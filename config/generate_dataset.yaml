@@ -8,10 +8,6 @@ scene_names:
   - JmbYfDe2QKZ_1
   - JmbYfDe2QKZ_2
   - mJXqzFtmKg4_1
-  - ur6pFq6Qu1A_1
-  - UwV83HsGsw3_1
-  - Vt2qJdWjCF2_1
-  - YmJkqBEsHnH_1
 data_cfg:
   rgb: true
   depth: true

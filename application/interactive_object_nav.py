@@ -33,31 +33,40 @@ from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 
 # ── Visualization helpers ─────────────────────────────────────────────────────
 
+# Windows the user has closed — never re-open them
+_closed_windows: set = set()
+
+
+def safe_imshow(name: str, img: np.ndarray) -> None:
+    """Show img in a named window. If the user closed it, skip silently."""
+    if name in _closed_windows:
+        return
+    try:
+        prop = cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE)
+        if prop == 0:          # window existed but was closed by user
+            _closed_windows.add(name)
+            return
+        cv2.imshow(name, img)
+    except Exception:
+        _closed_windows.add(name)
+
+
 def build_rgb_map_2d(robot) -> np.ndarray:
     """Build a top-down RGB map from the loaded VLMap (done once per scene)."""
     return pool_3d_rgb_to_2d(robot.map.grid_rgb, robot.map.grid_pos, robot.map.gs)
 
 
 def show_obs(robot, label: str = ""):
-    """Display the robot's first-person and third-person views."""
+    """Display the third-person chase camera view."""
     obs = robot.sim.get_sensor_observations(0)
 
-    # First-person view
-    rgb = obs["color_sensor"]
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    if label:
-        cv2.putText(bgr, label, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.imshow("Robot view (1st person)", bgr)
-
-    # Third-person chase camera (behind the robot)
     if "back_color_sensor" in obs:
         back_rgb = obs["back_color_sensor"]
         back_bgr = cv2.cvtColor(back_rgb, cv2.COLOR_RGB2BGR)
         if label:
             cv2.putText(back_bgr, label, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
-        cv2.imshow("Robot view (3rd person)", back_bgr)
+        safe_imshow("3rd person", back_bgr)
 
     cv2.waitKey(1)
 
@@ -120,7 +129,7 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
         canvas_bgr = cv2.resize(canvas_bgr, (gs * scale, gs * scale),
                                  interpolation=cv2.INTER_NEAREST)
 
-    cv2.imshow("Semantic Map", canvas_bgr)
+    safe_imshow("Semantic Map", canvas_bgr)
     cv2.waitKey(1)
 
 
