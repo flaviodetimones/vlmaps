@@ -35,91 +35,97 @@ def parse_object_goal_instruction_deprecated(language_instr):
 
 def parse_object_goal_instruction(language_instr):
     """
-    Parse language instruction into a series of landmarks
+    Parse language instruction into a series of navigable semantic object categories.
     Example: "first go to the kitchen and then go to the toilet" -> ["kitchen", "toilet"]
+    Example: "go to the area of the counter" -> ["counter"]
     """
+    import json
     import openai
 
     openai_key = os.environ["OPENAI_KEY"]
-    openai.api_key = openai_key
     client = openai.OpenAI(api_key=openai_key)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "user",
-                "content": "go to the kitchen and then go to the toilet",
-            },
-            {
-                "role": "assistant",
-                "content": "kitchen, toilet"
-            },
-            {
-                "role": "user",
-                "content": "go to the chair and then go to another chair"
-            },
-            {
-                "role": "assistant",
-                "content": "chair, chair"
-            },
-            {
-                "role": "user",
-                "content": "navigate to the green sofa and turn right and find several chairs, finally go to the painting"
-            },
-            {
-                "role": "assistant",
-                "content": "green sofa, chairs, painting"
-            },
-            {
-                "role": "user",
-                "content": "approach the window in front, turn right and go to the television, and finally go by the oven in the kitchen"
-            },
-            {
-                "role": "assistant",
-                "content": "window, television, oven, kitchen"
-            },
-            {
-                "role": "user",
-                "content": "walk to the plant first, turn around and come back to the table, go further into the bedroom, and stand next to the bed"
-            },
-            {
-                "role": "assistant",
-                "content": "plant, table, bedroom, bed"
-            },
-            {
-                "role": "user",
-                "content": "go by the stairs, go to the room next to it, approach the book shelf and then go to the table in the next room"
-            },
-            {
-                "role": "assistant",
-                "content": "stairs, room, book shelf, table, next room"
-            },
-            {
-                "role": "user",
-                "content": "Go front left and move to the table, then turn around and find a cushion, later stand next to a column before finally navigate to any appliances"
-            },
-            {
-                "role": "assistant",
-                "content": "table, cushion, column, appliances"
-            },
-            {
-                "role": "user",
-                "content": "Move to the west of the chair, with the sofa on your right, move to the table, then turn right 90 degree, then find a table"
-            },
-            {
-                "role": "assistant",
-                "content": "chair, table"
-            },
-            {
-                "role": "user",
-                "content": language_instr
-            }
-        ],
-        max_tokens=300,
+
+    system_prompt = (
+        "You extract navigable semantic object categories from robot navigation instructions.\n"
+        "\n"
+        "Rules:\n"
+        "1. Output ONLY a JSON array of strings, nothing else. No explanation, no punctuation outside the array.\n"
+        "2. Each string must be a physical object or place a robot can navigate to (e.g. 'counter', 'sofa', 'kitchen').\n"
+        "3. IGNORE spatial/relational words that are NOT objects themselves:\n"
+        "   area, zone, region, vicinity, neighborhood, side, part, spot,\n"
+        "   near, nearby, next to, beside, between, around, in front of, behind,\n"
+        "   left, right, north, south, east, west, middle, center.\n"
+        "   When these words modify an object (e.g. 'area of the counter'), extract only the object ('counter').\n"
+        "4. Keep meaningful color/size/material adjectives that disambiguate objects (e.g. 'green sofa').\n"
+        "5. Extract objects in the order they should be visited.\n"
+        "6. If the same object appears multiple times, repeat it.\n"
+        "7. Do not add objects not mentioned in the instruction."
     )
 
-    text = response.choices[0].message.content
-    return [x.strip() for x in text.split(",")]
+    few_shots = [
+        # basic multi-target
+        ("go to the kitchen and then go to the toilet",
+         '["kitchen", "toilet"]'),
+        ("go to the chair and then go to another chair",
+         '["chair", "chair"]'),
+        ("navigate to the green sofa and turn right and find several chairs, finally go to the painting",
+         '["green sofa", "chairs", "painting"]'),
+        ("approach the window in front, turn right and go to the television, and finally go by the oven in the kitchen",
+         '["window", "television", "oven", "kitchen"]'),
+        ("walk to the plant first, turn around and come back to the table, go further into the bedroom, and stand next to the bed",
+         '["plant", "table", "bedroom", "bed"]'),
+        # directional noise — direction words are not targets
+        ("Move to the west of the chair, with the sofa on your right, move to the table, then turn right 90 degrees",
+         '["chair", "sofa", "table"]'),
+        # ── tricky relational/spatial qualifiers ──────────────────────────────
+        # "area of X" → only X
+        ("go to the area of the counter",
+         '["counter"]'),
+        ("navigate to the area near the bookshelf",
+         '["bookshelf"]'),
+        # "zone / region" → only the anchor object
+        ("move to the zone around the refrigerator",
+         '["refrigerator"]'),
+        ("head to the region of the dining table",
+         '["dining table"]'),
+        # "between X and Y" → both objects
+        ("go between the sofa and the TV",
+         '["sofa", "TV"]'),
+        ("position yourself between the bed and the wardrobe",
+         '["bed", "wardrobe"]'),
+        # "near / next to X" → only X
+        ("stand near the window",
+         '["window"]'),
+        ("move next to the kitchen counter",
+         '["kitchen counter"]'),
+    ]
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for user_text, assistant_text in few_shots:
+        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "assistant", "content": assistant_text})
+    messages.append({"role": "user", "content": language_instr})
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        max_tokens=300,
+        temperature=0.0,
+    )
+
+    text = response.choices[0].message.content.strip()
+
+    # Robust parsing: try JSON first, fall back to comma-split
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return [str(x).strip() for x in result if str(x).strip()]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fallback: strip any accidental markdown fences, then split on commas
+    text = text.strip("`").replace("```json", "").replace("```", "").strip()
+    return [x.strip().strip('"').strip("'") for x in text.split(",") if x.strip()]
 
 
 
