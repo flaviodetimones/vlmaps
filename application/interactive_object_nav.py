@@ -35,6 +35,7 @@ from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 
 # Windows the user has closed — never re-open them
 _closed_windows: set = set()
+_shown_windows: set = set()   # windows that have been successfully shown at least once
 
 
 def safe_imshow(name: str, img: np.ndarray) -> None:
@@ -42,11 +43,14 @@ def safe_imshow(name: str, img: np.ndarray) -> None:
     if name in _closed_windows:
         return
     try:
-        prop = cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE)
-        if prop == 0:          # window existed but was closed by user
-            _closed_windows.add(name)
-            return
+        if name in _shown_windows:
+            # Only check visibility after the window has been created
+            prop = cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE)
+            if prop < 1:   # -1 = destroyed, 0 = closed by user
+                _closed_windows.add(name)
+                return
         cv2.imshow(name, img)
+        _shown_windows.add(name)
     except Exception:
         _closed_windows.add(name)
 
