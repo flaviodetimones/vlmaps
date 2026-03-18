@@ -1,0 +1,29 @@
+defaults:
+  - data_paths: docker
+
+# HM3D scenes available in /workspace/data/hm3d/
+scene_names:
+  - 00800-TEEsavR23oF
+  - 00801-HaxA7YrQdEC
+  - 00802-wcojb4TFT35
+  - 00803-k1cupFYWXJ6
+  - 00804-BHXhpBwSMLh
+  - 00805-SUHsP6z2gcJ
+  - 00806-tQ5s4ShP627
+  - 00807-rsggHU7g7dh
+  - 00808-y9hTuugGdiq
+  - 00809-Qpor2mEya8F
+
+data_cfg:
+  rgb: true
+  depth: true
+  semantic: true
+  resolution:
+    w: 1080
+    h: 720
+  camera_height: 1.5
+
+# Trajectory parameters
+num_waypoints: 20       # random waypoints to connect via ShortestPathFollower
+max_steps_per_leg: 500  # max steps between consecutive waypoints
+sample_every: 1         # save every N steps (1 = save all)
