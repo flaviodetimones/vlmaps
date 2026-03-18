@@ -28,6 +28,7 @@ from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
 from vlmaps.utils.llm_utils import parse_object_goal_instruction
 from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
 from vlmaps.utils.matterport3d_categories import mp3dcat
+from vlmaps.utils.room_map_utils import find_room_goal, load_room_map
 from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 
 
@@ -189,6 +190,16 @@ def main(config: DictConfig) -> None:
     print("\nBuilding top-down RGB map...")
     rgb_map_2d = build_rgb_map_2d(robot)
 
+    # ── Load pre-labelled room map (if available) ─────────────────────────
+    scene_dir = robot.vlmaps_data_save_dirs[config.scene_id]
+    _room_data = load_room_map(scene_dir)
+    if _room_data is not None:
+        _room_map, _room_categories, _room_regions = _room_data
+        print(f"Room map loaded: {list(_room_regions.keys())}")
+    else:
+        _room_map, _room_categories, _room_regions = None, [], {}
+        print("No room map found. Run build_room_map.py to enable region-aware navigation.")
+
     print("\nSearching for a good starting position...")
     start_tf = find_best_start_pose(robot)
     robot.set_agent_state(start_tf)
@@ -236,7 +247,15 @@ def main(config: DictConfig) -> None:
             cv2.waitKey(200)
 
             robot.empty_recorded_actions()
-            robot.move_to_object(cat)
+
+            # ── Region-aware navigation: use room map if query matches a room ──
+            room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
+            if room_goal is not None:
+                print(f"  Room map match: navigating to region centroid {room_goal}")
+                robot.move_to(list(room_goal))
+            else:
+                robot.move_to_object(cat)
+
             planned_actions = robot.get_recorded_actions() or []
             n_actions = len(planned_actions)
             print(f"  Path computed: {n_actions} actions. Replaying...")
