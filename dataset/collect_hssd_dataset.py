@@ -10,10 +10,9 @@ saving RGB + depth frames + poses in the same format expected by VLMapBuilder:
         poses.txt             (N x 7: x y z qx qy qz qw)
 
 Controls:
-    w   — move forward
-    a   — turn left
-    d   — turn right
-    s   — save current frame
+    w   — move forward       (frame saved automatically)
+    a   — turn left          (frame saved automatically)
+    d   — turn right         (frame saved automatically)
     q   — quit and write poses.txt
 
 Usage (inside Docker):
@@ -114,10 +113,9 @@ def main():
     print(f"Output : {out}")
     print()
     print("Controls:")
-    print("  w — move forward")
-    print("  a — turn left")
-    print("  d — turn right")
-    print("  s — save current frame")
+    print("  w — move forward  (auto-saved)")
+    print("  a — turn left     (auto-saved)")
+    print("  d — turn right    (auto-saved)")
     print("  q — quit and save poses.txt")
     print()
 
@@ -148,25 +146,29 @@ def main():
         # HUD
         cv2.putText(display, f"Frames saved: {frame_id}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(display, "w=fwd  a=left  d=right  s=save  q=quit",
+        cv2.putText(display, "w=fwd  a=left  d=right  q=quit",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         cv2.imshow("HSSD Collection", display)
 
         key = cv2.waitKey(30) & 0xFF
 
+        moved = False
         if key == ord("w"):
             agent.act("move_forward")
+            moved = True
         elif key == ord("a"):
             agent.act("turn_left")
+            moved = True
         elif key == ord("d"):
             agent.act("turn_right")
-        elif key == ord("s"):
-            obs = sim.get_sensor_observations()
-            save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
-            print(f"Saved frame {frame_id:06d}")
-            frame_id += 1
+            moved = True
         elif key == ord("q"):
             break
+
+        if moved:
+            obs = sim.get_sensor_observations()
+            save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
+            frame_id += 1
 
     cv2.destroyAllWindows()
 
