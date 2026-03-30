@@ -27,7 +27,7 @@ from scipy.ndimage import distance_transform_edt
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
 from vlmaps.utils.llm_utils import parse_object_goal_instruction
 from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
-from vlmaps.utils.matterport3d_categories import mp3dcat
+from vlmaps.utils.matterport3d_categories import mp3dcat, get_categories
 from vlmaps.utils.room_map_utils import find_room_goal, load_room_map
 from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 
@@ -185,7 +185,9 @@ def main(config: DictConfig) -> None:
     # ── Setup ────────────────────────────────────────────────────────────────
     robot = HabitatLanguageRobot(config)
     robot.setup_scene(config.scene_id)
-    robot.map.init_categories(mp3dcat.copy())
+    _dataset_type = str(getattr(config, "dataset_type", "mp3d"))
+    _scene_categories = get_categories(_dataset_type)
+    robot.map.init_categories(_scene_categories)
 
     print("\nBuilding top-down RGB map...")
     rgb_map_2d = build_rgb_map_2d(robot)

@@ -10,3 +10,11 @@ nav:
 # scene_id: [1, 2, 3, 4, 5, 6, 7, 8, 9]
 scene_id: 0
 refine: false
+
+# Dataset type: "mp3d" (default) or "hssd"
+# Override on the command line: dataset_type=hssd data_paths=hssd
+dataset_type: "mp3d"
+
+# Required only for HSSD — path to hssd-hab.scene_dataset_config.json
+# Override: +scene_dataset_config_file=/workspace/data/hssd-hab/hssd-hab.scene_dataset_config.json
+scene_dataset_config_file: ""

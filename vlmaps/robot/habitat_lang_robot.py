@@ -101,7 +101,9 @@ class HabitatLanguageRobot(LangRobot):
 
         # TODO: check if needed
         if "3d" in self.config.map_config.map_type:
-            self.map.init_categories(mp3dcat.copy())
+            from vlmaps.utils.matterport3d_categories import get_categories
+            _dataset_type = str(getattr(self.config, "dataset_type", "mp3d"))
+            self.map.init_categories(get_categories(_dataset_type))
             self.global_pc = grid_id2base_pos_3d_batch(self.map.grid_pos, self.cs, self.gs)
 
         self.vlmaps_dataloader = VLMapsDataloaderHabitat(vlmaps_data_dir, self.config.map_config, map=self.map)
@@ -113,24 +115,36 @@ class HabitatLanguageRobot(LangRobot):
         if self.sim is not None:
             self.sim.close()
 
-        # HM3D: "00800-TEEsavR23oF" → short name "TEEsavR23oF", file .basis.glb
-        # MP3D: "5LpN3gDmAk7"      → short name "5LpN3gDmAk7",  file .glb
-        if "-" in scene_name:
-            scene_short_name = scene_name.split("-")[-1]
-            glb_filename = scene_short_name + ".basis.glb"
-        else:
-            scene_short_name = scene_name
-            glb_filename = scene_short_name + ".glb"
-        self.test_scene = os.path.join(
-            self.test_scene_dir,
-            scene_name,
-            glb_filename,
-        )
+        # Determine dataset type (default mp3d for backward compatibility)
+        dataset_type = str(getattr(self.config, "dataset_type", "mp3d"))
 
-        self.sim_setting = {
-            "scene": self.test_scene,
-            **self.config["params"]["sim_setting"],
-        }
+        if dataset_type == "hssd":
+            # HSSD: scene loaded via SceneDataset config; scene_id is a bare string
+            self.test_scene = scene_name
+            scene_dataset_config_file = str(getattr(self.config, "scene_dataset_config_file", ""))
+            self.sim_setting = {
+                "scene": self.test_scene,
+                "scene_dataset_config_file": scene_dataset_config_file,
+                **self.config["params"]["sim_setting"],
+            }
+        else:
+            # HM3D: "00800-TEEsavR23oF" → short name "TEEsavR23oF", file .basis.glb
+            # MP3D: "5LpN3gDmAk7"      → short name "5LpN3gDmAk7",  file .glb
+            if "-" in scene_name:
+                scene_short_name = scene_name.split("-")[-1]
+                glb_filename = scene_short_name + ".basis.glb"
+            else:
+                scene_short_name = scene_name
+                glb_filename = scene_short_name + ".glb"
+            self.test_scene = os.path.join(
+                self.test_scene_dir,
+                scene_name,
+                glb_filename,
+            )
+            self.sim_setting = {
+                "scene": self.test_scene,
+                **self.config["params"]["sim_setting"],
+            }
 
         cfg = make_cfg(self.sim_setting)
 

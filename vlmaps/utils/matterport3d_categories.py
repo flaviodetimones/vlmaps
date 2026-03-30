@@ -1,3 +1,53 @@
+# HSSD common furniture vocabulary — used when dataset_type="hssd".
+# CLIP is used for scoring so any meaningful text label works.
+hssd_categories = [
+    "void",
+    "wall",
+    "floor",
+    "ceiling",
+    "chair",
+    "table",
+    "sofa",
+    "bed",
+    "desk",
+    "cabinet",
+    "shelf",
+    "shelving",
+    "counter",
+    "sink",
+    "toilet",
+    "bathtub",
+    "shower",
+    "door",
+    "window",
+    "mirror",
+    "tv",
+    "monitor",
+    "plant",
+    "lamp",
+    "picture",
+    "cushion",
+    "stool",
+    "appliances",
+    "refrigerator",
+    "oven",
+    "microwave",
+    "washer",
+    "dryer",
+    "objects",
+    "furniture",
+    "clothes",
+]
+
+
+def get_categories(dataset_type: str = "mp3d"):
+    """Return the category vocabulary list for the given dataset type."""
+    if dataset_type == "hssd":
+        return hssd_categories.copy()
+    # Default: mp3d (also used for hm3d)
+    return mp3dcat.copy()
+
+
 mp3dcat = [
     "void",
     "wall",
