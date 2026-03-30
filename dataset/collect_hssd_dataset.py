@@ -1,7 +1,7 @@
 """
-Phase 5 — Automated HSSD Data Collection
-==========================================
-Drives the agent through an HSSD scene via random pathfinder navigation,
+Phase 5 — Interactive HSSD Data Collection
+============================================
+Manual keyboard-driven navigation through an HSSD scene,
 saving RGB + depth frames + poses in the same format expected by VLMapBuilder:
 
     <output_dir>/
@@ -9,16 +9,18 @@ saving RGB + depth frames + poses in the same format expected by VLMapBuilder:
         depth/    000000.npy  000001.npy  ...
         poses.txt             (N x 7: x y z qx qy qz qw)
 
-Only frames that differ by at least MIN_DIST metres OR MIN_ROT degrees from the
-previous saved frame are kept — same filtering strategy as the MP3D collection.
+Controls:
+    w   — move forward
+    a   — turn left
+    d   — turn right
+    s   — save current frame
+    q   — quit and write poses.txt
 
 Usage (inside Docker):
     cd /workspace/third_party/vlmaps
     python dataset/collect_hssd_dataset.py \\
         --scene_dataset_config /workspace/data/versioned_data/hssd-hab/hssd-hab.scene_dataset_config.json \\
-        --scene_id 102344280 \\
-        --output_dir /workspace/data/vlmaps_dataset/102344280_1 \\
-        --n_frames 2000
+        --scene_id 102344280
 
 After collection, build the VLMap with:
     python application/create_map.py data_paths=hssd scene_id=0
@@ -31,16 +33,11 @@ from pathlib import Path
 import cv2
 import habitat_sim
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
 
-# ── Tuneable parameters ───────────────────────────────────────────────────────
-MIN_DIST = 0.10      # metres between saved frames
-MIN_ROT  = 5.0       # degrees between saved frames
 SENSOR_HEIGHT = 1.5  # metres (same as interactive_object_nav.py)
-WIDTH    = 1080
-HEIGHT   = 720
-# ─────────────────────────────────────────────────────────────────────────────
+WIDTH  = 1080
+HEIGHT = 720
 
 
 def make_cfg(scene_dataset_config: str, scene_id: str) -> habitat_sim.Configuration:
@@ -80,17 +77,6 @@ def make_cfg(scene_dataset_config: str, scene_id: str) -> habitat_sim.Configurat
     return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
 
-def quat_xyzw(q) -> np.ndarray:
-    return np.array([q.x, q.y, q.z, q.w], dtype=np.float64)
-
-
-def angle_between_quats(q1: np.ndarray, q2: np.ndarray) -> float:
-    """Return the rotation angle in degrees between two unit quaternions (xyzw)."""
-    dot = abs(float(np.dot(q1, q2)))
-    dot = min(1.0, dot)
-    return np.degrees(2.0 * np.arccos(dot))
-
-
 def save_frame(obs, state, rgb_dir: Path, depth_dir: Path,
                frame_id: int, poses_list: list) -> None:
     rgb = obs["color_sensor"][:, :, :3]
@@ -101,72 +87,21 @@ def save_frame(obs, state, rgb_dir: Path, depth_dir: Path,
     np.save(str(depth_dir / f"{frame_id:06d}.npy"), depth)
 
     pos = state.position
-    quat = quat_xyzw(state.rotation)
-    poses_list.append([pos[0], pos[1], pos[2],
-                       quat[0], quat[1], quat[2], quat[3]])
-
-
-def navigate_to(sim, agent, target: np.ndarray, poses_list: list,
-                rgb_dir: Path, depth_dir: Path, frame_id: int,
-                last_pos: np.ndarray, last_quat: np.ndarray,
-                n_frames_target: int) -> tuple:
-    """
-    Follow the shortest path from current position to target, saving frames.
-    Returns (frame_id, last_pos, last_quat).
-    """
-    follower = habitat_sim.GreedyGeodesicFollower(
-        sim.pathfinder, agent,
-        goal_radius=0.5,
-        stop_key=None,
-        forward_key="move_forward",
-        left_key="turn_left",
-        right_key="turn_right",
-    )
-
-    max_steps = 2000
-    for _ in range(max_steps):
-        if frame_id >= n_frames_target:
-            break
-        try:
-            action = follower.next_action_along(target)
-        except Exception:
-            break
-        if action is None:
-            break
-
-        obs = sim.step(action)
-        state = agent.get_state()
-        pos = np.array(state.position)
-        quat = quat_xyzw(state.rotation)
-
-        dist = float(np.linalg.norm(pos - last_pos))
-        rot = angle_between_quats(quat, last_quat)
-
-        if dist >= MIN_DIST or rot >= MIN_ROT:
-            save_frame(obs, state, rgb_dir, depth_dir, frame_id, poses_list)
-            frame_id += 1
-            last_pos = pos
-            last_quat = quat
-
-            if frame_id % 100 == 0:
-                print(f"  {frame_id}/{n_frames_target} frames saved...")
-
-    return frame_id, last_pos, last_quat
+    q = state.rotation
+    poses_list.append([pos[0], pos[1], pos[2], q.x, q.y, q.z, q.w])
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automated HSSD dataset collection")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--scene_dataset_config",
                         default="/workspace/data/versioned_data/hssd-hab/hssd-hab.scene_dataset_config.json")
     parser.add_argument("--scene_id", default="102344280")
     parser.add_argument("--output_dir",
                         default="/workspace/data/vlmaps_dataset_hssd/102344280_1")
-    parser.add_argument("--n_frames", type=int, default=2000,
-                        help="Target number of frames to collect")
     args = parser.parse_args()
 
     if not os.path.exists(args.scene_dataset_config):
-        print(f"ERROR: scene_dataset_config not found: {args.scene_dataset_config}")
+        print(f"ERROR: not found: {args.scene_dataset_config}")
         sys.exit(1)
 
     out = Path(args.output_dir)
@@ -175,57 +110,65 @@ def main():
     rgb_dir.mkdir(parents=True, exist_ok=True)
     depth_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Scene   : {args.scene_id}")
-    print(f"Output  : {out}")
-    print(f"Target  : {args.n_frames} frames")
-    print(f"Filters : MIN_DIST={MIN_DIST}m  MIN_ROT={MIN_ROT}°")
+    print(f"Scene  : {args.scene_id}")
+    print(f"Output : {out}")
+    print()
+    print("Controls:")
+    print("  w — move forward")
+    print("  a — turn left")
+    print("  d — turn right")
+    print("  s — save current frame")
+    print("  q — quit and save poses.txt")
     print()
 
     cfg = make_cfg(args.scene_dataset_config, args.scene_id)
     sim = habitat_sim.Simulator(cfg)
     agent = sim.initialize_agent(0)
 
-    # Recompute navmesh
-    nav_settings = habitat_sim.NavMeshSettings()
-    nav_settings.set_defaults()
-    nav_settings.agent_radius = 0.1
-    nav_settings.agent_height = 1.5
-    sim.recompute_navmesh(sim.pathfinder, nav_settings)
-    assert sim.pathfinder.is_loaded, "NavMesh not loaded — aborting"
-    print("✓ NavMesh loaded")
-
-    # Random starting position
-    start_pos = sim.pathfinder.get_random_navigable_point()
     state = habitat_sim.AgentState()
-    state.position = start_pos
+    state.position = sim.pathfinder.get_random_navigable_point()
     agent.set_state(state)
 
     poses_list = []
     frame_id = 0
-    last_pos  = np.array(start_pos)
-    last_quat = quat_xyzw(agent.get_state().rotation)
 
-    # Save initial frame
-    obs = sim.get_sensor_observations()
-    save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
-    frame_id += 1
-    print(f"✓ Initial frame saved. Starting navigation...")
+    while True:
+        obs = sim.get_sensor_observations()
+        rgb = obs["color_sensor"][:, :, :3]
+        display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    # Random walk: repeatedly pick a new random navigable point and follow path
-    while frame_id < args.n_frames:
-        target = sim.pathfinder.get_random_navigable_point()
-        frame_id, last_pos, last_quat = navigate_to(
-            sim, agent, target, poses_list,
-            rgb_dir, depth_dir, frame_id, last_pos, last_quat,
-            args.n_frames,
-        )
+        # HUD
+        cv2.putText(display, f"Frames saved: {frame_id}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(display, "w=fwd  a=left  d=right  s=save  q=quit",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.imshow("HSSD Collection", display)
 
-    # Save poses
-    poses = np.array(poses_list, dtype=np.float64)
-    np.savetxt(str(out / "poses.txt"), poses)
-    print(f"\n✓ Collection complete.")
-    print(f"  Frames saved : {len(poses_list)}")
-    print(f"  poses.txt    : {out / 'poses.txt'}")
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == ord("w"):
+            agent.act("move_forward")
+        elif key == ord("a"):
+            agent.act("turn_left")
+        elif key == ord("d"):
+            agent.act("turn_right")
+        elif key == ord("s"):
+            obs = sim.get_sensor_observations()
+            save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
+            print(f"Saved frame {frame_id:06d}")
+            frame_id += 1
+        elif key == ord("q"):
+            break
+
+    cv2.destroyAllWindows()
+
+    if poses_list:
+        poses = np.array(poses_list, dtype=np.float64)
+        np.savetxt(str(out / "poses.txt"), poses)
+        print(f"\n✓ Saved {len(poses_list)} frames to {out}")
+        print(f"  poses.txt written.")
+    else:
+        print("No frames saved.")
 
     sim.close()
 
