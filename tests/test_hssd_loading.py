@@ -70,18 +70,25 @@ def test_hssd_basic(scene_dataset_config: str, scene_id: str) -> bool:
     print(f"✓ RGB shape : {obs['rgb'].shape}")
     print(f"✓ Depth shape: {obs['depth'].shape}")
 
-    # 5. Test semantic scene (region annotations — free on HSSD)
-    scene = sim.semantic_scene
-    print(f"✓ Semantic scene loaded: {len(scene.levels)} level(s)")
-    total_regions = 0
-    for level in scene.levels:
-        for region in level.regions:
-            total_regions += 1
-            center = region.aabb.center
-            print(f"    Region '{region.category.name()}' "
-                  f"center=({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
-    print(f"✓ Total regions: {total_regions}")
-    assert total_regions > 0, "No regions found in semantic scene"
+    # 5. Test semantic region annotations via semantic_config.json (HSSD format)
+    import json as _json
+    from pathlib import Path as _Path
+    semantic_cfg_path = (
+        _Path(scene_dataset_config).parent / "semantics" / "scenes"
+        / f"{scene_id}.semantic_config.json"
+    )
+    if semantic_cfg_path.exists():
+        with open(semantic_cfg_path) as _f:
+            _sdata = _json.load(_f)
+        regions = _sdata.get("region_annotations", [])
+        print(f"✓ Semantic config found: {len(regions)} region(s)")
+        for r in regions:
+            print(f"    '{r.get('name')}' | {r.get('label')} "
+                  f"| poly_pts={len(r.get('poly_loop', []))}")
+        assert len(regions) > 0, "semantic_config.json has no region_annotations"
+    else:
+        print(f"  [info] No semantic_config.json for scene {scene_id} — "
+              f"room reasoning will use LabelMe instead.")
 
     # 6. Test navmesh
     navmesh_settings = habitat_sim.NavMeshSettings()

@@ -3,11 +3,12 @@ room_provider.py
 ================
 Abstract interface for room/region information, with two concrete implementations:
 
-- LabelMeRoomProvider  : loads room_map/ saved by labelme_to_room_map.py.
-                          Works for both MP3D and HSSD (manual annotation).
-- SemanticSceneRoomProvider : reads region annotations directly from
-                          Habitat-Sim's semantic_scene API (HSSD only — free,
-                          no manual labeling needed).
+- LabelMeRoomProvider        : loads room_map/ saved by labelme_to_room_map.py.
+                                Works for both MP3D and HSSD (manual annotation).
+- SemanticSceneRoomProvider  : reads region annotations directly from the
+                                per-scene semantic_config.json files in the
+                                HSSD dataset (semantics/scenes/<id>.semantic_config.json).
+                                Free annotations — no manual labeling needed.
 
 Both expose the same three methods so the rest of the pipeline is agnostic.
 """
@@ -97,86 +98,137 @@ class LabelMeRoomProvider(RoomProvider):
 
 # ── Semantic scene provider (HSSD) ───────────────────────────────────────────
 
+def _point_in_polygon(px: float, pz: float, poly_xz: np.ndarray) -> bool:
+    """Ray-casting point-in-polygon test. poly_xz: (N, 2) array of (x, z) vertices."""
+    n = len(poly_xz)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, zi = poly_xz[i]
+        xj, zj = poly_xz[j]
+        if ((zi > pz) != (zj > pz)) and (px < (xj - xi) * (pz - zi) / (zj - zi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
 class SemanticSceneRoomProvider(RoomProvider):
     """
-    Reads region annotations directly from Habitat-Sim's semantic_scene API.
-    Available on HSSD scenes without any manual labeling.
+    Reads HSSD region annotations from the per-scene semantic_config.json.
 
-    Call build(sim, rmin, cmin, cs, gs) after the simulator is initialized.
+    HSSD stores room/region info as 2D polygon floor plans (not via
+    sim.semantic_scene.levels which is empty for HSSD). Each region has:
+      - name   : human-readable room name (e.g. "kitchen")
+      - label  : category string (e.g. "kitchen/cooking area")
+      - poly_loop : list of [x, 0, z] world-coord vertices
+      - floor_height, extrusion_height
+
+    Call build(semantic_config_path, rmin, cmin, cs, gs) after loading the scene.
+    The semantic_config_path is typically:
+      <hssd_root>/semantics/scenes/<scene_id>.semantic_config.json
     """
 
     def __init__(self):
         self._available = False
-        self._regions: List[Dict] = []       # [{name, centroid_rc, aabb, ...}, ...]
-        self._region_grid: Optional[np.ndarray] = None   # (H, W) int
+        self._regions: List[Dict] = []
+        self._region_grid: Optional[np.ndarray] = None   # (H, W) int, 0 = unlabeled
 
-    def build(self, sim, rmin: float, cmin: float, cs: float, gs: int) -> None:
+    # ------------------------------------------------------------------
+    @staticmethod
+    def find_config_path(scene_dataset_config: str, scene_id: str) -> Optional[str]:
         """
-        Extract region information from sim.semantic_scene and rasterise
-        them onto the VLMap grid.
+        Derive the semantic_config.json path from the dataset config path and scene_id.
+        Looks in <dataset_root>/semantics/scenes/<scene_id>.semantic_config.json
+        """
+        root = Path(scene_dataset_config).parent
+        p = root / "semantics" / "scenes" / f"{scene_id}.semantic_config.json"
+        return str(p) if p.exists() else None
+
+    # ------------------------------------------------------------------
+    def build(self, semantic_config_path: str,
+              rmin: float, cmin: float, cs: float, gs: int) -> None:
+        """
+        Load region polygons from the HSSD semantic_config.json and rasterise
+        them onto the VLMap grid using point-in-polygon.
 
         Parameters
         ----------
-        sim   : habitat_sim.Simulator
-        rmin  : top-left row offset of the cropped VLMap grid (world units)
-        cmin  : top-left col offset of the cropped VLMap grid (world units)
+        semantic_config_path : path to <scene_id>.semantic_config.json
+        rmin  : top-left Z offset of the VLMap grid (world metres)
+        cmin  : top-left X offset of the VLMap grid (world metres)
         cs    : cell size in metres (typically 0.05)
         gs    : grid size in cells (typically 1000)
         """
-        try:
-            scene = sim.semantic_scene
-        except Exception:
+        import json
+
+        p = Path(semantic_config_path)
+        if not p.exists():
+            print(f"[SemanticSceneRoomProvider] config not found: {p}")
             return
 
-        self._regions = []
+        with open(p) as f:
+            data = json.load(f)
+
+        annotations = data.get("region_annotations", [])
+        if not annotations:
+            print("[SemanticSceneRoomProvider] no region_annotations in config")
+            return
+
         H = W = gs
         self._region_grid = np.zeros((H, W), dtype=np.int32)
+        self._regions = []
 
-        region_id = 1
-        for level in scene.levels:
-            for region in level.regions:
-                try:
-                    cat_name = region.category.name() if region.category else "unknown"
-                except Exception:
-                    cat_name = "unknown"
+        for region_id, ann in enumerate(annotations, start=1):
+            name = ann.get("name", f"region_{region_id}")
+            label = ann.get("label", name)
+            poly_raw = ann.get("poly_loop", [])  # [[x, 0, z], ...]
 
-                center = region.aabb.center   # magnum Vector3: (x, y, z), y-up
-                half = region.aabb.half_extents
+            if len(poly_raw) < 3:
+                continue
 
-                # World X/Z → row/col (habitat uses Y-up, navigation is XZ plane)
-                cx_world = float(center[0])
-                cz_world = float(center[2])
-                hx = float(half[0])
-                hz = float(half[2])
+            # Extract (x, z) pairs — y is always 0 in HSSD poly_loops
+            poly_xz = np.array([[v[0], v[2]] for v in poly_raw], dtype=np.float32)
 
-                # Rasterise AABB onto grid
-                r_lo = int((cz_world - hz - rmin) / cs)
-                r_hi = int((cz_world + hz - rmin) / cs)
-                c_lo = int((cx_world - hx - cmin) / cs)
-                c_hi = int((cx_world + hx - cmin) / cs)
+            # Bounding box in world coords → grid coords for fast pre-filter
+            x_min, z_min = poly_xz.min(axis=0)
+            x_max, z_max = poly_xz.max(axis=0)
 
-                r_lo = max(0, r_lo); r_hi = min(H - 1, r_hi)
-                c_lo = max(0, c_lo); c_hi = min(W - 1, c_hi)
+            c_lo = max(0, int((x_min - cmin) / cs))
+            c_hi = min(W - 1, int((x_max - cmin) / cs) + 1)
+            r_lo = max(0, int((z_min - rmin) / cs))
+            r_hi = min(H - 1, int((z_max - rmin) / cs) + 1)
 
-                centroid_r = int((cz_world - rmin) / cs)
-                centroid_c = int((cx_world - cmin) / cs)
+            # Rasterise: test each grid cell centre against the polygon
+            for r in range(r_lo, r_hi + 1):
+                for c in range(c_lo, c_hi + 1):
+                    wx = cmin + c * cs + cs / 2.0
+                    wz = rmin + r * cs + cs / 2.0
+                    if _point_in_polygon(wx, wz, poly_xz):
+                        # Later regions overwrite earlier ones (fine for non-overlapping rooms)
+                        self._region_grid[r, c] = region_id
 
-                self._regions.append({
-                    "id": region_id,
-                    "category": cat_name,
-                    "label": f"{cat_name}_{region_id}",
-                    "centroid": [centroid_r, centroid_c],
-                    "aabb_r": (r_lo, r_hi),
-                    "aabb_c": (c_lo, c_hi),
-                })
+            # Centroid = average of polygon vertices
+            cx_world = float(poly_xz[:, 0].mean())
+            cz_world = float(poly_xz[:, 1].mean())
+            centroid_r = int((cz_world - rmin) / cs)
+            centroid_c = int((cx_world - cmin) / cs)
 
-                if r_lo <= r_hi and c_lo <= c_hi:
-                    self._region_grid[r_lo:r_hi+1, c_lo:c_hi+1] = region_id
-
-                region_id += 1
+            self._regions.append({
+                "id": region_id,
+                "name": name,
+                "category": label,
+                "label": name,          # use short name as label for matching
+                "centroid": [centroid_r, centroid_c],
+                "poly_xz": poly_xz,
+                "floor_height": ann.get("floor_height", 0.0),
+            })
 
         self._available = bool(self._regions)
+        n_labeled = int((self._region_grid > 0).sum())
+        print(f"[SemanticSceneRoomProvider] loaded {len(self._regions)} regions, "
+              f"{n_labeled} grid cells labeled")
 
+    # ------------------------------------------------------------------
     def is_available(self) -> bool:
         return self._available
 
@@ -197,12 +249,16 @@ class SemanticSceneRoomProvider(RoomProvider):
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         if not self._available:
             return None
-        room_name_lower = room_name.lower().replace(" ", "_")
+        query = room_name.lower().strip()
+        best = None
         for reg in self._regions:
-            if room_name_lower in reg["label"].lower() or room_name_lower in reg["category"].lower():
-                r, c = reg["centroid"]
-                return (float(r), float(c))
-        return None
+            if query in reg["label"].lower() or query in reg["category"].lower():
+                best = reg
+                break
+        if best is None:
+            return None
+        r, c = best["centroid"]
+        return (float(r), float(c))
 
     def list_rooms(self) -> List[str]:
         return [r["label"] for r in self._regions]
