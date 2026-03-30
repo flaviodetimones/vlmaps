@@ -24,23 +24,26 @@ import glob
 from pathlib import Path
 
 
-def survey_scene(sim, scene_id: str) -> dict:
+def survey_scene(sim, scene_id: str, dataset_dir: "Path") -> dict:
     """Return a dict with scene metadata extracted from an open simulator."""
+    import json
     result = {
         "scene_id": scene_id,
-        "levels": 0,
+        "levels": 1,   # HSSD scenes are single-level by design
         "regions": 0,
         "region_names": [],
         "navmesh_area_m2": 0.0,
         "error": None,
     }
     try:
-        scene = sim.semantic_scene
-        result["levels"] = len(scene.levels)
-        for level in scene.levels:
-            for region in level.regions:
+        # Read region annotations directly from semantic_config.json
+        sem_cfg = dataset_dir / "semantics" / "scenes" / f"{scene_id}.semantic_config.json"
+        if sem_cfg.exists():
+            with open(sem_cfg) as f:
+                data = json.load(f)
+            for ann in data.get("region_annotations", []):
                 result["regions"] += 1
-                result["region_names"].append(region.category.name())
+                result["region_names"].append(ann.get("name", "?"))
 
         # Recompute navmesh and estimate navigable area
         import habitat_sim
@@ -121,7 +124,7 @@ def main():
             sim_cfg = habitat_sim.Configuration(cfg, [agent_cfg])
             sim = habitat_sim.Simulator(sim_cfg)
 
-            meta = survey_scene(sim, scene_id)
+            meta = survey_scene(sim, scene_id, dataset_dir)
 
             # Save one RGB frame
             obs = sim.get_sensor_observations()
@@ -137,7 +140,7 @@ def main():
             sim.close()
 
             flag = ""
-            if meta["levels"] == 1 and meta["regions"] >= 5:
+            if meta["regions"] >= 5 and meta["navmesh_area_m2"] >= 100:
                 flag = "★ CANDIDATE"
             print(f"levels={meta['levels']} regions={meta['regions']} "
                   f"area={meta['navmesh_area_m2']}m² {flag}")
@@ -165,8 +168,10 @@ def main():
 
     # Print top candidates
     candidates = [r for r in rows
-                  if r.get("levels") == 1 and isinstance(r.get("regions"), int)
-                  and r["regions"] >= 5 and not r.get("error")]
+                  if isinstance(r.get("regions"), int)
+                  and r["regions"] >= 5
+                  and r.get("navmesh_area_m2", 0) >= 100
+                  and not r.get("error")]
     candidates.sort(key=lambda r: -r["regions"])
     print(f"\n=== Top single-level candidates (≥5 regions) ===")
     for r in candidates[:10]:
