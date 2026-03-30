@@ -125,6 +125,14 @@ def main():
     sim = habitat_sim.Simulator(cfg)
     agent = sim.initialize_agent(0)
 
+    # HSSD does not ship a pre-built navmesh — recompute before using pathfinder
+    nav_settings = habitat_sim.NavMeshSettings()
+    nav_settings.set_defaults()
+    nav_settings.agent_radius = 0.1
+    nav_settings.agent_height = 1.5
+    sim.recompute_navmesh(sim.pathfinder, nav_settings)
+    assert sim.pathfinder.is_loaded, "NavMesh failed to load"
+
     state = habitat_sim.AgentState()
     state.position = sim.pathfinder.get_random_navigable_point()
     agent.set_state(state)
