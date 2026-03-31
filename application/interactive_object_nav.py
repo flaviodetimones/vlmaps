@@ -61,18 +61,23 @@ def build_rgb_map_2d(robot) -> np.ndarray:
     return pool_3d_rgb_to_2d(robot.map.grid_rgb, robot.map.grid_pos, robot.map.gs)
 
 
-def show_obs(robot, label: str = ""):
-    """Display the third-person chase camera view."""
-    obs = robot.sim.get_sensor_observations(0)
+def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
+    """Display the first-person camera view (with optional YOLOE overlay)."""
+    if yoloe_frame_bgr is not None:
+        # Show YOLOE-annotated frame on the same window
+        frame = yoloe_frame_bgr.copy()
+    else:
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" in obs:
+            frame = cv2.cvtColor(obs["color_sensor"][:, :, :3], cv2.COLOR_RGB2BGR)
+        else:
+            cv2.waitKey(1)
+            return
 
-    if "back_color_sensor" in obs:
-        back_rgb = obs["back_color_sensor"]
-        back_bgr = cv2.cvtColor(back_rgb, cv2.COLOR_RGB2BGR)
-        if label:
-            cv2.putText(back_bgr, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
-        safe_imshow("3rd person", back_bgr)
-
+    if label:
+        cv2.putText(frame, label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
+    safe_imshow("1st person", frame)
     cv2.waitKey(1)
 
 
@@ -326,7 +331,7 @@ def main(config: DictConfig) -> None:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Facing: {cat}")
 
-            # YOLOE verification
+            # YOLOE verification — overlay result on the 1st person window
             _yoloe_confirmed = False
             try:
                 from vlmaps.utils.yoloe_utils import yoloe_verify
@@ -335,8 +340,8 @@ def main(config: DictConfig) -> None:
                     frame = obs["color_sensor"][:, :, :3]
                     _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
                     if _ann_frame is not None:
-                        safe_imshow("YOLOE", cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR))
-                        cv2.waitKey(1)
+                        ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                        show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
                     if _yoloe_confirmed:
                         print(f"  YOLOE: ✓ Found '{cat}'!")
                     else:
