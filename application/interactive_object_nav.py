@@ -139,7 +139,7 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
     if path_cells and len(path_cells) > 1:
         pts = np.array([[c[1], c[0]] for c in path_cells], dtype=np.int32)
         canvas_bgr = cv2.cvtColor(canvas.astype(np.uint8), cv2.COLOR_RGB2BGR)
-        cv2.polylines(canvas_bgr, [pts], False, (255, 100, 0), 1)
+        cv2.polylines(canvas_bgr, [pts], False, (0, 0, 255), 2)
         canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
 
     # ── Robot position ────────────────────────────────────────────────────────

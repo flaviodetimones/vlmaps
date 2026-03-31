@@ -1,30 +1,31 @@
 """
 YOLOE open-vocabulary visual verification utility.
 
-Uses YOLOE-11L-Seg to check whether a queried object is visible in a camera frame.
-Returns (found: bool, annotated_frame: np.ndarray | None).
+Runs YOLOE in a subprocess to avoid CUDA/segfault conflicts with habitat-sim.
+Communicates via temporary files.
 """
 
+import subprocess
+import sys
+import tempfile
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Optional
 
-_model = None
+import cv2
+
 _WEIGHTS_CANDIDATES = [
     Path("/workspace/yoloe-11l-seg.pt"),
     Path(__file__).resolve().parents[4] / "yoloe-11l-seg.pt",  # repo root
 ]
 
+_WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_worker.py"
 
-def _load_model():
-    global _model
-    if _model is not None:
-        return _model
-    from ultralytics import YOLO
+
+def _find_weights() -> str:
     for p in _WEIGHTS_CANDIDATES:
         if p.exists():
-            _model = YOLO(str(p))
-            return _model
+            return str(p)
     raise FileNotFoundError(f"YOLOE weights not found in {_WEIGHTS_CANDIDATES}")
 
 
@@ -33,7 +34,7 @@ def yoloe_verify(
     target_name: str,
     conf_thresh: float = 0.25,
 ) -> Tuple[bool, Optional[np.ndarray]]:
-    """Run YOLOE on a single RGB frame and check for target_name.
+    """Run YOLOE on a single RGB frame via subprocess.
 
     Args:
         frame_rgb: (H, W, 3) uint8 RGB image.
@@ -41,17 +42,42 @@ def yoloe_verify(
         conf_thresh: minimum confidence to consider a detection valid.
 
     Returns:
-        (found, annotated_frame) where annotated_frame is the frame with
-        bounding boxes drawn, or None if detection failed.
+        (found, annotated_frame) where annotated_frame is the RGB frame
+        with bounding boxes drawn, or the original frame if nothing found.
     """
-    model = _load_model()
-    model.set_classes([target_name])
-    results = model.predict(frame_rgb, conf=conf_thresh, verbose=False)
+    weights = _find_weights()
 
-    if not results or len(results[0].boxes) == 0:
-        return False, frame_rgb.copy()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = Path(tmpdir) / "frame.png"
+        out_path = Path(tmpdir) / "result.png"
+        flag_path = Path(tmpdir) / "found.txt"
 
-    ann = results[0].plot()  # BGR annotated image
-    # Convert back to RGB for consistency
-    ann_rgb = ann[:, :, ::-1].copy()
-    return True, ann_rgb
+        # Save input frame (BGR for cv2)
+        cv2.imwrite(str(in_path), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+
+        result = subprocess.run(
+            [
+                sys.executable, str(_WORKER_SCRIPT),
+                "--weights", weights,
+                "--input", str(in_path),
+                "--output", str(out_path),
+                "--flag", str(flag_path),
+                "--target", target_name,
+                "--conf", str(conf_thresh),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            print(f"  YOLOE subprocess error: {result.stderr[:300]}")
+            return False, frame_rgb.copy()
+
+        found = flag_path.exists()
+        if out_path.exists():
+            ann_bgr = cv2.imread(str(out_path))
+            ann_rgb = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)
+            return found, ann_rgb
+
+        return found, frame_rgb.copy()
