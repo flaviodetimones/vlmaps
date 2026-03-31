@@ -2,7 +2,7 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig
 from vlmaps.map.vlmap import VLMap
-from vlmaps.utils.matterport3d_categories import mp3dcat
+from vlmaps.utils.matterport3d_categories import mp3dcat, get_categories
 from vlmaps.utils.visualize_utils import (
     pool_3d_label_to_2d,
     pool_3d_rgb_to_2d,
@@ -32,10 +32,12 @@ def main(config: DictConfig) -> None:
     # cat = "chair"
 
     vlmap._init_clip()
+    _dataset_type = str(getattr(config, "dataset_type", "mp3d"))
+    _categories = get_categories(_dataset_type)
     print("considering categories: ")
-    print(mp3dcat[1:-1])
+    print(_categories)
     if config.init_categories:
-        vlmap.init_categories(mp3dcat[1:-1])
+        vlmap.init_categories(_categories)
         mask = vlmap.index_map(cat, with_init_cat=True)
     else:
         mask = vlmap.index_map(cat, with_init_cat=False)

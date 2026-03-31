@@ -156,6 +156,16 @@ class HabitatLanguageRobot(LangRobot):
             self.sim.reconfigure(cfg)
         self.last_scene_name = scene_name
 
+        # HSSD scenes do not ship a pre-built navmesh — recompute so that
+        # sim.step() respects walls and obstacles instead of walking through them.
+        if dataset_type == "hssd":
+            nav_settings = habitat_sim.NavMeshSettings()
+            nav_settings.set_defaults()
+            nav_settings.agent_radius = 0.1
+            nav_settings.agent_height = 1.5
+            self.sim.recompute_navmesh(self.sim.pathfinder, nav_settings)
+            assert self.sim.pathfinder.is_loaded, "HSSD navmesh recomputation failed"
+
         # TODO: add in document to enable this features
         # load agent mesh for visualization
         # if self.agent_model_dir:
@@ -466,6 +476,7 @@ class HabitatLanguageRobot(LangRobot):
         paths = self.nav.plan_to(
             curr_pose_on_full_map[:2], pos, vis=self.config["nav"]["vis"]
         )  # take (row, col) in full map
+        self.last_planned_path = paths  # expose for visualization
         print(paths)
         actions_list, poses_list = self.controller.convert_paths_to_actions(curr_pose_on_full_map, paths[1:])
         success, real_actions_list = self.execute_actions(actions_list, poses_list, vis=self.config["nav"]["vis"])

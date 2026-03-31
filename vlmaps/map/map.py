@@ -79,6 +79,10 @@ class Map:
     def generate_obstacle_map(self, h_min: float = 0, h_max: float = 1.5) -> np.ndarray:
         """Generate topdown obstacle map from loaded 3D map
 
+        A cell is navigable (1) if it has floor voxels AND no obstacle voxels.
+        A cell is occupied (0) if it has no floor data OR has obstacle voxels.
+        This prevents unmapped areas from appearing as free space.
+
         Args:
             h_min (float, optional): The minimum height (m) of voxels considered
                 as obstacles. Defaults to 0.
@@ -89,8 +93,17 @@ class Map:
         """
         assert self.occupied_ids is not None, "map not loaded"
         heights = np.arange(0, self.occupied_ids.shape[-1]) * self.cs
-        height_mask = np.logical_and(heights > h_min, heights < h_max)
-        self.obstacles_map = np.sum(self.occupied_ids[..., height_mask] > 0, axis=2) == 0
+
+        # Floor detection: voxels in the low band (ground level)
+        floor_mask = heights < 0.15
+        has_floor = np.sum(self.occupied_ids[..., floor_mask] > 0, axis=2) > 0
+
+        # Obstacle detection: voxels in the mid-to-high band (walls, furniture)
+        obstacle_mask = np.logical_and(heights >= 0.2, heights < h_max)
+        has_obstacle = np.sum(self.occupied_ids[..., obstacle_mask] > 0, axis=2) > 0
+
+        # Navigable = has floor AND no obstacles; unmapped = obstacle
+        self.obstacles_map = (has_floor & ~has_obstacle).astype(np.uint8)
         self.generate_cropped_obstacle_map(self.obstacles_map)
         return self.obstacles_map
 

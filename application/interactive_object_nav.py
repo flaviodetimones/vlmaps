@@ -76,13 +76,42 @@ def show_obs(robot, label: str = ""):
     cv2.waitKey(1)
 
 
-def compute_heatmap(robot, category: str) -> np.ndarray:
-    """Compute the 2D heatmap for a category once and cache it externally."""
-    mask_3d = robot.map.index_map(category, with_init_cat=True)
-    mask_2d = pool_3d_label_to_2d(mask_3d, robot.map.grid_pos, robot.map.gs)
-    from scipy.ndimage import distance_transform_edt as edt
-    dist = edt(~mask_2d)
-    return np.clip(1.0 - dist * 0.05, 0, 1).astype(np.float32)
+def compute_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarray:
+    """Compute the 2D heatmap using continuous CLIP scores instead of binary argmax.
+
+    Steps:
+      1. Get the raw CLIP score for the target category (per-voxel, 0-1).
+      2. Keep only voxels where the target is the argmax AND score > threshold.
+      3. Project the continuous scores to 2D (max-pool per column).
+      4. Apply distance decay from the high-score cells.
+    """
+    from vlmaps.utils.index_utils import find_similar_category_id
+
+    cat_id = find_similar_category_id(category, robot.map.categories)
+    scores = robot.map.scores_mat[:, cat_id]               # (N,) raw CLIP score
+    max_ids = np.argmax(robot.map.scores_mat, axis=1)       # (N,) winning category
+
+    # Only keep voxels where this category wins AND score is strong enough
+    valid = (max_ids == cat_id) & (scores > score_thresh)
+    scores_filtered = np.where(valid, scores, 0.0)
+
+    # Project to 2D: max score per (row, col) column
+    gs = robot.map.gs
+    heat_2d = np.zeros((gs, gs), dtype=np.float32)
+    for i, pos in enumerate(robot.map.grid_pos):
+        row, col, _ = pos
+        if scores_filtered[i] > heat_2d[row, col]:
+            heat_2d[row, col] = scores_filtered[i]
+
+    # Distance decay from high-score cells
+    mask = heat_2d > 0
+    if mask.any():
+        dist = distance_transform_edt(~mask)
+        heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.05, 0, 1).astype(np.float32))
+        # Suppress low-confidence far-away glow
+        heat_2d[heat_2d < 0.1] = 0
+
+    return heat_2d
 
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
@@ -258,6 +287,9 @@ def main(config: DictConfig) -> None:
             else:
                 robot.move_to_object(cat)
 
+            # Capture planned path for visualization
+            path_cells = getattr(robot, "last_planned_path", None) or []
+
             planned_actions = robot.get_recorded_actions() or []
             n_actions = len(planned_actions)
             print(f"  Path computed: {n_actions} actions. Replaying...")
@@ -276,10 +308,44 @@ def main(config: DictConfig) -> None:
                 robot._set_nav_curr_pose()
                 show_obs(robot, f"[{i+1}/{n_actions}] -> {cat}")
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         path_cells=path_cells,
                          label=f"[{i+1}/{n_actions}] -> {cat}")
 
             show_obs(robot, f"Arrived: {cat}")
-            show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Arrived: {cat}")
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=path_cells, label=f"Arrived: {cat}")
+
+            # ── Face the object and verify with YOLOE ──
+            print(f"  Turning to face '{cat}'...")
+            try:
+                robot.face(cat)
+            except Exception:
+                pass  # face() may fail if object not in map — still show arrival
+            robot._set_nav_curr_pose()
+            show_obs(robot, f"Facing: {cat}")
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=path_cells, label=f"Facing: {cat}")
+
+            # YOLOE verification
+            _yoloe_confirmed = False
+            try:
+                from vlmaps.utils.yoloe_utils import yoloe_verify
+                obs = robot.sim.get_sensor_observations(0)
+                if "color_sensor" in obs:
+                    frame = obs["color_sensor"][:, :, :3]
+                    _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
+                    if _ann_frame is not None:
+                        safe_imshow("YOLOE", cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR))
+                        cv2.waitKey(1)
+                    if _yoloe_confirmed:
+                        print(f"  YOLOE: ✓ Found '{cat}'!")
+                    else:
+                        print(f"  YOLOE: ✗ '{cat}' not confirmed visually.")
+            except ImportError:
+                print("  (YOLOE not available — skipping visual verification)")
+            except Exception as e:
+                print(f"  YOLOE error: {e}")
+
             print(f"  Done.")
 
             from vlmaps.utils.habitat_utils import agent_state2tf
