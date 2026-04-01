@@ -231,7 +231,7 @@ class HabitatLanguageRobot(LangRobot):
         if dataset_type == "hssd":
             nav_settings = habitat_sim.NavMeshSettings()
             nav_settings.set_defaults()
-            nav_settings.agent_radius = 0.1
+            nav_settings.agent_radius = 0.25
             nav_settings.agent_height = 1.5
             # include_static_objects: try as NavMeshSettings attribute (0.3.x),
             # then as keyword arg (0.2.x), then fall back silently.

@@ -108,13 +108,12 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarr
         if scores_filtered[i] > heat_2d[row, col]:
             heat_2d[row, col] = scores_filtered[i]
 
-    # Distance decay from high-score cells
+    # Tight distance decay — only a ~3-cell (15 cm) fringe around real detections
     mask = heat_2d > 0
     if mask.any():
         dist = distance_transform_edt(~mask)
-        heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.05, 0, 1).astype(np.float32))
-        # Suppress low-confidence far-away glow
-        heat_2d[heat_2d < 0.1] = 0
+        heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.3, 0, 1).astype(np.float32))
+        heat_2d[heat_2d < 0.15] = 0
 
     return heat_2d
 
@@ -181,7 +180,7 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     robot._set_nav_curr_pose()
     dx = target_row - robot.curr_pos_on_map[0]   # positive = south
     dy = target_col - robot.curr_pos_on_map[1]   # positive = east
-    angle = np.arctan2(dy, -dx) * 180.0 / np.pi  # 0°=north, +CW
+    angle = np.arctan2(-dy, dx) * 180.0 / np.pi  # 0°=north, +CW, face target
     turn = (angle - robot.curr_ang_deg_on_map + 180) % 360 - 180
     robot.turn(turn)
     robot._set_nav_curr_pose()
