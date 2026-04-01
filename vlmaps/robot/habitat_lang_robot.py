@@ -163,7 +163,16 @@ class HabitatLanguageRobot(LangRobot):
             nav_settings.set_defaults()
             nav_settings.agent_radius = 0.1
             nav_settings.agent_height = 1.5
-            self.sim.recompute_navmesh(self.sim.pathfinder, nav_settings)
+            # include_static_objects: try as NavMeshSettings attribute (0.3.x),
+            # then as keyword arg (0.2.x), then fall back silently.
+            try:
+                nav_settings.include_static_objects = True
+            except AttributeError:
+                pass
+            try:
+                self.sim.recompute_navmesh(self.sim.pathfinder, nav_settings, include_static_objects=True)
+            except TypeError:
+                self.sim.recompute_navmesh(self.sim.pathfinder, nav_settings)
             assert self.sim.pathfinder.is_loaded, "HSSD navmesh recomputation failed"
 
         # TODO: add in document to enable this features

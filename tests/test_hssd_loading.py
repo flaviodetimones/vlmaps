@@ -95,7 +95,14 @@ def test_hssd_basic(scene_dataset_config: str, scene_id: str) -> bool:
     navmesh_settings.set_defaults()
     navmesh_settings.agent_radius = 0.1
     navmesh_settings.agent_height = 1.5
-    success = sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
+    try:
+        navmesh_settings.include_static_objects = True
+    except AttributeError:
+        pass
+    try:
+        success = sim.recompute_navmesh(sim.pathfinder, navmesh_settings, include_static_objects=True)
+    except TypeError:
+        success = sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
     assert success, "NavMesh computation failed"
     assert sim.pathfinder.is_loaded, "PathFinder reports navmesh not loaded"
     print("✓ NavMesh computed and loaded")

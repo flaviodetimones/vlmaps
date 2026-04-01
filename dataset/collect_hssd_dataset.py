@@ -95,15 +95,27 @@ def main():
     parser.add_argument("--scene_dataset_config",
                         default="/workspace/data/versioned_data/hssd-hab/hssd-hab.scene_dataset_config.json")
     parser.add_argument("--scene_id", default="102344280")
-    parser.add_argument("--output_dir",
-                        default="/workspace/data/vlmaps_dataset_hssd/102344280_1")
+    parser.add_argument("--scene_number", type=int, default=None,
+                        help="Scene number for the output directory name (auto-detected if omitted)")
+    parser.add_argument("--output_dir", default=None,
+                        help="Override output directory (default: derived from scene_id and scene_number)")
     args = parser.parse_args()
 
     if not os.path.exists(args.scene_dataset_config):
         print(f"ERROR: not found: {args.scene_dataset_config}")
         sys.exit(1)
 
-    out = Path(args.output_dir)
+    base_dir = Path("/workspace/data/vlmaps_dataset_hssd")
+    if args.output_dir is not None:
+        out = Path(args.output_dir)
+    else:
+        if args.scene_number is not None:
+            n = args.scene_number
+        else:
+            # Auto-detect: find next available scene number
+            existing = sorted(base_dir.glob(f"{args.scene_id}_*")) if base_dir.exists() else []
+            n = len(existing)
+        out = base_dir / f"{args.scene_id}_{n}"
     rgb_dir   = out / "rgb"
     depth_dir = out / "depth"
     rgb_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +140,14 @@ def main():
     nav_settings.set_defaults()
     nav_settings.agent_radius = 0.1
     nav_settings.agent_height = 1.5
-    sim.recompute_navmesh(sim.pathfinder, nav_settings)
+    try:
+        nav_settings.include_static_objects = True
+    except AttributeError:
+        pass
+    try:
+        sim.recompute_navmesh(sim.pathfinder, nav_settings, include_static_objects=True)
+    except TypeError:
+        sim.recompute_navmesh(sim.pathfinder, nav_settings)
     assert sim.pathfinder.is_loaded, "NavMesh failed to load"
 
     state = habitat_sim.AgentState()
@@ -154,19 +173,18 @@ def main():
 
         moved = False
         if key == ord("w"):
-            agent.act("move_forward")
+            obs = sim.step("move_forward")
             moved = True
         elif key == ord("a"):
-            agent.act("turn_left")
+            obs = sim.step("turn_left")
             moved = True
         elif key == ord("d"):
-            agent.act("turn_right")
+            obs = sim.step("turn_right")
             moved = True
         elif key == ord("q"):
             break
 
         if moved:
-            obs = sim.get_sensor_observations()
             save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
             frame_id += 1
 
