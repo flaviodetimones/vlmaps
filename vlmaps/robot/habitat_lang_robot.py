@@ -84,7 +84,11 @@ class HabitatLanguageRobot(LangRobot):
             self._build_navmesh_obstacle_map(Path(vlmaps_data_dir) / "poses.txt")
 
         cropped_obst_map = self.map.get_obstacle_cropped()
-        if self.config.map_config.potential_obstacle_names and self.config.map_config.obstacle_names:
+        # customize_obstacle_map intersects semantic features with the obstacle map.
+        # For HSSD this removes navmesh walls that lack semantic labels, leaving an
+        # almost obstacle-free map and causing straight-line paths through walls.
+        # Skip it for HSSD: the navmesh already encodes all obstacles correctly.
+        if dataset_type != "hssd" and self.config.map_config.potential_obstacle_names and self.config.map_config.obstacle_names:
             print("come here")
             self.map.customize_obstacle_map(
                 self.config.map_config.potential_obstacle_names,
