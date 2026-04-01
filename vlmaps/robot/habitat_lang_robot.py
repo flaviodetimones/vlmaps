@@ -88,6 +88,9 @@ class HabitatLanguageRobot(LangRobot):
         # For HSSD this removes navmesh walls that lack semantic labels, leaving an
         # almost obstacle-free map and causing straight-line paths through walls.
         # Skip it for HSSD: the navmesh already encodes all obstacles correctly.
+        # Still init CLIP so that init_categories() works for semantic search later.
+        if dataset_type == "hssd" and not hasattr(self.map, "clip_model"):
+            self.map._init_clip()
         if dataset_type != "hssd" and self.config.map_config.potential_obstacle_names and self.config.map_config.obstacle_names:
             print("come here")
             self.map.customize_obstacle_map(
