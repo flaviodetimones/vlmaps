@@ -77,6 +77,12 @@ class HabitatLanguageRobot(LangRobot):
 
         self.setup_map(vlmaps_data_dir)
 
+        # For HSSD the voxel-height obstacle map is unreliable — replace with
+        # a navmesh-based map so path planning has correct free/obstacle cells.
+        dataset_type = str(getattr(self.config, "dataset_type", "mp3d"))
+        if dataset_type == "hssd":
+            self._build_navmesh_obstacle_map(Path(vlmaps_data_dir) / "poses.txt")
+
         cropped_obst_map = self.map.get_obstacle_cropped()
         if self.config.map_config.potential_obstacle_names and self.config.map_config.obstacle_names:
             print("come here")
@@ -95,6 +101,53 @@ class HabitatLanguageRobot(LangRobot):
         )
 
         # self._setup_localizer(vlmaps_data_dir)
+
+    def _build_navmesh_obstacle_map(self, poses_path: Path) -> None:
+        """Replace the voxel-height obstacle map with a navmesh-based one.
+
+        For HSSD scenes almost every floor cell also has obstacle voxels above
+        it (robot navigated near walls), so the standard voxel approach leaves
+        nearly no navigable cells. The navmesh correctly encodes navigability
+        regardless of observation coverage. Updates self.map in-place.
+        """
+        from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
+        import numpy as np
+
+        m = self.map
+        gs, cs = m.gs, m.cs
+
+        any_mapped = np.any(m.occupied_ids >= 0, axis=2)
+        x_idx, y_idx = np.where(any_mapped)
+        if len(x_idx) == 0:
+            return
+        rmin, rmax = int(np.min(x_idx)), int(np.max(x_idx))
+        cmin, cmax = int(np.min(y_idx)), int(np.max(y_idx))
+
+        poses = np.loadtxt(poses_path)
+        init_hab_tf = cvt_pose_vec2tf(poses[0])
+        base_rot_inv = m.base_transform[:3, :3].T
+
+        rows_arr = np.arange(rmin, rmax + 1)
+        cols_arr = np.arange(cmin, cmax + 1)
+        R, C = np.meshgrid(rows_arr, cols_arr, indexing="ij")
+        x_fwd  = (gs / 2 - R) * cs
+        y_left = (gs / 2 - C) * cs
+
+        pts_base = np.stack([x_fwd.ravel(), y_left.ravel(), np.zeros(R.size)], axis=1)
+        pts_hab_rel = (base_rot_inv @ pts_base.T).T
+        pts_hab_abs = (init_hab_tf[:3, :3] @ pts_hab_rel.T).T + init_hab_tf[:3, 3]
+
+        navigable = np.array([self.sim.pathfinder.is_navigable(p) for p in pts_hab_abs], dtype=bool)
+
+        obstacle_map = np.zeros((gs, gs), dtype=np.uint8)
+        obstacle_map[rmin:rmax + 1, cmin:cmax + 1] = navigable.reshape(R.shape).astype(np.uint8)
+
+        m.obstacles_map = obstacle_map
+        m.rmin = rmin
+        m.rmax = rmax
+        m.cmin = cmin
+        m.cmax = cmax
+        m.obstacles_cropped = obstacle_map[rmin:rmax + 1, cmin:cmax + 1]
 
     def setup_map(self, vlmaps_data_dir: str):
         self.load_scene_map(vlmaps_data_dir, self.config["map_config"])
