@@ -174,6 +174,19 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
 
 # ── Navigation helpers ────────────────────────────────────────────────────────
 
+def face_toward_pos(robot, target_row: float, target_col: float) -> None:
+    """Turn robot to face directly toward a specific map (row, col) position.
+    Uses the same angle convention as VLMaps (0°=north, +CW) but correctly
+    normalises to [-180, 180] so the robot always takes the shortest turn."""
+    robot._set_nav_curr_pose()
+    dx = target_row - robot.curr_pos_on_map[0]   # positive = south
+    dy = target_col - robot.curr_pos_on_map[1]   # positive = east
+    angle = np.arctan2(dy, -dx) * 180.0 / np.pi  # 0°=north, +CW
+    turn = (angle - robot.curr_ang_deg_on_map + 180) % 360 - 180
+    robot.turn(turn)
+    robot._set_nav_curr_pose()
+
+
 def find_best_start_pose(robot):
     """
     Scan ~30 evenly-spaced trajectory poses and return the one whose 2-D map
@@ -289,8 +302,14 @@ def main(config: DictConfig) -> None:
             if room_goal is not None:
                 print(f"  Room map match: navigating to region centroid {room_goal}")
                 robot.move_to(list(room_goal))
+                boundary_pos = None
             else:
-                robot.move_to_object(cat)
+                # Stage 1: navigate to 0.5m standoff
+                robot._set_nav_curr_pose()
+                standoff_pos, boundary_pos = robot.map.get_standoff_pos(
+                    robot.curr_pos_on_map, cat, standoff_m=0.5)
+                print(f"  Navigating to 0.5m standoff: {standoff_pos}  (boundary: {boundary_pos})")
+                robot.move_to(standoff_pos)
 
             # Capture planned path for visualization
             path_cells = getattr(robot, "last_planned_path", None) or []
@@ -316,22 +335,26 @@ def main(config: DictConfig) -> None:
                          path_cells=path_cells,
                          label=f"[{i+1}/{n_actions}] -> {cat}")
 
-            show_obs(robot, f"Arrived: {cat}")
+            show_obs(robot, f"Arrived (0.5m): {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Arrived: {cat}")
+                     path_cells=path_cells, label=f"Arrived (0.5m): {cat}")
 
-            # ── Face the object and verify with YOLOE ──
-            print(f"  Turning to face '{cat}'...")
-            try:
-                robot.face(cat)
-            except Exception:
-                pass  # face() may fail if object not in map — still show arrival
-            robot._set_nav_curr_pose()
-            show_obs(robot, f"Facing: {cat}")
+            # ── Face the object using the boundary computed at planning time ──
+            print(f"  Turning to face '{cat}' from 0.5m...")
+            if room_goal is None:
+                # boundary_pos is consistent with the standoff we navigated to
+                face_toward_pos(robot, boundary_pos[0], boundary_pos[1])
+            else:
+                try:
+                    robot.face(cat)
+                    robot._set_nav_curr_pose()
+                except Exception:
+                    pass
+            show_obs(robot, f"Facing (0.5m): {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Facing: {cat}")
+                     path_cells=path_cells, label=f"Facing (0.5m): {cat}")
 
-            # YOLOE verification — overlay result on the 1st person window
+            # Stage 1: YOLOE at 0.5m
             _yoloe_confirmed = False
             try:
                 from vlmaps.utils.yoloe_utils import yoloe_verify
@@ -341,17 +364,54 @@ def main(config: DictConfig) -> None:
                     _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
                     if _ann_frame is not None:
                         ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                        show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
+                        show_obs(robot, f"YOLOE 0.5m: {cat}", yoloe_frame_bgr=ann_bgr)
                     if _yoloe_confirmed:
-                        print(f"  YOLOE: ✓ Found '{cat}'!")
+                        print(f"  YOLOE (0.5m): ✓ Found '{cat}'!")
                     else:
-                        print(f"  YOLOE: ✗ '{cat}' not confirmed visually.")
+                        print(f"  YOLOE (0.5m): ✗ '{cat}' not detected. Backing off to 1m...")
             except ImportError:
                 print("  (YOLOE not available — skipping visual verification)")
             except Exception as e:
-                print(f"  YOLOE error: {e}")
+                print(f"  YOLOE error at 0.5m: {e}")
 
-            print(f"  Done.")
+            # Stage 2: If not confirmed at 0.5m, back off to 1m and retry
+            if not _yoloe_confirmed and room_goal is None:
+                robot._set_nav_curr_pose()
+                standoff_pos_far, boundary_pos_far = robot.map.get_standoff_pos(
+                    robot.curr_pos_on_map, cat, standoff_m=1.0)
+                print(f"  Navigating to 1m standoff: {standoff_pos_far}  (boundary: {boundary_pos_far})")
+                try:
+                    robot.move_to(standoff_pos_far)
+                except Exception as e:
+                    print(f"  [warn] Could not navigate to 1m standoff: {e}")
+                robot._set_nav_curr_pose()
+
+                show_obs(robot, f"Arrived (1m): {cat}")
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         label=f"Arrived (1m): {cat}")
+
+                print(f"  Turning to face '{cat}' from 1m...")
+                face_toward_pos(robot, boundary_pos_far[0], boundary_pos_far[1])
+                show_obs(robot, f"Facing (1m): {cat}")
+
+                try:
+                    obs = robot.sim.get_sensor_observations(0)
+                    if "color_sensor" in obs:
+                        frame = obs["color_sensor"][:, :, :3]
+                        _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
+                        if _ann_frame is not None:
+                            ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                            show_obs(robot, f"YOLOE 1m: {cat}", yoloe_frame_bgr=ann_bgr)
+                        if _yoloe_confirmed:
+                            print(f"  YOLOE (1m): ✓ Found '{cat}'!")
+                        else:
+                            print(f"  YOLOE (1m): ✗ '{cat}' still not confirmed.")
+                except ImportError:
+                    pass
+                except Exception as e:
+                    print(f"  YOLOE error at 1m: {e}")
+
+            print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
 
             from vlmaps.utils.habitat_utils import agent_state2tf
             agent_state = robot.sim.get_agent(0).get_state()

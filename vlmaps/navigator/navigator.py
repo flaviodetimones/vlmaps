@@ -24,7 +24,15 @@ class Navigator:
         start = self._convert_full_map_pos_to_cropped_map_pos(start_full_map)
         goal = self._convert_full_map_pos_to_cropped_map_pos(goal_full_map)
         if self._check_if_start_in_graph_obstacle(start):
-            self._rebuild_visgraph(start, vis)
+            try:
+                self._rebuild_visgraph(start, vis)
+            except Exception:
+                # pyvisgraph rebuild failed (known bug); snap start to nearest free cell
+                free_rows, free_cols = np.where(self.obs_map == 1)
+                if len(free_rows) > 0:
+                    dist_sq = (free_rows - start[0]) ** 2 + (free_cols - start[1]) ** 2
+                    best = int(np.argmin(dist_sq))
+                    start = [float(free_rows[best]), float(free_cols[best])]
         paths = plan_to_pos_v2(start, goal, self.obs_map, self.visgraph, vis)
         paths = self.shift_path(paths, self.rowmin, self.colmin)
         return paths

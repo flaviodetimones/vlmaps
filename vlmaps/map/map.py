@@ -202,6 +202,39 @@ class Map:
 
         return self.nearest_point_on_polygon(curr_pos, contours[id])
 
+    def get_standoff_pos(self, curr_pos: List[float], name: str, standoff_m: float):
+        """Return (standoff_pos, boundary_pos) where standoff_pos is standoff_m meters
+        away from the nearest object boundary along the direction from object toward robot.
+        boundary_pos is the actual point on the polygon boundary (use it for facing)."""
+        contours, centers, bbox_list = self.get_pos(name)
+        ids_list = self.filter_small_objects(bbox_list, area_thres=10)
+        contours = [contours[i] for i in ids_list]
+        centers = [centers[i] for i in ids_list]
+        bbox_list = [bbox_list[i] for i in ids_list]
+        if len(centers) == 0:
+            return curr_pos, curr_pos
+        obj_id = self.select_nearest_obj(centers, bbox_list, curr_pos)
+        boundary_pos = self.nearest_point_on_polygon(curr_pos, contours[obj_id])
+
+        # Compute direction from boundary toward robot
+        standoff_cells = standoff_m / self.cs
+        dr = curr_pos[0] - boundary_pos[0]
+        dc = curr_pos[1] - boundary_pos[1]
+        dist = np.sqrt(dr ** 2 + dc ** 2)
+        if dist < 1e-3:
+            # Robot is on the boundary; use direction from object center
+            center = centers[obj_id]
+            dr = curr_pos[0] - center[0]
+            dc = curr_pos[1] - center[1]
+            dist = np.sqrt(dr ** 2 + dc ** 2)
+        if dist < 1e-3:
+            return boundary_pos, boundary_pos
+        dr /= dist
+        dc /= dist
+        standoff_pos = [int(boundary_pos[0] + dr * standoff_cells),
+                        int(boundary_pos[1] + dc * standoff_cells)]
+        return standoff_pos, boundary_pos
+
     def nearest_point_on_polygon(self, coord: List[float], polygon: List[List[float]]):
         # Create a Shapely Point from the given coordinate
         point = Point(coord)
