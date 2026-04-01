@@ -149,6 +149,16 @@ class HabitatLanguageRobot(LangRobot):
         m.cmax = cmax
         m.obstacles_cropped = obstacle_map[rmin:rmax + 1, cmin:cmax + 1]
 
+        # The dataloader is created before this method runs and caches rmin/cmin
+        # from the old voxel-based map — sync it so the visgraph uses correct offsets.
+        if hasattr(self, "vlmaps_dataloader"):
+            self.vlmaps_dataloader.rmin = rmin
+            self.vlmaps_dataloader.xmax = rmax
+            self.vlmaps_dataloader.cmin = cmin
+            self.vlmaps_dataloader.ymax = cmax
+            self.vlmaps_dataloader.obstacles_cropped = m.obstacles_cropped
+            self.vlmaps_dataloader.obstacles = m.obstacles_map
+
     def setup_map(self, vlmaps_data_dir: str):
         self.load_scene_map(vlmaps_data_dir, self.config["map_config"])
 
