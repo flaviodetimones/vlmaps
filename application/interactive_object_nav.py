@@ -81,7 +81,107 @@ def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
     cv2.waitKey(1)
 
 
-def compute_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarray:
+def postprocess_heatmap(
+    heatmap: np.ndarray,
+    blur_ksize: int = 5,
+    blur_sigma: float = 1.0,
+    rel_thresh: float = 0.5,
+    min_area: int = 3,
+    score_mode: str = "mean_log_area",
+    keep_ratio: float = 0.2,
+):
+    """Remove spurious small activations from a 2D heatmap.
+
+    Pipeline:
+      1. Light Gaussian blur to suppress high-frequency noise.
+      2. Relative threshold (fraction of smoothed max) to binarise.
+      3. Connected components on the binary mask.
+      4. Score each component: 'mean_log_area' (default) or 'max_sqrt_area'.
+      5. Keep components whose score >= keep_ratio * best_score.
+
+    Args:
+        heatmap:    float32 (H, W) — raw heatmap from compute_heatmap.
+        blur_ksize: Gaussian kernel size (0 = skip blur).
+        blur_sigma: Gaussian sigma.
+        rel_thresh: Threshold = rel_thresh * smoothed_max.
+        min_area:   Minimum component area to consider (px²).
+        score_mode: 'mean_log_area' or 'max_sqrt_area'.
+        keep_ratio: Components with score >= keep_ratio * best_score are kept.
+
+    Returns:
+        cleaned_heatmap: float32, same shape — zeros outside retained components.
+        final_mask:      bool array — True where a retained component is.
+        kept_components: list of dicts with keys label, area, max_val, mean_val,
+                         sum_val, bbox (x,y,w,h), centroid (row,col), score.
+                         Sorted by score descending.
+    """
+    if heatmap.max() < 1e-6:
+        return heatmap.copy(), np.zeros(heatmap.shape, dtype=bool), []
+
+    h = heatmap.astype(np.float32)
+
+    # 1. Gaussian blur (blur_ksize must be odd)
+    if blur_ksize > 0:
+        ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+        h_smooth = cv2.GaussianBlur(h, (ksize, ksize), blur_sigma)
+    else:
+        h_smooth = h.copy()
+
+    # 2. Relative threshold
+    thr = rel_thresh * h_smooth.max()
+    binary = (h_smooth >= thr).astype(np.uint8)
+
+    # 3. Connected components (8-connectivity)
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    # 4. Score each component (label 0 = background)
+    components = []
+    for lbl in range(1, n_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        mask_lbl = labels == lbl
+        vals = heatmap[mask_lbl]
+        max_val = float(vals.max())
+        mean_val = float(vals.mean())
+        sum_val = float(vals.sum())
+
+        if score_mode == "mean_log_area":
+            score = mean_val * np.log1p(area)
+        else:  # "max_sqrt_area"
+            score = max_val * np.sqrt(area)
+
+        bbox = (
+            int(stats[lbl, cv2.CC_STAT_LEFT]),
+            int(stats[lbl, cv2.CC_STAT_TOP]),
+            int(stats[lbl, cv2.CC_STAT_WIDTH]),
+            int(stats[lbl, cv2.CC_STAT_HEIGHT]),
+        )
+        centroid = (float(centroids[lbl, 1]), float(centroids[lbl, 0]))  # (row, col)
+
+        components.append(dict(
+            label=lbl, area=area, max_val=max_val, mean_val=mean_val,
+            sum_val=sum_val, bbox=bbox, centroid=centroid, score=score,
+        ))
+
+    if not components:
+        return heatmap.copy(), np.zeros(heatmap.shape, dtype=bool), []
+
+    # 5. Keep components competitive with the best one
+    best_score = max(c["score"] for c in components)
+    kept = [c for c in components if c["score"] >= keep_ratio * best_score]
+    kept.sort(key=lambda c: c["score"], reverse=True)
+
+    # 6. Build outputs
+    final_mask = np.zeros(heatmap.shape, dtype=bool)
+    for c in kept:
+        final_mask |= (labels == c["label"])
+
+    cleaned_heatmap = np.where(final_mask, heatmap, 0.0).astype(np.float32)
+    return cleaned_heatmap, final_mask, kept
+
+
+def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
     """Compute the 2D heatmap using continuous CLIP scores instead of binary argmax.
 
     Steps:
@@ -89,6 +189,11 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarr
       2. Keep only voxels where the target is the argmax AND score > threshold.
       3. Project the continuous scores to 2D (max-pool per column).
       4. Apply distance decay from the high-score cells.
+      5. Postprocess to suppress spurious small activations.
+
+    Returns:
+        heat_2d:         float32 (gs, gs) — cleaned heatmap.
+        kept_components: list of dicts from postprocess_heatmap (score-sorted).
     """
     from vlmaps.utils.index_utils import find_similar_category_id
 
@@ -115,7 +220,13 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarr
         heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.3, 0, 1).astype(np.float32))
         heat_2d[heat_2d < 0.15] = 0
 
-    return heat_2d
+    # Postprocess: remove spurious small activations
+    heat_2d, _, kept_components = postprocess_heatmap(heat_2d)
+    if kept_components:
+        print(f"  Heatmap postprocess: kept {len(kept_components)} component(s) "
+              f"(areas: {[c['area'] for c in kept_components]})")
+
+    return heat_2d, kept_components
 
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
@@ -184,6 +295,127 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     turn = (angle - robot.curr_ang_deg_on_map + 180) % 360 - 180
     robot.turn(turn)
     robot._set_nav_curr_pose()
+
+
+def scan_360_and_verify(
+    robot,
+    cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+    path_cells: list,
+    step_deg: int = 20,
+) -> bool:
+    """Rotate 360° in step_deg increments, running YOLOE at each step.
+
+    All rotation is done via discrete sim.step() actions — no teleportation.
+
+    Args:
+        robot:      HabitatLanguageRobot instance.
+        cat:        Category name to verify.
+        rgb_map_2d: Top-down RGB background (for show_map).
+        heatmap:    Current heatmap (for show_map overlay).
+        path_cells: Planned path cells (for show_map overlay).
+        step_deg:   Degrees per scan step (default 20).
+
+    Returns:
+        True if YOLOE detects the object during the scan, False otherwise.
+    """
+    try:
+        from vlmaps.utils.yoloe_utils import yoloe_verify
+    except ImportError:
+        print("  (YOLOE not available — skipping 360° scan)")
+        return False
+
+    n_steps = 360 // step_deg
+    print(f"  Starting 360° scan ({n_steps} steps of {step_deg}°)...")
+
+    for step in range(n_steps):
+        angle_done = step * step_deg
+        # Smooth discrete rotation — robot.turn uses execute_actions internally
+        robot.turn(float(step_deg))
+        robot._set_nav_curr_pose()
+
+        show_obs(robot, f"Scan {angle_done}°/{360}°: {cat}")
+        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                 path_cells=path_cells,
+                 label=f"Scan {angle_done}°: {cat}")
+
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            continue
+
+        frame = obs["color_sensor"][:, :, :3]
+        found, ann_frame = yoloe_verify(frame, cat)
+        if ann_frame is not None:
+            status = "FOUND" if found else "not found"
+            ann_bgr = cv2.cvtColor(ann_frame, cv2.COLOR_RGB2BGR)
+            show_obs(robot, f"YOLOE scan {angle_done}° ({status}): {cat}",
+                     yoloe_frame_bgr=ann_bgr)
+
+        if found:
+            print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
+            return True
+
+    print(f"  YOLOE scan: '{cat}' not found after full 360°.")
+    return False
+
+
+def navigate_to_alternative(
+    robot,
+    cat: str,
+    kept_components: list,
+    current_pos,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+) -> bool:
+    """Navigate to the best heatmap component NOT near the current position.
+
+    Picks the highest-scoring component whose centroid is at least 20 cells
+    from current_pos, plans a smooth path to its standoff, and faces it.
+
+    Returns True if an alternative was found and navigated to.
+    """
+    if not kept_components:
+        print("  No alternative components in heatmap — giving up.")
+        return False
+
+    curr_row, curr_col = float(current_pos[0]), float(current_pos[1])
+    MIN_DIST_CELLS = 20  # ~1 m (cell_size=0.05 m)
+
+    # Components are score-sorted descending; pick first that is far enough away
+    alt = None
+    for c in kept_components:
+        dr = c["centroid"][0] - curr_row
+        dc = c["centroid"][1] - curr_col
+        if np.sqrt(dr * dr + dc * dc) >= MIN_DIST_CELLS:
+            alt = c
+            break
+
+    if alt is None:
+        print("  All heatmap components are near current position — giving up.")
+        return False
+
+    alt_centroid = [int(alt["centroid"][0]), int(alt["centroid"][1])]
+    print(f"  Alternative: component score={alt['score']:.3f} "
+          f"area={alt['area']} centroid={alt_centroid}")
+
+    try:
+        robot._set_nav_curr_pose()
+        standoff_alt, boundary_alt = robot.map.get_standoff_pos(
+            robot.curr_pos_on_map, cat, standoff_m=1.0)
+        # Override standoff with the alternative centroid direction if needed
+        # (get_standoff_pos picks the nearest VLMap region regardless of centroid)
+        print(f"  Alternative standoff: {standoff_alt}  boundary: {boundary_alt}")
+        robot.move_to(standoff_alt)
+        robot._set_nav_curr_pose()
+        face_toward_pos(robot, boundary_alt[0], boundary_alt[1])
+        show_obs(robot, f"Alternative arrival: {cat}")
+        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                 label=f"Alternative: {cat}")
+        return True
+    except Exception as e:
+        print(f"  Alternative navigation failed: {e}")
+        return False
 
 
 def find_best_start_pose(robot):
@@ -290,7 +522,7 @@ def main(config: DictConfig) -> None:
 
             # Compute heatmap ONCE per category (may call LLM API once if needed)
             print("  Computing semantic heatmap...")
-            heatmap = compute_heatmap(robot, cat)
+            heatmap, kept_components = compute_heatmap(robot, cat)
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
             cv2.waitKey(200)
 
@@ -409,6 +641,42 @@ def main(config: DictConfig) -> None:
                     pass
                 except Exception as e:
                     print(f"  YOLOE error at 1m: {e}")
+
+            # Stage 3: 360° scan if still not confirmed
+            if not _yoloe_confirmed:
+                print(f"  '{cat}' not found at standoff — starting 360° scan...")
+                _yoloe_confirmed = scan_360_and_verify(
+                    robot, cat, rgb_map_2d, heatmap, path_cells, step_deg=20
+                )
+
+            # Stage 4: Alternative route if 360° scan also failed
+            if not _yoloe_confirmed:
+                print(f"  360° scan failed — searching alternative route...")
+                robot._set_nav_curr_pose()
+                _navigated_alt = navigate_to_alternative(
+                    robot, cat, kept_components,
+                    robot.curr_pos_on_map, rgb_map_2d, heatmap
+                )
+                if _navigated_alt:
+                    # One final YOLOE check at the alternative location
+                    try:
+                        obs = robot.sim.get_sensor_observations(0)
+                        if "color_sensor" in obs:
+                            frame = obs["color_sensor"][:, :, :3]
+                            _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
+                            if _ann_frame is not None:
+                                ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                                show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
+                            if _yoloe_confirmed:
+                                print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
+                            else:
+                                print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
+                    except ImportError:
+                        pass
+                    except Exception as e:
+                        print(f"  YOLOE error at alternative: {e}")
+                else:
+                    print(f"  No viable alternative route for '{cat}'.")
 
             print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
 
