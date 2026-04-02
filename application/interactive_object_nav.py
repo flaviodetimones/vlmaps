@@ -303,61 +303,89 @@ def scan_360_and_verify(
     rgb_map_2d: np.ndarray,
     heatmap: np.ndarray,
     path_cells: list,
-    step_deg: int = 20,
 ) -> bool:
-    """Rotate 360° in step_deg increments, running YOLOE at each step.
+    """Rotate 360° with real-time display and asynchronous YOLOE detection.
 
-    All rotation is done via discrete sim.step() actions — no teleportation.
+    - Uses native 5° sim actions for smooth, continuous rotation.
+    - YOLOE runs in a background thread — the display never freezes.
+    - Shows the latest YOLOE annotation overlaid on the live camera feed.
+    - Stops as soon as the object is confirmed.
 
-    Args:
-        robot:      HabitatLanguageRobot instance.
-        cat:        Category name to verify.
-        rgb_map_2d: Top-down RGB background (for show_map).
-        heatmap:    Current heatmap (for show_map overlay).
-        path_cells: Planned path cells (for show_map overlay).
-        step_deg:   Degrees per scan step (default 20).
-
-    Returns:
-        True if YOLOE detects the object during the scan, False otherwise.
+    Returns True if YOLOE detects the object during the scan.
     """
-    try:
-        from vlmaps.utils.yoloe_utils import yoloe_verify
-    except ImportError:
+    from vlmaps.utils.yoloe_utils import get_session
+
+    session = get_session(cat)
+    if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
 
-    n_steps = 360 // step_deg
-    print(f"  Starting 360° scan ({n_steps} steps of {step_deg}°)...")
+    # Native step is 5° (turn_angle param); full rotation = 72 steps
+    step_deg = robot.turn_angle   # 5° per action
+    n_steps = int(round(360 / step_deg))
+    print(f"  Starting 360° scan ({n_steps} steps × {step_deg}°, async YOLOE)…")
 
-    for step in range(n_steps):
-        angle_done = step * step_deg
-        # Smooth discrete rotation — robot.turn uses execute_actions internally
-        robot.turn(float(step_deg))
+    session.start_bg_thread()
+    found = False
+    last_ann_bgr = None
+
+    try:
+        for step in range(n_steps):
+            angle_done = int(step * step_deg)
+
+            # Single native sim action — no batching, so display stays smooth
+            robot.sim.step("turn_right")
+
+            obs = robot.sim.get_sensor_observations(0)
+            if "color_sensor" in obs:
+                frame_rgb = obs["color_sensor"][:, :, :3]
+
+                # Submit to YOLOE (non-blocking, background thread)
+                session.push_frame(frame_rgb)
+
+                # Read latest available YOLOE result (non-blocking)
+                det_found, ann_rgb = session.poll_result()
+                if ann_rgb is not None:
+                    last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+                if det_found:
+                    found = True
+
+                # Show frame: annotated if YOLOE has replied, raw otherwise
+                if last_ann_bgr is not None:
+                    label = f"Scan {angle_done}°: {'FOUND!' if found else cat}"
+                    show_obs(robot, label, yoloe_frame_bgr=last_ann_bgr)
+                else:
+                    show_obs(robot, f"Scan {angle_done}°: {cat}")
+
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=path_cells,
+                     label=f"Scan {angle_done}°: {cat}")
+
+            if found:
+                print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
+                break
+
+        # Wait briefly for the last in-flight result
+        if not found:
+            import time
+            time.sleep(0.6)
+            det_found, ann_rgb = session.poll_result()
+            if det_found:
+                found = True
+                if ann_rgb is not None:
+                    last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+                    show_obs(robot, f"Scan final: FOUND! {cat}",
+                             yoloe_frame_bgr=last_ann_bgr)
+                print(f"  YOLOE scan: FOUND '{cat}' (last frame)!")
+
+    finally:
+        session.stop_bg_thread()
+        # Restore pose tracking after raw sim steps
         robot._set_nav_curr_pose()
 
-        show_obs(robot, f"Scan {angle_done}°/{360}°: {cat}")
-        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                 path_cells=path_cells,
-                 label=f"Scan {angle_done}°: {cat}")
-
-        obs = robot.sim.get_sensor_observations(0)
-        if "color_sensor" not in obs:
-            continue
-
-        frame = obs["color_sensor"][:, :, :3]
-        found, ann_frame = yoloe_verify(frame, cat)
-        if ann_frame is not None:
-            status = "FOUND" if found else "not found"
-            ann_bgr = cv2.cvtColor(ann_frame, cv2.COLOR_RGB2BGR)
-            show_obs(robot, f"YOLOE scan {angle_done}° ({status}): {cat}",
-                     yoloe_frame_bgr=ann_bgr)
-
-        if found:
-            print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
-            return True
-
-    print(f"  YOLOE scan: '{cat}' not found after full 360°.")
-    return False
+    if not found:
+        print(f"  YOLOE scan: '{cat}' not found after full 360°.")
+    return found
 
 
 def navigate_to_alternative(
@@ -528,6 +556,10 @@ def main(config: DictConfig) -> None:
 
             robot.empty_recorded_actions()
 
+            # ── Get (or create) the YOLOE session for this target ─────────────
+            from vlmaps.utils.yoloe_utils import get_session, shutdown_session
+            _yoloe_session = get_session(cat)
+
             # ── Region-aware navigation: use room map if query matches a room ──
             room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
             if room_goal is not None:
@@ -535,11 +567,11 @@ def main(config: DictConfig) -> None:
                 robot.move_to(list(room_goal))
                 boundary_pos = None
             else:
-                # Stage 1: navigate to 0.5m standoff
+                # Navigate as close as possible (0.25 m); navmesh handles collisions
                 robot._set_nav_curr_pose()
                 standoff_pos, boundary_pos = robot.map.get_standoff_pos(
-                    robot.curr_pos_on_map, cat, standoff_m=0.5)
-                print(f"  Navigating to 0.5m standoff: {standoff_pos}  (boundary: {boundary_pos})")
+                    robot.curr_pos_on_map, cat, standoff_m=0.25)
+                print(f"  Navigating to standoff: {standoff_pos}  (boundary: {boundary_pos})")
                 robot.move_to(standoff_pos)
 
             # Capture planned path for visualization
@@ -566,14 +598,13 @@ def main(config: DictConfig) -> None:
                          path_cells=path_cells,
                          label=f"[{i+1}/{n_actions}] -> {cat}")
 
-            show_obs(robot, f"Arrived (0.5m): {cat}")
+            show_obs(robot, f"Arrived: {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Arrived (0.5m): {cat}")
+                     path_cells=path_cells, label=f"Arrived: {cat}")
 
-            # ── Face the object using the boundary computed at planning time ──
-            print(f"  Turning to face '{cat}' from 0.5m...")
+            # ── Face the object ───────────────────────────────────────────────
+            print(f"  Turning to face '{cat}'…")
             if room_goal is None:
-                # boundary_pos is consistent with the standoff we navigated to
                 face_toward_pos(robot, boundary_pos[0], boundary_pos[1])
             else:
                 try:
@@ -581,89 +612,51 @@ def main(config: DictConfig) -> None:
                     robot._set_nav_curr_pose()
                 except Exception:
                     pass
-            show_obs(robot, f"Facing (0.5m): {cat}")
+            show_obs(robot, f"Facing: {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Facing (0.5m): {cat}")
+                     path_cells=path_cells, label=f"Facing: {cat}")
 
-            # Stage 1: YOLOE at 0.5m
+            # Stage 1: YOLOE check at arrival position
             _yoloe_confirmed = False
-            try:
-                from vlmaps.utils.yoloe_utils import yoloe_verify
-                obs = robot.sim.get_sensor_observations(0)
-                if "color_sensor" in obs:
-                    frame = obs["color_sensor"][:, :, :3]
-                    _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
-                    if _ann_frame is not None:
-                        ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                        show_obs(robot, f"YOLOE 0.5m: {cat}", yoloe_frame_bgr=ann_bgr)
-                    if _yoloe_confirmed:
-                        print(f"  YOLOE (0.5m): ✓ Found '{cat}'!")
-                    else:
-                        print(f"  YOLOE (0.5m): ✗ '{cat}' not detected. Backing off to 1m...")
-            except ImportError:
-                print("  (YOLOE not available — skipping visual verification)")
-            except Exception as e:
-                print(f"  YOLOE error at 0.5m: {e}")
-
-            # Stage 2: If not confirmed at 0.5m, back off to 1m and retry
-            if not _yoloe_confirmed and room_goal is None:
-                robot._set_nav_curr_pose()
-                standoff_pos_far, boundary_pos_far = robot.map.get_standoff_pos(
-                    robot.curr_pos_on_map, cat, standoff_m=1.0)
-                print(f"  Navigating to 1m standoff: {standoff_pos_far}  (boundary: {boundary_pos_far})")
+            if _yoloe_session is not None:
                 try:
-                    robot.move_to(standoff_pos_far)
-                except Exception as e:
-                    print(f"  [warn] Could not navigate to 1m standoff: {e}")
-                robot._set_nav_curr_pose()
-
-                show_obs(robot, f"Arrived (1m): {cat}")
-                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                         label=f"Arrived (1m): {cat}")
-
-                print(f"  Turning to face '{cat}' from 1m...")
-                face_toward_pos(robot, boundary_pos_far[0], boundary_pos_far[1])
-                show_obs(robot, f"Facing (1m): {cat}")
-
-                try:
-                    obs = robot.sim.get_sensor_observations(0)
-                    if "color_sensor" in obs:
-                        frame = obs["color_sensor"][:, :, :3]
-                        _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
+                    obs_data = robot.sim.get_sensor_observations(0)
+                    if "color_sensor" in obs_data:
+                        frame = obs_data["color_sensor"][:, :, :3]
+                        _yoloe_confirmed, _ann_frame = _yoloe_session.check(frame)
                         if _ann_frame is not None:
                             ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                            show_obs(robot, f"YOLOE 1m: {cat}", yoloe_frame_bgr=ann_bgr)
+                            show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
-                            print(f"  YOLOE (1m): ✓ Found '{cat}'!")
+                            print(f"  YOLOE: ✓ Found '{cat}'!")
                         else:
-                            print(f"  YOLOE (1m): ✗ '{cat}' still not confirmed.")
-                except ImportError:
-                    pass
+                            print(f"  YOLOE: ✗ '{cat}' not detected.")
                 except Exception as e:
-                    print(f"  YOLOE error at 1m: {e}")
+                    print(f"  YOLOE error: {e}")
+            else:
+                print("  (YOLOE not available — skipping visual verification)")
 
-            # Stage 3: 360° scan if still not confirmed
+            # Stage 2: 360° real-time scan if not confirmed at arrival
             if not _yoloe_confirmed:
-                print(f"  '{cat}' not found at standoff — starting 360° scan...")
+                print(f"  Starting 360° real-time scan for '{cat}'…")
                 _yoloe_confirmed = scan_360_and_verify(
-                    robot, cat, rgb_map_2d, heatmap, path_cells, step_deg=20
+                    robot, cat, rgb_map_2d, heatmap, path_cells
                 )
 
-            # Stage 4: Alternative route if 360° scan also failed
+            # Stage 3: Alternative route if 360° scan also failed
             if not _yoloe_confirmed:
-                print(f"  360° scan failed — searching alternative route...")
+                print(f"  360° scan failed — searching alternative route…")
                 robot._set_nav_curr_pose()
                 _navigated_alt = navigate_to_alternative(
                     robot, cat, kept_components,
                     robot.curr_pos_on_map, rgb_map_2d, heatmap
                 )
-                if _navigated_alt:
-                    # One final YOLOE check at the alternative location
+                if _navigated_alt and _yoloe_session is not None:
                     try:
-                        obs = robot.sim.get_sensor_observations(0)
-                        if "color_sensor" in obs:
-                            frame = obs["color_sensor"][:, :, :3]
-                            _yoloe_confirmed, _ann_frame = yoloe_verify(frame, cat)
+                        obs_data = robot.sim.get_sensor_observations(0)
+                        if "color_sensor" in obs_data:
+                            frame = obs_data["color_sensor"][:, :, :3]
+                            _yoloe_confirmed, _ann_frame = _yoloe_session.check(frame)
                             if _ann_frame is not None:
                                 ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                                 show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
@@ -671,11 +664,9 @@ def main(config: DictConfig) -> None:
                                 print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
                             else:
                                 print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
-                    except ImportError:
-                        pass
                     except Exception as e:
                         print(f"  YOLOE error at alternative: {e}")
-                else:
+                elif not _navigated_alt:
                     print(f"  No viable alternative route for '{cat}'.")
 
             print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
@@ -687,6 +678,8 @@ def main(config: DictConfig) -> None:
 
         print("\nInstruction complete.")
 
+    from vlmaps.utils.yoloe_utils import shutdown_session
+    shutdown_session()
     cv2.destroyAllWindows()
 
 
