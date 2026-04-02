@@ -231,7 +231,7 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
              path_cells: list = None, label: str = "",
-             zoom_radius: int = 150, output_px: int = 700):
+             zoom_radius: int = 300, output_px: int = 700):
     """Display a top-down semantic map with optional zoom centered on the robot.
 
     Args:
@@ -582,68 +582,118 @@ def fine_visual_center(
     session,
     cat: str,
     img_w: int = 640,
-    tol_x_frac: float = 0.06,
-    max_iters: int = 10,
+    img_fov_h: float = 90.0,
+    max_turns: int = 6,
 ) -> bool:
-    """Fine-tune horizontal alignment so the detected bbox is centred in frame.
+    """One-shot horizontal centering: one YOLOE call → compute N turns → execute.
 
-    Uses the persistent YOLOE session to get bounding-box centre coordinates
-    and turns the robot left/right in single 5° steps until the horizontal
-    error falls within tolerance.
-
-    Note on vertical centering: the Habitat discrete action space has no
-    pitch control (only turn_left, turn_right, move_forward).  Vertical
-    alignment is therefore not achievable here; only horizontal centering
-    is performed.
+    Takes a single snapshot, reads the bbox centre, estimates how many 5°
+    discrete turns are needed to centre it, and executes them in one go.
+    No iterative re-checking — fast and leaves the robot facing the object.
 
     Args:
-        img_w:       Frame width in pixels (default 640 from sim config).
-        tol_x_frac:  Tolerance as fraction of img_w (default 6% → 38 px).
-        max_iters:   Maximum correction steps before giving up.
+        img_w:      Frame width in pixels (default 640 from sim config).
+        img_fov_h:  Horizontal field-of-view in degrees (default 90°).
+        max_turns:  Cap on the number of turns applied in either direction.
 
     Returns:
-        True if the object was centered within tolerance, False otherwise.
+        True if the object was detected and turns were applied, False otherwise.
     """
-    tol_px = tol_x_frac * img_w
-    img_cx = img_w / 2.0
+    obs = robot.sim.get_sensor_observations(0)
+    if "color_sensor" not in obs:
+        return False
 
-    print(f"  [center] Fine visual centering for '{cat}' "
-          f"(tol={tol_px:.0f} px, max {max_iters} steps)…")
+    frame = obs["color_sensor"][:, :, :3]
+    found, ann_rgb, bbox_center = session.check(frame)
 
-    for it in range(max_iters):
-        obs = robot.sim.get_sensor_observations(0)
-        if "color_sensor" not in obs:
-            break
+    if ann_rgb is not None:
+        show_obs(robot, f"Center: {cat}",
+                 yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
 
-        frame = obs["color_sensor"][:, :, :3]
-        found, ann_rgb, bbox_center = session.check(frame)
+    if not found or bbox_center is None:
+        print(f"  [center] '{cat}' not detected — skipping centering.")
+        return False
 
-        if not found or bbox_center is None:
-            print(f"  [center] Object lost at iter {it} — stopping centering.")
-            break
+    cx, _cy = bbox_center
+    err_x = cx - img_w / 2.0
+    # pixels per 5° step (turn_angle) based on horizontal fov
+    px_per_step = img_w * (robot.turn_angle / img_fov_h)
+    n_turns = int(round(err_x / px_per_step))
+    n_turns = max(-max_turns, min(max_turns, n_turns))
 
-        cx, _cy = bbox_center
-        err_x = cx - img_cx
+    print(f"  [center] err_x={err_x:+.1f}px → {abs(n_turns)}×"
+          f"{'turn_right' if n_turns >= 0 else 'turn_left'}")
 
-        if ann_rgb is not None:
-            lbl = f"Centering ({it+1}): err={err_x:+.0f}px"
-            show_obs(robot, lbl,
-                     yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
+    if n_turns == 0:
+        robot._set_nav_curr_pose()
+        return True
 
-        if abs(err_x) <= tol_px:
-            print(f"  [center] Centered: err_x={err_x:+.1f}px ≤ tol={tol_px:.0f}px")
-            robot._set_nav_curr_pose()
-            return True
-
-        # Single discrete turn toward the object
-        if err_x > 0:
-            robot.sim.step("turn_right")
-        else:
-            robot.sim.step("turn_left")
+    action = "turn_right" if n_turns > 0 else "turn_left"
+    for _ in range(abs(n_turns)):
+        robot.sim.step(action)
 
     robot._set_nav_curr_pose()
-    print(f"  [center] Centering finished ({it+1} iters, tolerance not met).")
-    return False
+
+    # Show result after centering
+    obs2 = robot.sim.get_sensor_observations(0)
+    if "color_sensor" in obs2:
+        show_obs(robot, f"Centered: {cat}")
+
+    return True
+
+
+def select_safe_goal_from_path(
+    path_cells: list,
+    heatmap: np.ndarray,
+    obs_map: np.ndarray,
+    min_dist_cells: float = 10.0,
+    max_dist_cells: float = 24.0,
+    clearance_cells: float = 3.0,
+) -> tuple:
+    """Walk planned path backward to find the best final viewing position.
+
+    The heatmap argmax is used as the estimated object position.  The function
+    scans the path from end to start and returns the last cell that is:
+      - between min_dist_cells and max_dist_cells from the object centroid, and
+      - at least clearance_cells away from the nearest obstacle.
+
+    Grid units: cs=0.05 m → 10 cells ≈ 0.5 m, 24 cells ≈ 1.2 m.
+
+    Args:
+        path_cells:      List of [row, col] grid cells from last_planned_path.
+        heatmap:         float32 (gs, gs) — current semantic heatmap.
+        obs_map:         uint8/bool (gs, gs) — 1=free, 0=obstacle.
+        min_dist_cells:  Minimum cells from object centroid (default 0.5 m).
+        max_dist_cells:  Maximum cells from object centroid (default 1.2 m).
+        clearance_cells: Minimum cells from any obstacle (default 0.15 m).
+
+    Returns:
+        best_goal:      [row, col] — selected navigation goal.
+        obj_centroid:   [row, col] — heatmap argmax (use as face-toward target).
+    """
+    obj_row, obj_col = np.unravel_index(np.argmax(heatmap), heatmap.shape)
+    obj_centroid = [int(obj_row), int(obj_col)]
+
+    if not path_cells:
+        return obj_centroid, obj_centroid
+
+    dist_to_obs = distance_transform_edt(obs_map)
+
+    for cell in reversed(path_cells):
+        row, col = int(cell[0]), int(cell[1])
+        dr = row - obj_row
+        dc = col - obj_col
+        dist = float(np.sqrt(dr * dr + dc * dc))
+        if 0 <= row < obs_map.shape[0] and 0 <= col < obs_map.shape[1]:
+            clearance = float(dist_to_obs[row, col])
+        else:
+            clearance = 0.0
+        if min_dist_cells <= dist <= max_dist_cells and clearance >= clearance_cells:
+            return [row, col], obj_centroid
+
+    # Fallback: use path end
+    last = path_cells[-1]
+    return [int(last[0]), int(last[1])], obj_centroid
 
 
 def find_best_start_pose(robot):
@@ -764,15 +814,28 @@ def main(config: DictConfig) -> None:
             room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
             if room_goal is not None:
                 print(f"  Room map match: navigating to region centroid {room_goal}")
-                robot.move_to(list(room_goal))
+                goal_pos = list(room_goal)
+                obj_centroid = goal_pos
+                robot.move_to(goal_pos)
                 boundary_pos = None
             else:
-                # Navigate as close as possible (0.25 m); navmesh handles collisions
+                # Step 1: plan to a close-approach standoff to get the path
                 robot._set_nav_curr_pose()
-                standoff_pos, boundary_pos = robot.map.get_standoff_pos(
+                standoff_pos, _ = robot.map.get_standoff_pos(
                     robot.curr_pos_on_map, cat, standoff_m=0.25)
-                print(f"  Navigating to standoff: {standoff_pos}  (boundary: {boundary_pos})")
+                print(f"  Planning initial path to standoff: {standoff_pos}")
                 robot.move_to(standoff_pos)
+                _initial_path = getattr(robot, "last_planned_path", None) or []
+
+                # Step 2: walk path backward to pick best viewpoint + object centroid
+                goal_pos, obj_centroid = select_safe_goal_from_path(
+                    _initial_path, heatmap, robot.map.obstacles_map
+                )
+                print(f"  Path-based goal: {goal_pos}  object centroid: {obj_centroid}")
+
+                # Step 3: re-plan to the selected goal
+                robot.empty_recorded_actions()
+                robot.move_to(goal_pos)
 
             # Capture planned path for visualization
             path_cells = getattr(robot, "last_planned_path", None) or []
@@ -794,7 +857,7 @@ def main(config: DictConfig) -> None:
             )
             if not completed:
                 nav_recovery_and_replan(
-                    robot, standoff_pos, cat, rgb_map_2d, heatmap
+                    robot, goal_pos, cat, rgb_map_2d, heatmap
                 )
 
             show_obs(robot, f"Arrived: {cat}")
@@ -804,7 +867,8 @@ def main(config: DictConfig) -> None:
             # ── Face the object ───────────────────────────────────────────────
             print(f"  Turning to face '{cat}'…")
             if room_goal is None:
-                face_toward_pos(robot, boundary_pos[0], boundary_pos[1])
+                # Orient toward heatmap centroid (argmax), not standoff boundary
+                face_toward_pos(robot, obj_centroid[0], obj_centroid[1])
             else:
                 try:
                     robot.face(cat)
