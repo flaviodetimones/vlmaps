@@ -230,40 +230,58 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
 
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
-             path_cells: list = None, label: str = ""):
-    """
-    Display a top-down semantic map with:
-      - RGB background of the scene
-      - Heatmap overlay for the queried category (if provided)
-      - Planned path drawn as a blue polyline
-      - Robot's current position as a green circle
+             path_cells: list = None, label: str = "",
+             zoom_radius: int = 150, output_px: int = 700):
+    """Display a top-down semantic map with optional zoom centered on the robot.
+
+    Args:
+        zoom_radius: Half-side of the crop window in map cells. The displayed
+                     region is (2*zoom_radius) × (2*zoom_radius) cells, upscaled
+                     to output_px for readability. Use 0 to show the full map.
+        output_px:   Target display size in pixels (square).
     """
     gs = robot.map.gs
+    row = int(robot.curr_pos_on_map[0])
+    col = int(robot.curr_pos_on_map[1])
 
-    # ── Base: RGB top-down map ────────────────────────────────────────────────
-    canvas = rgb_map_2d.astype(np.float32).copy()
+    # ── Crop region ───────────────────────────────────────────────────────────
+    if zoom_radius > 0:
+        r0 = max(0, row - zoom_radius)
+        r1 = min(gs, row + zoom_radius)
+        c0 = max(0, col - zoom_radius)
+        c1 = min(gs, col + zoom_radius)
+    else:
+        r0, r1, c0, c1 = 0, gs, 0, gs
+
+    # ── Base: RGB crop ────────────────────────────────────────────────────────
+    canvas = rgb_map_2d[r0:r1, c0:c1].astype(np.float32).copy()
 
     # ── Semantic heatmap overlay ──────────────────────────────────────────────
     if heatmap_2d is not None:
-        heatmap_u8 = (np.clip(heatmap_2d, 0, 1) * 255).astype(np.uint8)
+        h_crop = heatmap_2d[r0:r1, c0:c1]
+        heatmap_u8 = (np.clip(h_crop, 0, 1) * 255).astype(np.uint8)
         heat_bgr = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
         heat_rgb = heat_bgr[:, :, ::-1].astype(np.float32)
         canvas = canvas * 0.5 + heat_rgb * 0.5
 
-    # ── Planned path ──────────────────────────────────────────────────────────
-    if path_cells and len(path_cells) > 1:
-        pts = np.array([[c[1], c[0]] for c in path_cells], dtype=np.int32)
-        canvas_bgr = cv2.cvtColor(canvas.astype(np.uint8), cv2.COLOR_RGB2BGR)
-        cv2.polylines(canvas_bgr, [pts], False, (0, 0, 255), 2)
-        canvas = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-    # ── Robot position ────────────────────────────────────────────────────────
-    row = int(robot.curr_pos_on_map[0])
-    col = int(robot.curr_pos_on_map[1])
     canvas_bgr = cv2.cvtColor(np.clip(canvas, 0, 255).astype(np.uint8),
                                cv2.COLOR_RGB2BGR)
-    cv2.circle(canvas_bgr, (col, row), 5, (0, 255, 0), -1)   # filled green dot
-    cv2.circle(canvas_bgr, (col, row), 7, (255, 255, 255), 1) # white outline
+
+    # ── Planned path (remapped to crop coords) ────────────────────────────────
+    if path_cells and len(path_cells) > 1:
+        pts = np.array(
+            [[c[1] - c0, c[0] - r0] for c in path_cells
+             if r0 <= c[0] < r1 and c0 <= c[1] < c1],
+            dtype=np.int32,
+        )
+        if len(pts) > 1:
+            cv2.polylines(canvas_bgr, [pts], False, (0, 0, 255), 2)
+
+    # ── Robot position ────────────────────────────────────────────────────────
+    robot_r = row - r0
+    robot_c = col - c0
+    cv2.circle(canvas_bgr, (robot_c, robot_r), 5, (0, 255, 0), -1)
+    cv2.circle(canvas_bgr, (robot_c, robot_r), 7, (255, 255, 255), 1)
 
     # ── Label ─────────────────────────────────────────────────────────────────
     if label:
@@ -272,11 +290,15 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
         cv2.putText(canvas_bgr, label, (8, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
-    # Scale up so the map is easier to read (grid is 500x500 by default)
-    scale = max(1, 600 // gs)
-    if scale > 1:
-        canvas_bgr = cv2.resize(canvas_bgr, (gs * scale, gs * scale),
-                                 interpolation=cv2.INTER_NEAREST)
+    # ── Upscale to output_px ──────────────────────────────────────────────────
+    h_crop = r1 - r0
+    w_crop = c1 - c0
+    scale = output_px / max(h_crop, w_crop, 1)
+    if abs(scale - 1.0) > 0.01:
+        h_out = max(1, int(h_crop * scale))
+        w_out = max(1, int(w_crop * scale))
+        canvas_bgr = cv2.resize(canvas_bgr, (w_out, h_out),
+                                 interpolation=cv2.INTER_LINEAR)
 
     safe_imshow("Semantic Map", canvas_bgr)
     cv2.waitKey(1)
@@ -344,7 +366,7 @@ def scan_360_and_verify(
                 session.push_frame(frame_rgb)
 
                 # Read latest available YOLOE result (non-blocking)
-                det_found, ann_rgb = session.poll_result()
+                det_found, ann_rgb, _bbox = session.poll_result()
                 if ann_rgb is not None:
                     last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
                 if det_found:
@@ -369,7 +391,7 @@ def scan_360_and_verify(
         if not found:
             import time
             time.sleep(0.6)
-            det_found, ann_rgb = session.poll_result()
+            det_found, ann_rgb, _bbox = session.poll_result()
             if det_found:
                 found = True
                 if ann_rgb is not None:
@@ -444,6 +466,184 @@ def navigate_to_alternative(
     except Exception as e:
         print(f"  Alternative navigation failed: {e}")
         return False
+
+
+# ── Navigation robustness helpers ────────────────────────────────────────────
+
+def _agent_xyz(robot) -> np.ndarray:
+    """Return the agent's current 3-D world position from the simulator."""
+    return np.array(robot.sim.get_agent(0).get_state().position, dtype=np.float64)
+
+
+def execute_nav_replay(
+    robot,
+    planned_actions: list,
+    cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+    path_cells: list,
+    motion_thresh: float = 0.4,
+    stuck_threshold: int = 3,
+) -> bool:
+    """Replay a pre-planned action list with stuck detection.
+
+    Monitors actual displacement after each move_forward action.  If
+    real displacement is below motion_thresh × forward_dist for
+    stuck_threshold consecutive steps, returns False immediately so the
+    caller can trigger recovery.  Turn actions are never counted as stuck.
+
+    Args:
+        motion_thresh:   Fraction of forward_dist considered "barely moved".
+        stuck_threshold: Consecutive low-motion steps before declaring stuck.
+
+    Returns:
+        True  — replay completed without stuck event.
+        False — stuck detected; caller should recover and re-plan.
+    """
+    low_motion_count = 0
+    n = len(planned_actions)
+    expected_fwd = robot.forward_dist  # metres per move_forward action
+
+    for i, action in enumerate(planned_actions):
+        if action == "stop":
+            continue
+
+        is_fwd = (action == "move_forward")
+        if is_fwd:
+            pre_xyz = _agent_xyz(robot)
+
+        robot.sim.step(action)
+        robot._set_nav_curr_pose()
+
+        if is_fwd:
+            disp = float(np.linalg.norm(_agent_xyz(robot) - pre_xyz))
+            if disp < motion_thresh * expected_fwd:
+                low_motion_count += 1
+                if low_motion_count >= stuck_threshold:
+                    print(f"  [nav] Stuck after {i+1}/{n} actions "
+                          f"(last disp={disp*100:.1f} cm) — triggering recovery")
+                    return False
+            else:
+                low_motion_count = 0
+
+        show_obs(robot, f"[{i+1}/{n}] -> {cat}")
+        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                 path_cells=path_cells, label=f"[{i+1}/{n}] -> {cat}")
+
+    return True
+
+
+def nav_recovery_and_replan(
+    robot,
+    standoff_pos: list,
+    cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+    recovery_turn_deg: float = 30.0,
+) -> bool:
+    """Escape a stuck state and replan to standoff_pos from the current pose.
+
+    Executes a small recovery turn, then calls robot.move_to() which both
+    plans and executes the new path directly (no reset/replay needed).
+
+    Returns True if recovery navigation succeeded.
+    """
+    print(f"  [nav] Recovery: turning {recovery_turn_deg}° then replanning…")
+    n_turns = max(1, int(round(recovery_turn_deg / robot.turn_angle)))
+    for _ in range(n_turns):
+        robot.sim.step("turn_right")
+    robot._set_nav_curr_pose()
+
+    robot.empty_recorded_actions()
+    try:
+        robot.move_to(standoff_pos)
+        recovery_actions = robot.get_recorded_actions() or []
+        n = len(recovery_actions)
+        if n == 0:
+            print("  [nav] Recovery: already at standoff.")
+            return True
+        for i, action in enumerate(recovery_actions):
+            if action == "stop":
+                continue
+            robot.sim.step(action)
+            robot._set_nav_curr_pose()
+            show_obs(robot, f"[recovery {i+1}/{n}] -> {cat}")
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     label=f"[recovery {i+1}/{n}] -> {cat}")
+        print("  [nav] Recovery complete.")
+        return True
+    except Exception as e:
+        print(f"  [nav] Recovery replan failed: {e}")
+        return False
+
+
+def fine_visual_center(
+    robot,
+    session,
+    cat: str,
+    img_w: int = 640,
+    tol_x_frac: float = 0.06,
+    max_iters: int = 10,
+) -> bool:
+    """Fine-tune horizontal alignment so the detected bbox is centred in frame.
+
+    Uses the persistent YOLOE session to get bounding-box centre coordinates
+    and turns the robot left/right in single 5° steps until the horizontal
+    error falls within tolerance.
+
+    Note on vertical centering: the Habitat discrete action space has no
+    pitch control (only turn_left, turn_right, move_forward).  Vertical
+    alignment is therefore not achievable here; only horizontal centering
+    is performed.
+
+    Args:
+        img_w:       Frame width in pixels (default 640 from sim config).
+        tol_x_frac:  Tolerance as fraction of img_w (default 6% → 38 px).
+        max_iters:   Maximum correction steps before giving up.
+
+    Returns:
+        True if the object was centered within tolerance, False otherwise.
+    """
+    tol_px = tol_x_frac * img_w
+    img_cx = img_w / 2.0
+
+    print(f"  [center] Fine visual centering for '{cat}' "
+          f"(tol={tol_px:.0f} px, max {max_iters} steps)…")
+
+    for it in range(max_iters):
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            break
+
+        frame = obs["color_sensor"][:, :, :3]
+        found, ann_rgb, bbox_center = session.check(frame)
+
+        if not found or bbox_center is None:
+            print(f"  [center] Object lost at iter {it} — stopping centering.")
+            break
+
+        cx, _cy = bbox_center
+        err_x = cx - img_cx
+
+        if ann_rgb is not None:
+            lbl = f"Centering ({it+1}): err={err_x:+.0f}px"
+            show_obs(robot, lbl,
+                     yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
+
+        if abs(err_x) <= tol_px:
+            print(f"  [center] Centered: err_x={err_x:+.1f}px ≤ tol={tol_px:.0f}px")
+            robot._set_nav_curr_pose()
+            return True
+
+        # Single discrete turn toward the object
+        if err_x > 0:
+            robot.sim.step("turn_right")
+        else:
+            robot.sim.step("turn_left")
+
+    robot._set_nav_curr_pose()
+    print(f"  [center] Centering finished ({it+1} iters, tolerance not met).")
+    return False
 
 
 def find_best_start_pose(robot):
@@ -588,15 +788,14 @@ def main(config: DictConfig) -> None:
             robot.set_agent_state(start_tf)
             robot._set_nav_curr_pose()
 
-            for i, action in enumerate(planned_actions):
-                if action == "stop":
-                    continue
-                robot.sim.step(action)
-                robot._set_nav_curr_pose()
-                show_obs(robot, f"[{i+1}/{n_actions}] -> {cat}")
-                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                         path_cells=path_cells,
-                         label=f"[{i+1}/{n_actions}] -> {cat}")
+            # Replay with stuck detection — recover and replan if needed
+            completed = execute_nav_replay(
+                robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells
+            )
+            if not completed:
+                nav_recovery_and_replan(
+                    robot, standoff_pos, cat, rgb_map_2d, heatmap
+                )
 
             show_obs(robot, f"Arrived: {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
@@ -623,12 +822,13 @@ def main(config: DictConfig) -> None:
                     obs_data = robot.sim.get_sensor_observations(0)
                     if "color_sensor" in obs_data:
                         frame = obs_data["color_sensor"][:, :, :3]
-                        _yoloe_confirmed, _ann_frame = _yoloe_session.check(frame)
+                        _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                         if _ann_frame is not None:
                             ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                             show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
-                            print(f"  YOLOE: ✓ Found '{cat}'!")
+                            print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
+                            fine_visual_center(robot, _yoloe_session, cat)
                         else:
                             print(f"  YOLOE: ✗ '{cat}' not detected.")
                 except Exception as e:
@@ -642,6 +842,8 @@ def main(config: DictConfig) -> None:
                 _yoloe_confirmed = scan_360_and_verify(
                     robot, cat, rgb_map_2d, heatmap, path_cells
                 )
+                if _yoloe_confirmed and _yoloe_session is not None:
+                    fine_visual_center(robot, _yoloe_session, cat)
 
             # Stage 3: Alternative route if 360° scan also failed
             if not _yoloe_confirmed:
@@ -656,12 +858,13 @@ def main(config: DictConfig) -> None:
                         obs_data = robot.sim.get_sensor_observations(0)
                         if "color_sensor" in obs_data:
                             frame = obs_data["color_sensor"][:, :, :3]
-                            _yoloe_confirmed, _ann_frame = _yoloe_session.check(frame)
+                            _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                             if _ann_frame is not None:
                                 ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                                 show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
+                                fine_visual_center(robot, _yoloe_session, cat)
                             else:
                                 print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
                     except Exception as e:

@@ -111,13 +111,19 @@ class YoloeSession:
 
     def check(
         self, frame_rgb: np.ndarray
-    ) -> Tuple[bool, Optional[np.ndarray]]:
-        """Run YOLOE synchronously. Returns (found, annotated_frame_rgb).
+    ) -> Tuple[bool, Optional[np.ndarray], Optional[Tuple[float, float]]]:
+        """Run YOLOE synchronously.
+
+        Returns:
+            found:       True if the target object was detected.
+            ann_rgb:     Annotated frame (RGB) with bounding boxes drawn.
+            bbox_center: (cx, cy) pixel coordinates of the best detection,
+                         or None if not found.
 
         After the first call (model already loaded), typically <500 ms.
         """
         if not self._ready or self._proc is None:
-            return False, frame_rgb.copy()
+            return False, frame_rgb.copy(), None
 
         with self._io_lock:
             cv2.imwrite(
@@ -128,12 +134,23 @@ class YoloeSession:
             self._proc.stdin.flush()
             line = self._proc.stdout.readline().strip()
 
-        found = (line == "1")
+        # Parse response: "0" or "1|cx|cy"
+        parts = line.split("|")
+        found = (parts[0] == "1")
+        bbox_center: Optional[Tuple[float, float]] = None
+        if found and len(parts) == 3:
+            try:
+                bbox_center = (float(parts[1]), float(parts[2]))
+            except ValueError:
+                pass
+
+        ann_rgb = frame_rgb.copy()
         if self._out_path.exists():
             ann_bgr = cv2.imread(str(self._out_path))
             if ann_bgr is not None:
-                return found, cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)
-        return found, frame_rgb.copy()
+                ann_rgb = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)
+
+        return found, ann_rgb, bbox_center
 
     # ── Async (background thread) API ─────────────────────────────────────────
 
@@ -181,15 +198,17 @@ class YoloeSession:
             except queue.Full:
                 pass
 
-    def poll_result(self) -> Tuple[Optional[bool], Optional[np.ndarray]]:
+    def poll_result(
+        self,
+    ) -> Tuple[Optional[bool], Optional[np.ndarray], Optional[Tuple[float, float]]]:
         """Return the latest detection result without blocking.
 
-        Returns (None, None) if no result is available yet.
+        Returns (None, None, None) if no result is available yet.
         """
         try:
             return self._result_q.get_nowait()
         except queue.Empty:
-            return None, None
+            return None, None, None
 
     def _bg_loop(self):
         while self._bg_running:
@@ -197,14 +216,14 @@ class YoloeSession:
                 frame = self._frame_q.get(timeout=0.1)
             except queue.Empty:
                 continue
-            found, ann = self.check(frame)
+            found, ann, bbox_center = self.check(frame)
             # Drop stale result and put the new one
             try:
                 self._result_q.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._result_q.put_nowait((found, ann))
+                self._result_q.put_nowait((found, ann, bbox_center))
             except queue.Full:
                 pass
 

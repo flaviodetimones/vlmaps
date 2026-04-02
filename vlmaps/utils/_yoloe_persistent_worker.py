@@ -1,16 +1,15 @@
 """
 Persistent YOLOE worker — loads the model ONCE, then processes frames on demand.
 
-Protocol (stdin → stdout, line-buffered):
+Protocol (stdin -> stdout, line-buffered):
   startup  : prints "READY\\n" when model is loaded.
   request  : reads "<input_path>|<output_path>\\n" from stdin.
-  response : prints "1\\n" (found) or "0\\n" (not found) after inference.
-  shutdown : reads "QUIT\\n" → exits cleanly.
+  response : prints "1|cx|cy\\n" (found, bbox center px) or "0\\n" (not found).
+  shutdown : reads "QUIT\\n" -> exits cleanly.
 """
 
 import argparse
 import sys
-from pathlib import Path
 
 import cv2
 
@@ -55,7 +54,16 @@ def main():
         ann = results[0].plot() if results else img
         cv2.imwrite(output_path, ann)
 
-        sys.stdout.write("1\n" if found else "0\n")
+        if found:
+            # Return bbox center of the highest-confidence detection
+            boxes = results[0].boxes
+            best = int(boxes.conf.argmax())
+            x1, y1, x2, y2 = boxes.xyxy[best].tolist()
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            sys.stdout.write(f"1|{cx:.2f}|{cy:.2f}\n")
+        else:
+            sys.stdout.write("0\n")
         sys.stdout.flush()
 
 
