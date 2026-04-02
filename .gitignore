@@ -17,4 +17,7 @@ data
 rgb.mp4
 depth.mp4
 outputs
-*.egg-info
+*.egg-infomobileclip_blt.ts
+yoloe-11l-seg.pt
+mobileclip_blt.ts
+yoloe-11l-seg.pt
