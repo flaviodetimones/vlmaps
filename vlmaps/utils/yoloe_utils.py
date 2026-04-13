@@ -85,11 +85,22 @@ class YoloeSession:
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered
         )
         line = self._proc.stdout.readline().strip()
         self._ready = (line == "READY")
+        if not self._ready:
+            # Drain stderr so we can report the crash reason
+            try:
+                err = self._proc.stderr.read(2000)
+                if err:
+                    print(f"  [YOLOE] Worker stderr:\n{err.strip()}", flush=True)
+            except Exception:
+                pass
+            if line:
+                print(f"  [YOLOE] Worker unexpected first line: {line!r}", flush=True)
         return self._ready
 
     def stop(self):

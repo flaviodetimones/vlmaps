@@ -15,20 +15,24 @@ from pathlib import Path
 
 
 def _ensure_mobileclip() -> None:
-    """Copy mobileclip_blt.ts from the repo into the ultralytics assets dir.
+    """Ensure mobileclip_blt.ts is in the ultralytics assets dir.
 
-    The file ships alongside the repo weights at <submodule_root>/mobileclip_blt.ts.
-    Ultralytics searches its assets/weights directory for this file when computing
-    text embeddings for YOLOE.  If the assets dir holds a corrupt/partial version
-    (e.g. from a failed auto-download), this replaces it with the known-good copy.
+    Searches candidate repo locations for a known-good copy and installs it.
+    If no source is found, removes any corrupt cached file (< 100 MB) so that
+    ultralytics can re-download a fresh copy on next model load.
     """
     # _yoloe_persistent_worker.py lives at:
     #   <submodule_root>/vlmaps/utils/_yoloe_persistent_worker.py
-    # parents[2] = <submodule_root>
-    submodule_root = Path(__file__).resolve().parents[2]
-    src = submodule_root / "mobileclip_blt.ts"
-    if not src.exists():
-        return  # file not present in repo — let ultralytics handle it
+    # parents[2] = <submodule_root>  (e.g. /workspace/third_party/vlmaps)
+    # parents[4] = workspace root    (e.g. /workspace)
+    this = Path(__file__).resolve()
+    _MOBILECLIP_CANDIDATES = [
+        this.parents[2] / "mobileclip_blt.ts",  # submodule root
+        this.parents[4] / "mobileclip_blt.ts",  # /workspace (outer repo root)
+        Path("/workspace/mobileclip_blt.ts"),    # explicit absolute fallback
+    ]
+
+    src = next((p for p in _MOBILECLIP_CANDIDATES if p.exists()), None)
 
     try:
         import ultralytics.utils as _uu
@@ -51,16 +55,32 @@ def _ensure_mobileclip() -> None:
         assets_dir.mkdir(parents=True, exist_ok=True)
         dst = assets_dir / "mobileclip_blt.ts"
 
-        # Replace if missing or size differs (corrupt/partial download)
-        if not dst.exists() or abs(dst.stat().st_size - src.stat().st_size) > 1024:
-            print(
-                f"[worker] Copying mobileclip_blt.ts ({src.stat().st_size // 1_000_000} MB) "
-                f"→ {dst}",
-                flush=True,
-            )
-            shutil.copy2(src, dst)
+        if src is not None:
+            # Replace if missing or size differs (corrupt/partial download)
+            if not dst.exists() or abs(dst.stat().st_size - src.stat().st_size) > 1024:
+                print(
+                    f"[worker] Copying mobileclip_blt.ts ({src.stat().st_size // 1_000_000} MB) "
+                    f"→ {dst}",
+                    flush=True,
+                )
+                shutil.copy2(src, dst)
+            else:
+                print(f"[worker] mobileclip_blt.ts already present at {dst}", flush=True)
         else:
-            print(f"[worker] mobileclip_blt.ts already present at {dst}", flush=True)
+            # No source available — remove corrupt cached file (< 100 MB) so
+            # ultralytics will re-download a fresh copy
+            _MIN_MOBILECLIP_BYTES = 100 * 1024 * 1024  # 100 MB
+            if dst.exists() and dst.stat().st_size < _MIN_MOBILECLIP_BYTES:
+                print(
+                    f"[worker] Removing corrupt mobileclip_blt.ts at {dst} "
+                    f"({dst.stat().st_size // 1024} KB < 100 MB) to force re-download",
+                    flush=True,
+                )
+                dst.unlink()
+            elif not dst.exists():
+                print("[worker] mobileclip_blt.ts not found locally — ultralytics will download it", flush=True)
+            else:
+                print(f"[worker] mobileclip_blt.ts cached at {dst} ({dst.stat().st_size // 1_000_000} MB)", flush=True)
 
     except Exception as exc:
         sys.stderr.write(f"[worker] mobileclip pre-copy warning: {exc}\n")
