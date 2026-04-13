@@ -41,6 +41,7 @@ from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 # Windows the user has closed — never re-open them
 _closed_windows: set = set()
 _shown_windows: set = set()   # windows that have been successfully shown at least once
+_frozen_detection_bgr = None  # frozen YOLOE frame shown until next search
 
 
 def safe_imshow(name: str, img: np.ndarray) -> None:
@@ -67,9 +68,11 @@ def build_rgb_map_2d(robot) -> np.ndarray:
 
 def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
     """Display the first-person camera view (with optional YOLOE overlay)."""
+    global _frozen_detection_bgr
     if yoloe_frame_bgr is not None:
-        # Show YOLOE-annotated frame on the same window
         frame = yoloe_frame_bgr.copy()
+    elif _frozen_detection_bgr is not None:
+        frame = _frozen_detection_bgr.copy()
     else:
         obs = robot.sim.get_sensor_observations(0)
         if "color_sensor" in obs:
@@ -174,7 +177,18 @@ def postprocess_heatmap(
     # 5. Keep components competitive with the best one
     best_score = max(c["score"] for c in components)
     kept = [c for c in components if c["score"] >= keep_ratio * best_score]
-    kept.sort(key=lambda c: c["score"], reverse=True)
+
+    # Paso B — region quality: 0.3·norm_area + 0.4·mean_score + 0.3·density
+    max_area = max(c["area"] for c in kept) if kept else 1
+    for c in kept:
+        norm_area = c["area"] / max_area
+        mean_score = c["mean_val"]
+        bx, by, bw, bh = c["bbox"]
+        bbox_area = bw * bh
+        density = c["area"] / bbox_area if bbox_area > 0 else 0.0
+        c["quality"] = 0.3 * norm_area + 0.4 * mean_score + 0.3 * density
+
+    kept.sort(key=lambda c: c["quality"], reverse=True)
 
     # 6. Build outputs
     final_mask = np.zeros(heatmap.shape, dtype=bool)
@@ -228,7 +242,8 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
     heat_2d, _, kept_components = postprocess_heatmap(heat_2d)
     if kept_components:
         print(f"  Heatmap postprocess: kept {len(kept_components)} component(s) "
-              f"(areas: {[c['area'] for c in kept_components]})")
+              f"(areas: {[c['area'] for c in kept_components]}, "
+              f"quality: {[round(c['quality'], 3) for c in kept_components]})")
 
     return heat_2d, kept_components
 
@@ -400,6 +415,8 @@ def scan_360_and_verify(
 
             if found:
                 print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
+                if last_ann_bgr is not None:
+                    _frozen_detection_bgr = last_ann_bgr.copy()
                 break
 
         # Wait briefly for the last in-flight result
@@ -411,6 +428,7 @@ def scan_360_and_verify(
                 found = True
                 if ann_rgb is not None:
                     last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+                    _frozen_detection_bgr = last_ann_bgr.copy()
                     show_obs(robot, f"Scan final: FOUND! {cat}",
                              yoloe_frame_bgr=last_ann_bgr)
                 print(f"  YOLOE scan: FOUND '{cat}' (last frame)!")
@@ -815,6 +833,7 @@ def main(config: DictConfig) -> None:
             cat = cat.strip()
             if not cat:
                 continue
+            _frozen_detection_bgr = None  # clear previous detection freeze
             print(f"\nPlanning path to: {cat}")
 
             # Compute heatmap ONCE per category (may call LLM API once if needed)
@@ -880,22 +899,7 @@ def main(config: DictConfig) -> None:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Arrived: {cat}")
 
-            # ── Face the object ───────────────────────────────────────────────
-            print(f"  Turning to face '{cat}'…")
-            if room_goal is None:
-                # Orient toward heatmap centroid (argmax), not standoff boundary
-                face_toward_pos(robot, obj_centroid[0], obj_centroid[1])
-            else:
-                try:
-                    robot.face(cat)
-                    robot._set_nav_curr_pose()
-                except Exception:
-                    pass
-            show_obs(robot, f"Facing: {cat}")
-            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Facing: {cat}")
-
-            # Stage 1: YOLOE check at arrival position
+            # Stage 0: YOLOE check at raw arrival (before any rotation)
             _yoloe_confirmed = False
             if _yoloe_session is not None:
                 try:
@@ -905,16 +909,53 @@ def main(config: DictConfig) -> None:
                         _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                         if _ann_frame is not None:
                             ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                            show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
+                            show_obs(robot, f"YOLOE arrival: {cat}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
-                            print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
-                            fine_visual_center(robot, _yoloe_session, cat)
+                            print(f"  YOLOE stage 0: ✓ Found '{cat}' at arrival (no rotation needed)!")
+                            if _ann_frame is not None:
+                                _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                         else:
-                            print(f"  YOLOE: ✗ '{cat}' not detected.")
+                            print(f"  YOLOE stage 0: ✗ not visible at arrival.")
                 except Exception as e:
-                    print(f"  YOLOE error: {e}")
-            else:
-                print("  (YOLOE not available — skipping visual verification)")
+                    print(f"  YOLOE stage 0 error: {e}")
+
+            # ── Face the object (skip if already confirmed) ───────────────────
+            if not _yoloe_confirmed:
+                print(f"  Turning to face '{cat}'…")
+                if room_goal is None:
+                    face_toward_pos(robot, obj_centroid[0], obj_centroid[1])
+                else:
+                    try:
+                        robot.face(cat)
+                        robot._set_nav_curr_pose()
+                    except Exception:
+                        pass
+                show_obs(robot, f"Facing: {cat}")
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         path_cells=path_cells, label=f"Facing: {cat}")
+
+            # Stage 1: YOLOE check after facing (skip if already confirmed)
+            if not _yoloe_confirmed:
+                if _yoloe_session is not None:
+                    try:
+                        obs_data = robot.sim.get_sensor_observations(0)
+                        if "color_sensor" in obs_data:
+                            frame = obs_data["color_sensor"][:, :, :3]
+                            _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
+                            if _ann_frame is not None:
+                                ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                                show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
+                            if _yoloe_confirmed:
+                                print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
+                                if _ann_frame is not None:
+                                    _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                                fine_visual_center(robot, _yoloe_session, cat)
+                            else:
+                                print(f"  YOLOE: ✗ '{cat}' not detected.")
+                    except Exception as e:
+                        print(f"  YOLOE error: {e}")
+                else:
+                    print("  (YOLOE not available — skipping visual verification)")
 
             # Stage 2: 360° real-time scan if not confirmed at arrival
             if not _yoloe_confirmed:
@@ -944,6 +985,8 @@ def main(config: DictConfig) -> None:
                                 show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
+                                if _ann_frame is not None:
+                                    _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                                 fine_visual_center(robot, _yoloe_session, cat)
                             else:
                                 print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
