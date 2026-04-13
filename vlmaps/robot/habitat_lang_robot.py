@@ -579,6 +579,23 @@ class HabitatLanguageRobot(LangRobot):
 
         return actual_actions_list
 
+    def plan_path_only(self, pos: Tuple[float, float]) -> Tuple[List, List[str]]:
+        """Compute path and action list to pos WITHOUT executing any actions.
+
+        Args:
+            pos: (row, col) on full map
+
+        Returns:
+            (paths, actions_list) — paths is a list of [row, col] waypoints,
+            actions_list is the discrete action sequence to follow the path.
+        """
+        self._set_nav_curr_pose()
+        curr_pose_on_full_map = self.get_agent_pose_on_map()
+        paths = self.nav.plan_to(curr_pose_on_full_map[:2], pos, vis=False)
+        self.last_planned_path = paths
+        actions_list, _ = self.controller.convert_paths_to_actions(curr_pose_on_full_map, paths[1:])
+        return paths, actions_list
+
     def turn(self, angle_deg: float):
         """
         Turn right a relative angle in degrees

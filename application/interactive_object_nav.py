@@ -313,7 +313,7 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     robot._set_nav_curr_pose()
     dx = target_row - robot.curr_pos_on_map[0]   # positive = south
     dy = target_col - robot.curr_pos_on_map[1]   # positive = east
-    angle = np.arctan2(-dy, dx) * 180.0 / np.pi  # 0°=north, +CW, face target
+    angle = np.arctan2(dy, -dx) * 180.0 / np.pi  # 0°=north, +CW, face target
     turn = (angle - robot.curr_ang_deg_on_map + 180) % 360 - 180
     robot.turn(turn)
     robot._set_nav_curr_pose()
@@ -804,8 +804,6 @@ def main(config: DictConfig) -> None:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
             cv2.waitKey(200)
 
-            robot.empty_recorded_actions()
-
             # ── Get (or create) the YOLOE session for this target ─────────────
             from vlmaps.utils.yoloe_utils import get_session, shutdown_session
             _yoloe_session = get_session(cat)
@@ -816,16 +814,14 @@ def main(config: DictConfig) -> None:
                 print(f"  Room map match: navigating to region centroid {room_goal}")
                 goal_pos = list(room_goal)
                 obj_centroid = goal_pos
-                robot.move_to(goal_pos)
-                boundary_pos = None
+                _, planned_actions = robot.plan_path_only(goal_pos)
             else:
-                # Step 1: plan to a close-approach standoff to get the path
+                # Step 1: plan (without executing) to a close-approach standoff to get the path
                 robot._set_nav_curr_pose()
                 standoff_pos, _ = robot.map.get_standoff_pos(
                     robot.curr_pos_on_map, cat, standoff_m=0.25)
                 print(f"  Planning initial path to standoff: {standoff_pos}")
-                robot.move_to(standoff_pos)
-                _initial_path = getattr(robot, "last_planned_path", None) or []
+                _initial_path, _ = robot.plan_path_only(standoff_pos)
 
                 # Step 2: walk path backward to pick best viewpoint + object centroid
                 goal_pos, obj_centroid = select_safe_goal_from_path(
@@ -833,25 +829,26 @@ def main(config: DictConfig) -> None:
                 )
                 print(f"  Path-based goal: {goal_pos}  object centroid: {obj_centroid}")
 
-                # Step 3: re-plan to the selected goal
-                robot.empty_recorded_actions()
-                robot.move_to(goal_pos)
+                # Step 3: plan (without executing) to the selected goal
+                _, planned_actions = robot.plan_path_only(goal_pos)
 
             # Capture planned path for visualization
             path_cells = getattr(robot, "last_planned_path", None) or []
 
-            planned_actions = robot.get_recorded_actions() or []
             n_actions = len(planned_actions)
-            print(f"  Path computed: {n_actions} actions. Replaying...")
+            print(f"  Path computed: {n_actions} actions.")
 
             if n_actions == 0:
                 print(f"  [warn] No path found for '{cat}' — skipping.")
                 continue
 
-            robot.set_agent_state(start_tf)
-            robot._set_nav_curr_pose()
+            # Show heatmap + planned path BEFORE executing so the user can see the route
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=path_cells, label=f"Path planned: {cat}")
+            cv2.waitKey(800)
+            print(f"  Executing path ({n_actions} actions)…")
 
-            # Replay with stuck detection — recover and replan if needed
+            # Execute step by step — no teleport, robot moves from its current position
             completed = execute_nav_replay(
                 robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells
             )
