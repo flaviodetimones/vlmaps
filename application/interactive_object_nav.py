@@ -24,6 +24,10 @@ from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
 
+# Milliseconds to wait after each discrete sim step for smooth demo playback.
+# Increase for slower, more visible movements; decrease to speed up.
+_NAV_STEP_DELAY_MS: int = 80
+
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
 from vlmaps.utils.llm_utils import parse_object_goal_instruction
 from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
@@ -308,14 +312,24 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
 
 def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     """Turn robot to face directly toward a specific map (row, col) position.
-    Uses the same angle convention as VLMaps (0°=north, +CW) but correctly
-    normalises to [-180, 180] so the robot always takes the shortest turn."""
+
+    Coordinate math (base frame: x=north=-row, y=west=-col, CCW-positive):
+      angle = arctan2(-dy_map, -dx_map)  maps (row,col) deltas to base angle.
+    Turn sign: robot.turn(+) = turn_right (CW) = decreasing base angle,
+      matching convert_goal_to_actions convention (turn_right_angle = curr - target).
+    Each step is shown individually for smooth demo visualisation.
+    """
     robot._set_nav_curr_pose()
-    dx = target_row - robot.curr_pos_on_map[0]   # positive = south
-    dy = target_col - robot.curr_pos_on_map[1]   # positive = east
-    angle = np.arctan2(dy, -dx) * 180.0 / np.pi  # 0°=north, +CW, face target
-    turn = (angle - robot.curr_ang_deg_on_map + 180) % 360 - 180
-    robot.turn(turn)
+    dx = target_row - robot.curr_pos_on_map[0]   # positive = south = -x_base
+    dy = target_col - robot.curr_pos_on_map[1]   # positive = east  = -y_base
+    angle = np.arctan2(-dy, -dx) * 180.0 / np.pi  # CCW-positive, 0°=north
+    turn = (robot.curr_ang_deg_on_map - angle + 180) % 360 - 180  # +→CW→turn_right
+    n_turns = int(abs(turn) / robot.turn_angle)
+    action = "turn_right" if turn > 0 else "turn_left"
+    for _ in range(n_turns):
+        robot.sim.step(action)
+        show_obs(robot, "Facing…")
+        cv2.waitKey(_NAV_STEP_DELAY_MS)
     robot._set_nav_curr_pose()
 
 
@@ -382,6 +396,7 @@ def scan_360_and_verify(
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells,
                      label=f"Scan {angle_done}°: {cat}")
+            cv2.waitKey(_NAV_STEP_DELAY_MS)
 
             if found:
                 print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
@@ -529,6 +544,7 @@ def execute_nav_replay(
         show_obs(robot, f"[{i+1}/{n}] -> {cat}")
         show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                  path_cells=path_cells, label=f"[{i+1}/{n}] -> {cat}")
+        cv2.waitKey(_NAV_STEP_DELAY_MS)
 
     return True
 
@@ -570,6 +586,7 @@ def nav_recovery_and_replan(
             show_obs(robot, f"[recovery {i+1}/{n}] -> {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      label=f"[recovery {i+1}/{n}] -> {cat}")
+            cv2.waitKey(_NAV_STEP_DELAY_MS)
         print("  [nav] Recovery complete.")
         return True
     except Exception as e:
@@ -583,63 +600,65 @@ def fine_visual_center(
     cat: str,
     img_w: int = 640,
     img_fov_h: float = 90.0,
-    max_turns: int = 6,
+    max_turns: int = 8,
 ) -> bool:
-    """One-shot horizontal centering: one YOLOE call → compute N turns → execute.
+    """Iterative horizontal centering via YOLOE bounding-box feedback.
 
-    Takes a single snapshot, reads the bbox centre, estimates how many 5°
-    discrete turns are needed to centre it, and executes them in one go.
-    No iterative re-checking — fast and leaves the robot facing the object.
+    Uses the persistent YOLOE session to get bounding-box centre coordinates
+    and turns the robot left/right in single 5° steps until the horizontal
+    error falls within tolerance.
+
+    Note on vertical centering: the Habitat discrete action space has no
+    pitch control (only turn_left, turn_right, move_forward).  Vertical
+    alignment is therefore not achievable here; only horizontal centering
+    is performed.
 
     Args:
         img_w:      Frame width in pixels (default 640 from sim config).
         img_fov_h:  Horizontal field-of-view in degrees (default 90°).
-        max_turns:  Cap on the number of turns applied in either direction.
+        max_turns:  Maximum number of 5° correction steps in either direction.
 
     Returns:
-        True if the object was detected and turns were applied, False otherwise.
+        True if the object was detected at least once during centering.
     """
-    obs = robot.sim.get_sensor_observations(0)
-    if "color_sensor" not in obs:
-        return False
-
-    frame = obs["color_sensor"][:, :, :3]
-    found, ann_rgb, bbox_center = session.check(frame)
-
-    if ann_rgb is not None:
-        show_obs(robot, f"Center: {cat}",
-                 yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
-
-    if not found or bbox_center is None:
-        print(f"  [center] '{cat}' not detected — skipping centering.")
-        return False
-
-    cx, _cy = bbox_center
-    err_x = cx - img_w / 2.0
-    # pixels per 5° step (turn_angle) based on horizontal fov
+    # Tolerance: half a step's worth of pixels (centred within ±2.5°)
     px_per_step = img_w * (robot.turn_angle / img_fov_h)
-    n_turns = int(round(err_x / px_per_step))
-    n_turns = max(-max_turns, min(max_turns, n_turns))
+    tolerance_px = px_per_step / 2.0
+    detected_once = False
 
-    print(f"  [center] err_x={err_x:+.1f}px → {abs(n_turns)}×"
-          f"{'turn_right' if n_turns >= 0 else 'turn_left'}")
+    for step_i in range(max_turns):
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            break
 
-    if n_turns == 0:
-        robot._set_nav_curr_pose()
-        return True
+        frame = obs["color_sensor"][:, :, :3]
+        found, ann_rgb, bbox_center = session.check(frame)
 
-    action = "turn_right" if n_turns > 0 else "turn_left"
-    for _ in range(abs(n_turns)):
+        if ann_rgb is not None:
+            show_obs(robot, f"Centering {step_i+1}/{max_turns}: {cat}",
+                     yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
+
+        if not found or bbox_center is None:
+            print(f"  [center] Step {step_i+1}: '{cat}' not detected.")
+            break
+
+        detected_once = True
+        cx, _cy = bbox_center
+        err_x = cx - img_w / 2.0
+
+        if abs(err_x) <= tolerance_px:
+            print(f"  [center] Centred (err_x={err_x:+.1f}px ≤ {tolerance_px:.1f})")
+            break
+
+        action = "turn_right" if err_x > 0 else "turn_left"
+        print(f"  [center] Step {step_i+1}: err_x={err_x:+.1f}px → {action}")
         robot.sim.step(action)
+        cv2.waitKey(_NAV_STEP_DELAY_MS)
 
     robot._set_nav_curr_pose()
-
-    # Show result after centering
-    obs2 = robot.sim.get_sensor_observations(0)
-    if "color_sensor" in obs2:
-        show_obs(robot, f"Centered: {cat}")
-
-    return True
+    if not detected_once:
+        print(f"  [center] '{cat}' not detected — skipping centering.")
+    return detected_once
 
 
 def select_safe_goal_from_path(
