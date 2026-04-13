@@ -23,6 +23,12 @@ class Navigator:
         """
         start = self._convert_full_map_pos_to_cropped_map_pos(start_full_map)
         goal = self._convert_full_map_pos_to_cropped_map_pos(goal_full_map)
+        # Clamp goal to valid map indices (prevents IndexError at exact boundary)
+        h, w = self.obs_map.shape[:2]
+        goal = [
+            max(0, min(goal[0], h - 1)),
+            max(0, min(goal[1], w - 1)),
+        ]
         if self._check_if_start_in_graph_obstacle(start):
             try:
                 self._rebuild_visgraph(start, vis)

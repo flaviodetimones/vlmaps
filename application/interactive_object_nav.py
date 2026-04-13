@@ -351,7 +351,7 @@ def scan_360_and_verify(
     """
     from vlmaps.utils.yoloe_utils import get_session
 
-    session = get_session(cat)
+    session = get_session(cat, conf_thresh=0.30)
     if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
@@ -825,7 +825,7 @@ def main(config: DictConfig) -> None:
 
             # ── Get (or create) the YOLOE session for this target ─────────────
             from vlmaps.utils.yoloe_utils import get_session, shutdown_session
-            _yoloe_session = get_session(cat)
+            _yoloe_session = get_session(cat, conf_thresh=0.30)
 
             # ── Region-aware navigation: use room map if query matches a room ──
             room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
