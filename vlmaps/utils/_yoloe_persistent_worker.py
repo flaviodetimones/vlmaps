@@ -58,29 +58,27 @@ def _ensure_mobileclip() -> None:
         if src is not None:
             # Replace if missing or size differs (corrupt/partial download)
             if not dst.exists() or abs(dst.stat().st_size - src.stat().st_size) > 1024:
-                print(
+                sys.stderr.write(
                     f"[worker] Copying mobileclip_blt.ts ({src.stat().st_size // 1_000_000} MB) "
-                    f"→ {dst}",
-                    flush=True,
+                    f"→ {dst}\n"
                 )
                 shutil.copy2(src, dst)
             else:
-                print(f"[worker] mobileclip_blt.ts already present at {dst}", flush=True)
+                sys.stderr.write(f"[worker] mobileclip_blt.ts already present at {dst}\n")
         else:
             # No source available — remove corrupt cached file (< 100 MB) so
             # ultralytics will re-download a fresh copy
             _MIN_MOBILECLIP_BYTES = 100 * 1024 * 1024  # 100 MB
             if dst.exists() and dst.stat().st_size < _MIN_MOBILECLIP_BYTES:
-                print(
+                sys.stderr.write(
                     f"[worker] Removing corrupt mobileclip_blt.ts at {dst} "
-                    f"({dst.stat().st_size // 1024} KB < 100 MB) to force re-download",
-                    flush=True,
+                    f"({dst.stat().st_size // 1024} KB < 100 MB) to force re-download\n"
                 )
                 dst.unlink()
             elif not dst.exists():
-                print("[worker] mobileclip_blt.ts not found locally — ultralytics will download it", flush=True)
+                sys.stderr.write("[worker] mobileclip_blt.ts not found locally — ultralytics will download it\n")
             else:
-                print(f"[worker] mobileclip_blt.ts cached at {dst} ({dst.stat().st_size // 1_000_000} MB)", flush=True)
+                sys.stderr.write(f"[worker] mobileclip_blt.ts cached at {dst} ({dst.stat().st_size // 1_000_000} MB)\n")
 
     except Exception as exc:
         sys.stderr.write(f"[worker] mobileclip pre-copy warning: {exc}\n")

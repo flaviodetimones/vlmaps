@@ -89,18 +89,24 @@ class YoloeSession:
             text=True,
             bufsize=1,  # line-buffered
         )
-        line = self._proc.stdout.readline().strip()
-        self._ready = (line == "READY")
-        if not self._ready:
-            # Drain stderr so we can report the crash reason
-            try:
-                err = self._proc.stderr.read(2000)
-                if err:
-                    print(f"  [YOLOE] Worker stderr:\n{err.strip()}", flush=True)
-            except Exception:
-                pass
-            if line:
-                print(f"  [YOLOE] Worker unexpected first line: {line!r}", flush=True)
+        # Read until "READY" or EOF — diagnostic lines go to stderr, not stdout
+        self._ready = False
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                # EOF — worker crashed; drain stderr for diagnosis
+                try:
+                    err = self._proc.stderr.read(4000)
+                    if err:
+                        print(f"  [YOLOE] Worker stderr:\n{err.strip()}", flush=True)
+                except Exception:
+                    pass
+                break
+            if line.strip() == "READY":
+                self._ready = True
+                break
+            # Any other stdout line from the worker — print it for visibility
+            print(f"  [YOLOE] worker: {line.rstrip()}", flush=True)
         return self._ready
 
     def stop(self):
