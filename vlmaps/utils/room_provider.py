@@ -246,12 +246,22 @@ class SemanticSceneRoomProvider(RoomProvider):
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         if not self._available:
             return None
+        import re
         query = room_name.lower().strip()
+        # Require query to match a whole word in the label/category to avoid
+        # "bed" matching "bedroom", "bath" matching "bathroom", etc.
+        pattern = re.compile(r'\b' + re.escape(query) + r'\b')
         best = None
         for reg in self._regions:
-            if query in reg["label"].lower() or query in reg["category"].lower():
+            label = reg["label"].lower()
+            category = reg["category"].lower()
+            # Exact match wins immediately
+            if query == label or query == category:
                 best = reg
                 break
+            # Word-boundary match — keep first hit, keep looking for exact
+            if best is None and (pattern.search(label) or pattern.search(category)):
+                best = reg
         if best is None:
             return None
         r, c = best["centroid"]
