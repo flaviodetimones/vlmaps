@@ -916,24 +916,45 @@ def main(config: DictConfig) -> None:
             n_actions = len(planned_actions)
             print(f"  Path computed: {n_actions} actions.")
 
-            if n_actions == 0:
-                print(f"  [warn] No path found for '{cat}' — skipping.")
-                continue
+            # n_actions == 0 means robot is already at the goal — treat as arrived,
+            # not as failure.  A truly unreachable goal produces a non-empty path that
+            # ends before reaching the destination (handled by execute_nav_replay).
+            already_at_goal = (n_actions == 0)
+
+            if not already_at_goal:
+                # Sanity-check: reject paths whose length is excessively longer than
+                # the straight-line distance (detour ratio).  Wild visgraph paths that
+                # leave the house and loop back produce ratios >> 5.
+                _MAX_DETOUR_RATIO = 4.0
+                robot._set_nav_curr_pose()
+                cr, cc = robot.curr_pos_on_map
+                gr, gc = goal_pos[0], goal_pos[1]
+                straight_dist = float(np.sqrt((cr - gr) ** 2 + (cc - gc) ** 2))
+                if straight_dist > 1.0 and n_actions > _MAX_DETOUR_RATIO * straight_dist:
+                    print(
+                        f"  [warn] Path too long ({n_actions} actions vs "
+                        f"{straight_dist:.0f}-cell straight line, ratio "
+                        f"{n_actions / straight_dist:.1f}x > {_MAX_DETOUR_RATIO}x) — skipping."
+                    )
+                    continue
 
             # Show heatmap + planned path BEFORE executing so the user can see the route
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Path planned: {cat}")
             cv2.waitKey(800)
-            print(f"  Executing path ({n_actions} actions)…")
 
-            # Execute step by step — no teleport, robot moves from its current position
-            completed = execute_nav_replay(
-                robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells
-            )
-            if not completed:
-                nav_recovery_and_replan(
-                    robot, goal_pos, cat, rgb_map_2d, heatmap
+            if already_at_goal:
+                print(f"  Already at goal for '{cat}' — proceeding with verification.")
+            else:
+                print(f"  Executing path ({n_actions} actions)…")
+                # Execute step by step — no teleport, robot moves from its current position
+                completed = execute_nav_replay(
+                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells
                 )
+                if not completed:
+                    nav_recovery_and_replan(
+                        robot, goal_pos, cat, rgb_map_2d, heatmap
+                    )
 
             show_obs(robot, f"Arrived: {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
