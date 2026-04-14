@@ -100,14 +100,14 @@ class HabitatLanguageRobot(LangRobot):
             )
             cropped_obst_map = self.map.get_customized_obstacle_cropped()
 
-        # Safety margin: dilate obstacles slightly before building the visgraph.
+        # Safety margin: dilate obstacles before building the visgraph.
         # For HSSD the navmesh map has NO prior dilation; for MP3D the semantic
-        # customisation already applies dilate_iter=3, but a small extra margin
-        # still helps avoid paths that hug walls too closely.
-        # 2 extra iterations at cell_size=0.05 m → ~10 cm clearance per side.
+        # customisation already applies dilate_iter=3, but extra margin keeps
+        # paths well away from walls and furniture.
+        # 4 iterations at cell_size=0.05 m → ~20 cm clearance per side.
         from scipy.ndimage import binary_dilation as _bdilate
         _obs_mask = (cropped_obst_map == 0).astype(bool)
-        _obs_mask_dilated = _bdilate(_obs_mask, iterations=2)
+        _obs_mask_dilated = _bdilate(_obs_mask, iterations=4)
         cropped_obst_map_safe = np.where(_obs_mask_dilated, 0, cropped_obst_map).astype(np.uint8)
 
         self.nav.build_visgraph(

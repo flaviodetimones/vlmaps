@@ -366,7 +366,7 @@ def scan_360_and_verify(
     """
     from vlmaps.utils.yoloe_utils import get_session
 
-    session = get_session(cat, conf_thresh=0.25)
+    session = get_session(cat, conf_thresh=0.3)
     if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
@@ -887,7 +887,7 @@ def main(config: DictConfig) -> None:
                 cv2.waitKey(200)
 
                 from vlmaps.utils.yoloe_utils import get_session, shutdown_session
-                _yoloe_session = get_session(cat, conf_thresh=0.25)
+                _yoloe_session = get_session(cat, conf_thresh=0.3)
 
             if room_goal is not None:
                 goal_pos = list(room_goal)
@@ -937,6 +937,66 @@ def main(config: DictConfig) -> None:
                         f"{n_actions / straight_dist:.1f}x > {_MAX_DETOUR_RATIO}x) — skipping."
                     )
                     continue
+
+                # Narrow-passage check: if any cell on the path has less than
+                # _MIN_PASSAGE_CELLS clearance to an obstacle, the robot will likely
+                # collide.  Try one alternative standoff (further away, different
+                # approach angle).  If that also produces a narrow path, give up.
+                _MIN_PASSAGE_CELLS = 4  # 4 × 0.05 m = 20 cm minimum passage width
+                _obs_map_nav = robot.map.obstacles_map
+                _dist_nav = distance_transform_edt(_obs_map_nav)
+                _min_clearance = min(
+                    (float(_dist_nav[int(c[0]), int(c[1])])
+                     if 0 <= int(c[0]) < _dist_nav.shape[0]
+                        and 0 <= int(c[1]) < _dist_nav.shape[1]
+                     else 0.0)
+                    for c in path_cells
+                ) if path_cells else _MIN_PASSAGE_CELLS
+
+                if _min_clearance < _MIN_PASSAGE_CELLS and room_goal is None:
+                    print(
+                        f"  [narrow] Min clearance on path: {_min_clearance:.1f} cells "
+                        f"(< {_MIN_PASSAGE_CELLS}) — trying alternative standoff."
+                    )
+                    # Single retry: use a wider standoff from the opposite direction
+                    robot._set_nav_curr_pose()
+                    _alt_standoff, _ = robot.map.get_standoff_pos(
+                        robot.curr_pos_on_map, cat, standoff_m=1.5)
+                    _alt_path, _ = robot.plan_path_only(_alt_standoff)
+                    _alt_path_cells = getattr(robot, "last_planned_path", None) or []
+                    _alt_n = len(_alt_path)
+
+                    if _alt_n == 0:
+                        print(f"  [narrow] Alternative path also unreachable — skipping '{cat}'.")
+                        continue
+
+                    _alt_min_clearance = min(
+                        (float(_dist_nav[int(c[0]), int(c[1])])
+                         if 0 <= int(c[0]) < _dist_nav.shape[0]
+                            and 0 <= int(c[1]) < _dist_nav.shape[1]
+                         else 0.0)
+                        for c in _alt_path_cells
+                    ) if _alt_path_cells else 0.0
+
+                    if _alt_min_clearance < _MIN_PASSAGE_CELLS:
+                        print(
+                            f"  [narrow] Alternative path also too narrow "
+                            f"(clearance {_alt_min_clearance:.1f}) — skipping '{cat}'."
+                        )
+                        continue
+
+                    # Alternative is viable — use it
+                    print(
+                        f"  [narrow] Alternative path accepted "
+                        f"(clearance {_alt_min_clearance:.1f} cells, {_alt_n} actions)."
+                    )
+                    goal_pos, obj_centroid = select_safe_goal_from_path(
+                        _alt_path, heatmap, robot.map.obstacles_map
+                    )
+                    _, planned_actions = robot.plan_path_only(goal_pos)
+                    path_cells = getattr(robot, "last_planned_path", None) or []
+                    n_actions = len(planned_actions)
+                    already_at_goal = (n_actions == 0)
 
             # Show heatmap + planned path BEFORE executing so the user can see the route
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
