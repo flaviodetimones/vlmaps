@@ -145,8 +145,8 @@ class SemanticSceneRoomProvider(RoomProvider):
         return str(p) if p.exists() else None
 
     # ------------------------------------------------------------------
-    def build(self, semantic_config_path: str,
-              rmin: float, cmin: float, cs: float, gs: int) -> None:
+    def build(self, semantic_config_path: str, gs: int,
+              hab_to_grid=None) -> None:
         """
         Load region polygons from the HSSD semantic_config.json and rasterise
         them onto the VLMap grid using point-in-polygon.
@@ -154,16 +154,19 @@ class SemanticSceneRoomProvider(RoomProvider):
         Parameters
         ----------
         semantic_config_path : path to <scene_id>.semantic_config.json
-        rmin  : top-left Z offset of the VLMap grid (world metres)
-        cmin  : top-left X offset of the VLMap grid (world metres)
-        cs    : cell size in metres (typically 0.05)
         gs    : grid size in cells (typically 1000)
+        hab_to_grid : callable (x_hab, z_hab) -> (row, col) in grid space.
+                      Converts Habitat world coordinates to VLMap grid indices.
         """
         import json
 
         p = Path(semantic_config_path)
         if not p.exists():
             print(f"[SemanticSceneRoomProvider] config not found: {p}")
+            return
+
+        if hab_to_grid is None:
+            print("[SemanticSceneRoomProvider] hab_to_grid transform required")
             return
 
         with open(p) as f:
@@ -186,40 +189,34 @@ class SemanticSceneRoomProvider(RoomProvider):
             if len(poly_raw) < 3:
                 continue
 
-            # Extract (x, z) pairs — y is always 0 in HSSD poly_loops
-            poly_xz = np.array([[v[0], v[2]] for v in poly_raw], dtype=np.float32)
+            # Convert polygon from Habitat world (x, z) to VLMap grid (row, col)
+            poly_grid = np.array(
+                [hab_to_grid(v[0], v[2]) for v in poly_raw], dtype=np.float32
+            )
 
-            # Bounding box in world coords → grid coords for fast pre-filter
-            x_min, z_min = poly_xz.min(axis=0)
-            x_max, z_max = poly_xz.max(axis=0)
+            # Bounding box in grid coords for fast pre-filter
+            r_lo = max(0, int(poly_grid[:, 0].min()))
+            r_hi = min(H - 1, int(poly_grid[:, 0].max()) + 1)
+            c_lo = max(0, int(poly_grid[:, 1].min()))
+            c_hi = min(W - 1, int(poly_grid[:, 1].max()) + 1)
 
-            c_lo = max(0, int((x_min - cmin) / cs))
-            c_hi = min(W - 1, int((x_max - cmin) / cs) + 1)
-            r_lo = max(0, int((z_min - rmin) / cs))
-            r_hi = min(H - 1, int((z_max - rmin) / cs) + 1)
-
-            # Rasterise: test each grid cell centre against the polygon
+            # Rasterise: point-in-polygon in grid space
             for r in range(r_lo, r_hi + 1):
                 for c in range(c_lo, c_hi + 1):
-                    wx = cmin + c * cs + cs / 2.0
-                    wz = rmin + r * cs + cs / 2.0
-                    if _point_in_polygon(wx, wz, poly_xz):
-                        # Later regions overwrite earlier ones (fine for non-overlapping rooms)
+                    if _point_in_polygon(float(r), float(c), poly_grid):
                         self._region_grid[r, c] = region_id
 
-            # Centroid = average of polygon vertices
-            cx_world = float(poly_xz[:, 0].mean())
-            cz_world = float(poly_xz[:, 1].mean())
-            centroid_r = int((cz_world - rmin) / cs)
-            centroid_c = int((cx_world - cmin) / cs)
+            # Centroid in grid space
+            centroid_r = int(poly_grid[:, 0].mean())
+            centroid_c = int(poly_grid[:, 1].mean())
 
             self._regions.append({
                 "id": region_id,
                 "name": name,
                 "category": label,
-                "label": name,          # use short name as label for matching
+                "label": name,
                 "centroid": [centroid_r, centroid_c],
-                "poly_xz": poly_xz,
+                "poly_xz": np.array([[v[0], v[2]] for v in poly_raw], dtype=np.float32),
                 "floor_height": ann.get("floor_height", 0.0),
             })
 

@@ -126,14 +126,29 @@ class HabitatLanguageRobot(LangRobot):
                 _scene_cfg, self.scene_name
             )
             if _sem_config:
+                # Build the Habitat-world → VLMap-grid coordinate transform.
+                # Grid→Hab is: p_base=(gs/2-r)*cs, (gs/2-c)*cs, 0
+                #              p_hab = init_rot @ (base_rot_inv @ p_base) + init_t
+                # The inverse (Hab→Grid) reverses these steps.
+                from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
+                _poses = np.loadtxt(Path(vlmaps_data_dir) / "poses.txt")
+                _init_tf = cvt_pose_vec2tf(_poses[0])
+                _init_rot_inv = _init_tf[:3, :3].T
+                _init_t = _init_tf[:3, 3]
+                _base_rot = self.map.base_transform[:3, :3]
+                _gs = self.map.gs
+                _cs = self.map.cs
+
+                def _hab_to_grid(x_hab: float, z_hab: float):
+                    p_hab = np.array([x_hab, 0.0, z_hab])
+                    p_rel = _init_rot_inv @ (p_hab - _init_t)
+                    p_base = _base_rot @ p_rel
+                    row = _gs / 2.0 - p_base[0] / _cs
+                    col = _gs / 2.0 - p_base[1] / _cs
+                    return (row, col)
+
                 self.room_provider = SemanticSceneRoomProvider()
-                self.room_provider.build(
-                    _sem_config,
-                    self.vlmaps_dataloader.rmin,
-                    self.vlmaps_dataloader.cmin,
-                    self.map.cs,
-                    self.map.gs,
-                )
+                self.room_provider.build(_sem_config, _gs, hab_to_grid=_hab_to_grid)
             else:
                 print(f"[setup_scene] HSSD semantic config not found for '{self.scene_name}'")
 
