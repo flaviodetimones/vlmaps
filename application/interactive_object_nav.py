@@ -366,7 +366,7 @@ def scan_360_and_verify(
     """
     from vlmaps.utils.yoloe_utils import get_session
 
-    session = get_session(cat, conf_thresh=0.30)
+    session = get_session(cat, conf_thresh=0.25)
     if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
@@ -804,6 +804,10 @@ def main(config: DictConfig) -> None:
     show_map(robot, rgb_map_2d, heatmap_2d=None, label="Ready")
     print("Scene:", robot.vlmaps_data_save_dirs[config.scene_id].name)
 
+    _room_provider = getattr(robot, "room_provider", None)
+    if _room_provider and _room_provider.is_available():
+        print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
+
     # ── Instruction loop ─────────────────────────────────────────────────────
     while True:
         print("\n" + "─" * 50)
@@ -839,17 +843,41 @@ def main(config: DictConfig) -> None:
             # Compute heatmap ONCE per category (may call LLM API once if needed)
             print("  Computing semantic heatmap...")
             heatmap, kept_components = compute_heatmap(robot, cat)
+
+            # ── Phase A: annotate each component with its room ────────────────
+            if _room_provider and _room_provider.is_available():
+                robot._set_nav_curr_pose()
+                current_room = _room_provider.get_room_at_cell(
+                    int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+                )
+                print(f"  Current room: {current_room or 'unknown'}")
+                rooms_count: dict = {}
+                for comp in kept_components:
+                    cr, cc = comp["centroid"]
+                    comp["room"] = _room_provider.get_room_at_cell(int(cr), int(cc))
+                    r = comp["room"] or "unknown"
+                    rooms_count[r] = rooms_count.get(r, 0) + 1
+                if rooms_count:
+                    print(f"  Candidates by room: {rooms_count}")
+
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
             cv2.waitKey(200)
 
             # ── Get (or create) the YOLOE session for this target ─────────────
             from vlmaps.utils.yoloe_utils import get_session, shutdown_session
-            _yoloe_session = get_session(cat, conf_thresh=0.30)
+            _yoloe_session = get_session(cat, conf_thresh=0.25)
 
-            # ── Region-aware navigation: use room map if query matches a room ──
-            room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
+            # ── Region-aware navigation: room_provider (HSSD) or LabelMe map ──
+            room_goal = None
+            if _room_provider and _room_provider.is_available():
+                room_goal = _room_provider.get_room_centroid(cat)
+                if room_goal is not None:
+                    print(f"  Room provider match '{cat}': centroid {room_goal}")
+            if room_goal is None:
+                room_goal = find_room_goal(cat, _room_regions) if _room_regions else None
+                if room_goal is not None:
+                    print(f"  Room map match: navigating to region centroid {room_goal}")
             if room_goal is not None:
-                print(f"  Room map match: navigating to region centroid {room_goal}")
                 goal_pos = list(room_goal)
                 obj_centroid = goal_pos
                 _, planned_actions = robot.plan_path_only(goal_pos)

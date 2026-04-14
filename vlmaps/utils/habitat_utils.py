@@ -26,7 +26,7 @@ def make_cfg(settings: Dict) -> habitat_sim.Configuration:
         settings["height"],
         settings["width"],
         [0.0, settings["sensor_height"], 1.3],
-        orientation=[-np.pi / 4, 0, 0],  # 45° downward tilt
+        orientation=[-np.radians(40), 0, 0],  # 40° downward tilt
     )
     sensor_spec.append(back_rgb_sensor_spec)
 
@@ -37,7 +37,7 @@ def make_cfg(settings: Dict) -> habitat_sim.Configuration:
             settings["height"],
             settings["width"],
             [0.0, settings["sensor_height"], 0.0],
-            orientation=[-np.pi / 4, 0, 0],  # 45° downward tilt
+            orientation=[-np.radians(40), 0, 0],  # 40° downward tilt
         )
         sensor_spec.append(rgb_sensor_spec)
 

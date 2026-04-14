@@ -117,6 +117,26 @@ class HabitatLanguageRobot(LangRobot):
             vis=self.config["nav"]["vis"],
         )
 
+        # ── Room provider (HSSD: native semantic_config.json polygons) ───────
+        from vlmaps.utils.room_provider import SemanticSceneRoomProvider
+        self.room_provider = None
+        if dataset_type == "hssd":
+            _scene_cfg = str(getattr(self.config, "scene_dataset_config_file", ""))
+            _sem_config = SemanticSceneRoomProvider.find_config_path(
+                _scene_cfg, self.scene_name
+            )
+            if _sem_config:
+                self.room_provider = SemanticSceneRoomProvider()
+                self.room_provider.build(
+                    _sem_config,
+                    self.vlmaps_dataloader.rmin,
+                    self.vlmaps_dataloader.cmin,
+                    self.map.cs,
+                    self.map.gs,
+                )
+            else:
+                print(f"[setup_scene] HSSD semantic config not found for '{self.scene_name}'")
+
         # self._setup_localizer(vlmaps_data_dir)
 
     def _build_navmesh_obstacle_map(self, poses_path: Path) -> None:
