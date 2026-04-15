@@ -23,6 +23,7 @@ import numpy as np
 from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
+from vlmaps.utils.search_state import SearchState
 
 # Milliseconds to wait after each discrete sim step for smooth demo playback.
 # Increase for slower, more visible movements; decrease to speed up.
@@ -864,11 +865,18 @@ def main(config: DictConfig) -> None:
         show_obs(robot, "Start")
         show_map(robot, rgb_map_2d, label="Start")
 
+        # ── Phase B: build per-room search state for this instruction ────
+        _search_states: dict = {}  # cat → SearchState
+        for cat in categories:
+            _ss = SearchState(cat.strip(), _room_provider, robot.map.obstacles_map)
+            _search_states[cat.strip()] = _ss
+
         for cat in categories:
             cat = cat.strip()
             if not cat:
                 continue
             _frozen_detection_bgr = None  # clear previous detection freeze
+            _ss = _search_states.get(cat)
             print(f"\nPlanning path to: {cat}")
 
             # ── Check if target is a room name (room-level navigation) ────────
@@ -878,14 +886,18 @@ def main(config: DictConfig) -> None:
             if room_goal is None and _room_regions:
                 room_goal = find_room_goal(cat, _room_regions)
 
+            # Track current room in SearchState
+            robot._set_nav_curr_pose()
+            current_room = None
+            if _room_provider and _room_provider.is_available():
+                current_room = _room_provider.get_room_at_cell(
+                    int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+                )
+            if _ss:
+                _ss.update_current_room(current_room)
+
             if room_goal is not None:
                 # Room-level: navigate directly to centroid, no heatmap/YOLOE
-                robot._set_nav_curr_pose()
-                current_room = None
-                if _room_provider and _room_provider.is_available():
-                    current_room = _room_provider.get_room_at_cell(
-                        int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
-                    )
                 print(f"  Current room: {current_room or 'unknown'}")
                 print(f"  Room match '{cat}': navigating to centroid {room_goal}")
                 goal_pos = list(room_goal)
@@ -895,16 +907,12 @@ def main(config: DictConfig) -> None:
                 _yoloe_session = None
             else:
                 # Object-level: compute heatmap and prepare YOLOE
+                print(f"  Current room: {current_room or 'unknown'}")
                 print("  Computing semantic heatmap...")
                 heatmap, kept_components = compute_heatmap(robot, cat)
 
                 # Annotate each component with its room
                 if _room_provider and _room_provider.is_available():
-                    robot._set_nav_curr_pose()
-                    current_room = _room_provider.get_room_at_cell(
-                        int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
-                    )
-                    print(f"  Current room: {current_room or 'unknown'}")
                     rooms_count: dict = {}
                     for comp in kept_components:
                         cr, cc = comp["centroid"]
@@ -981,11 +989,18 @@ def main(config: DictConfig) -> None:
 
             # ── Room-level navigation: just arrive, no verification needed ────
             if room_goal is not None:
-                print(f"  Arrived at room '{cat}'. Done.")
+                robot._set_nav_curr_pose()
+                _arrived_room = None
+                if _room_provider and _room_provider.is_available():
+                    _arrived_room = _room_provider.get_room_at_cell(
+                        int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+                    )
+                if _ss:
+                    _ss.update_current_room(_arrived_room)
+                print(f"  Arrived at room '{cat}' (actual: {_arrived_room or 'unknown'}). Done.")
                 from vlmaps.utils.habitat_utils import agent_state2tf
                 agent_state = robot.sim.get_agent(0).get_state()
                 start_tf = agent_state2tf(agent_state)
-                robot._set_nav_curr_pose()
                 continue
 
             # Stage 0: YOLOE check at raw arrival (before any rotation)
@@ -1084,12 +1099,30 @@ def main(config: DictConfig) -> None:
                 elif not _navigated_alt:
                     print(f"  No viable alternative route for '{cat}'.")
 
+            # ── Update SearchState with result ────────────────────────────
+            robot._set_nav_curr_pose()
+            _end_room = None
+            if _room_provider and _room_provider.is_available():
+                _end_room = _room_provider.get_room_at_cell(
+                    int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+                )
+            if _ss:
+                _ss.update_current_room(_end_room)
+                _ss.record_candidate(_end_room, _yoloe_confirmed)
+                if _yoloe_confirmed:
+                    _ss.record_object_seen(_end_room, cat)
+                    _ss.mark_found(_end_room)
+
             print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
 
             from vlmaps.utils.habitat_utils import agent_state2tf
             agent_state = robot.sim.get_agent(0).get_state()
             start_tf = agent_state2tf(agent_state)
-            robot._set_nav_curr_pose()
+
+        # Print search state summary for all targets
+        for _cat, _ss in _search_states.items():
+            if _ss.rooms:
+                print(f"\n{_ss.summary()}")
 
         print("\nInstruction complete.")
 

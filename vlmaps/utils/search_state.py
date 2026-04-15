@@ -1,0 +1,159 @@
+"""
+search_state.py
+===============
+Per-room and per-search state tracking for room-aware object navigation.
+
+RoomState  — one per room, tracks exploration progress and object evidence.
+SearchState — one per search instruction, aggregates all RoomStates and
+             records the global search history.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+
+@dataclass
+class RoomState:
+    """Mutable state for a single room during a search episode."""
+
+    name: str
+    centroid: Tuple[float, float]          # (row, col) in VLMap grid
+
+    # Geometry (computed once at init from region_grid + obstacles_map)
+    total_cells: int = 0                   # room polygon cells in region_grid
+    free_cells: int = 0                    # room ∩ free-space (navigable area)
+
+    # Exploration
+    times_visited: int = 0                 # how many times the robot entered
+    objects_seen: List[str] = field(default_factory=list)  # objects found here
+    candidates_tried: int = 0             # heatmap components inspected here
+    candidates_confirmed: int = 0         # YOLOE-confirmed detections here
+
+    # Search result
+    target_found_here: bool = False
+
+    # ── Derived properties ──────────────────────────────────────────────
+    @property
+    def explored_ratio(self) -> float:
+        """Fraction of room area that is navigable (static, from map build)."""
+        if self.total_cells == 0:
+            return 0.0
+        return self.free_cells / self.total_cells
+
+    def summary(self) -> str:
+        """One-line human-readable summary for LLM context or logging."""
+        return (
+            f"{self.name}: visited={self.times_visited}, "
+            f"candidates={self.candidates_tried}/{self.candidates_confirmed}, "
+            f"objects={self.objects_seen}, "
+            f"navigable={self.explored_ratio:.0%}, "
+            f"found={self.target_found_here}"
+        )
+
+
+class SearchState:
+    """Tracks the full state of a single object-search episode.
+
+    Constructed once per navigation instruction.  Updated as the robot
+    navigates, inspects candidates, and confirms/rejects with YOLOE.
+    """
+
+    def __init__(
+        self,
+        target: str,
+        room_provider,
+        obstacles_map: np.ndarray,
+    ):
+        self.target: str = target
+        self.rooms: Dict[str, RoomState] = {}
+        self.visit_history: List[str] = []   # ordered list of room visits
+        self.current_room: Optional[str] = None
+        self.found: bool = False
+
+        self._build_rooms(room_provider, obstacles_map)
+
+    # ------------------------------------------------------------------
+    def _build_rooms(self, room_provider, obstacles_map: np.ndarray) -> None:
+        """Initialize one RoomState per room from the provider + obstacle map."""
+        if room_provider is None or not room_provider.is_available():
+            return
+
+        region_grid = getattr(room_provider, "_region_grid", None)
+        regions = getattr(room_provider, "_regions", [])
+        if region_grid is None or not regions:
+            return
+
+        free_mask = (obstacles_map > 0) if obstacles_map is not None else None
+
+        for reg in regions:
+            rid = reg["id"]
+            name = reg["label"]
+            cr, cc = reg["centroid"]
+
+            room_mask = (region_grid == rid)
+            total = int(room_mask.sum())
+            free = int((room_mask & free_mask).sum()) if free_mask is not None else total
+
+            self.rooms[name] = RoomState(
+                name=name,
+                centroid=(float(cr), float(cc)),
+                total_cells=total,
+                free_cells=free,
+            )
+
+    # ------------------------------------------------------------------
+    def update_current_room(self, room_name: Optional[str]) -> None:
+        """Record that the robot is now in *room_name*."""
+        if room_name is None:
+            return
+        prev = self.current_room
+        self.current_room = room_name
+        if room_name != prev and room_name in self.rooms:
+            self.rooms[room_name].times_visited += 1
+            self.visit_history.append(room_name)
+
+    def record_candidate(self, room_name: Optional[str], confirmed: bool) -> None:
+        """Record that a heatmap candidate in *room_name* was inspected."""
+        if room_name and room_name in self.rooms:
+            rs = self.rooms[room_name]
+            rs.candidates_tried += 1
+            if confirmed:
+                rs.candidates_confirmed += 1
+
+    def record_object_seen(self, room_name: Optional[str], obj: str) -> None:
+        """Record that *obj* was visually confirmed in *room_name*."""
+        if room_name and room_name in self.rooms:
+            rs = self.rooms[room_name]
+            if obj not in rs.objects_seen:
+                rs.objects_seen.append(obj)
+
+    def mark_found(self, room_name: Optional[str]) -> None:
+        """Mark the target as found in *room_name*."""
+        self.found = True
+        if room_name and room_name in self.rooms:
+            self.rooms[room_name].target_found_here = True
+
+    # ------------------------------------------------------------------
+    def summary(self) -> str:
+        """Multi-line summary of the entire search state."""
+        lines = [f"Search target: '{self.target}'  found={self.found}"]
+        lines.append(f"Visit history: {' → '.join(self.visit_history) or '(none)'}")
+        for rs in self.rooms.values():
+            lines.append(f"  {rs.summary()}")
+        return "\n".join(lines)
+
+    def room_summaries_for_llm(self) -> str:
+        """Compact room table suitable for LLM context window."""
+        lines = []
+        for rs in self.rooms.values():
+            lines.append(
+                f"- {rs.name} | visited {rs.times_visited}x | "
+                f"candidates {rs.candidates_tried} tried, "
+                f"{rs.candidates_confirmed} confirmed | "
+                f"navigable {rs.explored_ratio:.0%}"
+            )
+        return "\n".join(lines)
