@@ -808,36 +808,39 @@ def main(config: DictConfig) -> None:
     if _room_provider and _room_provider.is_available():
         print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
 
-    # Pre-compute which object categories actually have cells in the current map.
-    # labeled_map_cropped[i] is the boolean mask for category i after load_categories().
+    # Determine which categories actually have signal in the current scene using
+    # the same filter as compute_heatmap: voxel must win argmax AND score > 0.3.
+    # Computed once at startup (scores_mat doesn't change during the session).
     _STRUCTURAL = {"void", "wall", "floor", "ceiling"}
-    _MIN_CELLS = 15  # ignore categories with fewer active cells (noise)
-    def _get_present_categories() -> list:
-        labeled = getattr(robot.map, "labeled_map_cropped", None)
+    _SCORE_THRESH = 0.3   # must match compute_heatmap's score_thresh
+    _MIN_VOXELS = 10      # minimum winning voxels to consider a category present
+    def _build_present_categories() -> list:
+        from vlmaps.utils.index_utils import find_similar_category_id as _fsid
         cats = getattr(robot.map, "categories", [])
-        if labeled is None or not cats:
+        scores_mat = getattr(robot.map, "scores_mat", None)
+        if scores_mat is None:
             return [c for c in cats if c not in _STRUCTURAL]
+        max_ids = np.argmax(scores_mat, axis=1)
         present = []
         for i, c in enumerate(cats):
             if c in _STRUCTURAL:
                 continue
-            try:
-                if int(labeled[i].sum()) >= _MIN_CELLS:
-                    present.append(c)
-            except Exception:
-                pass
+            mask = (max_ids == i) & (scores_mat[:, i] > _SCORE_THRESH)
+            if int(mask.sum()) >= _MIN_VOXELS:
+                present.append(c)
         return present
+
+    _present_categories = _build_present_categories()
 
     # ── Instruction loop ─────────────────────────────────────────────────────
     while True:
-        _present = _get_present_categories()
         rooms_hint = ""
         if _room_provider and _room_provider.is_available():
             rooms_hint = f"  Rooms     : {_room_provider.list_rooms()}\n"
         print(
             f"\n{'─' * 50}\n"
             f"{rooms_hint}"
-            f"  Objects   : {_present}"
+            f"  Objects   : {_present_categories}"
         )
         instruction = input("Enter navigation instruction (or 'quit'): ").strip()
 
