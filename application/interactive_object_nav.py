@@ -808,15 +808,37 @@ def main(config: DictConfig) -> None:
     if _room_provider and _room_provider.is_available():
         print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
 
-    # Show the VLMaps queryable object categories (excludes structural labels)
+    # Pre-compute which object categories actually have cells in the current map.
+    # labeled_map_cropped[i] is the boolean mask for category i after load_categories().
     _STRUCTURAL = {"void", "wall", "floor", "ceiling"}
-    _map_cats = getattr(robot.map, "categories", [])
-    _queryable = [c for c in _map_cats if c not in _STRUCTURAL]
-    print(f"Queryable objects ({len(_queryable)}): {_queryable}")
+    _MIN_CELLS = 15  # ignore categories with fewer active cells (noise)
+    def _get_present_categories() -> list:
+        labeled = getattr(robot.map, "labeled_map_cropped", None)
+        cats = getattr(robot.map, "categories", [])
+        if labeled is None or not cats:
+            return [c for c in cats if c not in _STRUCTURAL]
+        present = []
+        for i, c in enumerate(cats):
+            if c in _STRUCTURAL:
+                continue
+            try:
+                if int(labeled[i].sum()) >= _MIN_CELLS:
+                    present.append(c)
+            except Exception:
+                pass
+        return present
 
     # ── Instruction loop ─────────────────────────────────────────────────────
     while True:
-        print("\n" + "─" * 50)
+        _present = _get_present_categories()
+        rooms_hint = ""
+        if _room_provider and _room_provider.is_available():
+            rooms_hint = f"  Rooms     : {_room_provider.list_rooms()}\n"
+        print(
+            f"\n{'─' * 50}\n"
+            f"{rooms_hint}"
+            f"  Objects   : {_present}"
+        )
         instruction = input("Enter navigation instruction (or 'quit'): ").strip()
 
         if instruction.lower() in ("quit", "exit", "q"):
