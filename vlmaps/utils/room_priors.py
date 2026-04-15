@@ -18,12 +18,20 @@ The result is normalised so the scores sum to 1 across known rooms.
 from __future__ import annotations
 
 import os
+import re as _re
 from typing import Dict, List, Optional
 
-# ── Fusion weights ──────────────────────────────────────────────────────────
-_W_LLM      = 0.50
+# ── Fusion weights (used for indirect queries without heatmap evidence) ──────
+_W_LLM      = 0.45
 _W_MANUAL   = 0.30
-_W_EVIDENCE = 0.20
+_W_EVIDENCE = 0.25
+
+# ── Dynamic weights for direct queries (heatmap evidence available) ──────────
+# direct:   heatmap dominates → 0.65 heatmap + 0.20 manual + 0.15 llm
+# indirect: language priors → 0.45 llm + 0.30 manual + 0.25 scene-evidence
+_W_DIRECT_HEATMAP = 0.65
+_W_DIRECT_MANUAL  = 0.20
+_W_DIRECT_LLM     = 0.15
 
 # ── Manual object→room table ────────────────────────────────────────────────
 # Format: object_keyword → {room_fragment: score}
@@ -86,6 +94,40 @@ _MANUAL_TABLE: Dict[str, Dict[str, float]] = {
     "furniture":    {"living": 0.4, "bedroom": 0.4, "office": 0.3},
 }
 
+# ── Semantic room alias table ────────────────────────────────────────────────
+# Maps scene-specific or atypical room names to the semantic families used in
+# the manual prior table.  Applied only for semantic reasoning — room instance
+# identity (e.g. bathroom.001) is never collapsed by this mapping.
+_SEMANTIC_ALIASES: Dict[str, str] = {
+    "tv":               "living",
+    "tv room":          "living",
+    "media":            "living",
+    "media room":       "living",
+    "lounge":           "living",
+    "den":              "living",
+    "family room":      "living",
+    "sitting room":     "living",
+    "laundryroom":      "laundry",
+    "laundry room":     "laundry",
+    "utility":          "laundry",
+    "utility room":     "laundry",
+    "washing":          "laundry",
+    "study":            "office",
+    "home office":      "office",
+    "nursery":          "bedroom",
+    "guest room":       "bedroom",
+    "master bedroom":   "bedroom",
+    "dining":           "dining",
+    "dining room":      "dining",
+    "eating area":      "dining",
+    "breakfast":        "dining",
+    "entrance":         "hallway",
+    "entry":            "hallway",
+    "foyer":            "hallway",
+    "corridor":         "hallway",
+    "passageway":       "hallway",
+}
+
 # ── Evidence co-occurrence table ────────────────────────────────────────────
 # Objects that, when seen in a room, reinforce particular room types.
 # Format: seen_object_keyword → room_fragment → reinforcement_score
@@ -107,6 +149,50 @@ _CO_OCCURRENCE: Dict[str, Dict[str, float]] = {
     "washer":       {"laundry": 0.8},
     "dryer":        {"laundry": 0.8},
 }
+
+
+# ── Room name normalisation ──────────────────────────────────────────────────
+
+def _normalize_room_for_priors(room_instance: str) -> str:
+    """Return the semantic family name for a room instance.
+
+    Strips numeric suffix (e.g. .001), then applies the semantic alias table.
+    Used ONLY for matching against the manual prior / evidence tables.
+    Never destroys room_instance identity — the original name is always kept
+    for state tracking.
+
+    Examples
+    --------
+    "tv"         → "living"
+    "tv.001"     → "living"
+    "bathroom"   → "bathroom"   (no alias → unchanged)
+    "dining room"→ "dining"
+    """
+    r = _re.sub(r'\.\d+$', '', room_instance.lower().strip())
+    return _SEMANTIC_ALIASES.get(r, r)
+
+
+def compute_heatmap_room_evidence(kept_components: list) -> Dict[str, float]:
+    """Aggregate heatmap component quality by room instance.
+
+    Sums component quality scores (from the 'quality' field set by
+    postprocess_heatmap) per room instance (from the 'room' field annotated
+    by the nav system).  Normalises to [0, 1] so the strongest room scores 1.
+
+    Returns an empty dict if no components have room annotations.
+    """
+    raw: Dict[str, float] = {}
+    for comp in kept_components:
+        room = comp.get("room")
+        if room is None:
+            continue
+        raw[room] = raw.get(room, 0.0) + float(comp.get("quality", 0.0))
+    if not raw:
+        return {}
+    max_q = max(raw.values())
+    if max_q < 1e-6:
+        return {}
+    return {r: min(1.0, v / max_q) for r, v in raw.items()}
 
 
 # ── LLM signal ──────────────────────────────────────────────────────────────
@@ -167,8 +253,11 @@ def _query_llm_room_prior(
 
 def _manual_prior(query: str, known_rooms: List[str]) -> Dict[str, float]:
     """
-    Look up the manual table for *query* and map scores to *known_rooms*
-    via substring matching (e.g. "bathroom" fragment matches "bathroom 1").
+    Look up the manual table for *query* and map scores to *known_rooms*.
+
+    Matching uses both the raw room name and its normalized semantic family
+    (via _normalize_room_for_priors), so scene-specific names like 'tv' are
+    correctly matched against fragments like 'living'.
     """
     q = query.lower().strip()
     # Find best matching key in table (exact first, then substring)
@@ -184,9 +273,10 @@ def _manual_prior(query: str, known_rooms: List[str]) -> Dict[str, float]:
     result: Dict[str, float] = {}
     for room in known_rooms:
         room_lower = room.lower()
+        room_normalized = _normalize_room_for_priors(room_lower)
         best = 0.0
         for fragment, score in table_entry.items():
-            if fragment in room_lower:
+            if fragment in room_lower or fragment in room_normalized:
                 best = max(best, score)
         if best > 0:
             result[room] = best
@@ -201,6 +291,9 @@ def _evidence_prior(
 ) -> Dict[str, float]:
     """
     For each room, accumulate co-occurrence scores for objects already seen there.
+
+    Matching uses both the raw room name and its normalized semantic family
+    so scene-specific names like 'tv' benefit from co-occurrence signals.
     Returns scores in [0, 1].
     """
     raw: Dict[str, float] = {r: 0.0 for r in known_rooms}
@@ -209,13 +302,14 @@ def _evidence_prior(
         if room not in raw:
             continue
         room_lower = room.lower()
+        room_normalized = _normalize_room_for_priors(room_lower)
         acc = 0.0
         for obj in seen_objs:
             obj_lower = obj.lower()
             for key, fragments in _CO_OCCURRENCE.items():
                 if key in obj_lower or obj_lower in key:
                     for frag, score in fragments.items():
-                        if frag in room_lower:
+                        if frag in room_lower or frag in room_normalized:
                             acc += score
         # Clamp per room to [0, 1]
         raw[room] = min(1.0, acc)
@@ -224,8 +318,6 @@ def _evidence_prior(
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
-
-import re as _re
 
 
 def canonical_room_type(room_instance: str) -> str:
@@ -254,6 +346,8 @@ def compute_room_priors(
     known_rooms: List[str],
     objects_seen_by_room: Optional[Dict[str, List[str]]] = None,
     llm_output: Optional[Dict[str, float]] = None,
+    heatmap_evidence: Optional[Dict[str, float]] = None,
+    query_type: str = "indirect",
 ) -> Dict[str, float]:
     """
     Compute fused room priors for *query* over *known_rooms*.
@@ -265,6 +359,14 @@ def compute_room_priors(
     objects_seen_by_room: {room_name: [objects confirmed in that room]}
     llm_output          : pre-computed LLM scores {room: score} — if None,
                           will call LLM automatically
+    heatmap_evidence    : {room_instance: normalised_quality} from heatmap
+                          components; only used when query_type == "direct"
+    query_type          : "direct"   — heatmap has signal, spatial evidence
+                                       dominates (0.65 heatmap + 0.20 manual
+                                       + 0.15 llm)
+                          "indirect" — no heatmap signal, language priors
+                                       dominate (0.45 llm + 0.30 manual
+                                       + 0.25 scene-evidence)
 
     Returns
     -------
@@ -279,25 +381,41 @@ def compute_room_priors(
     else:
         llm_scores = llm_output
 
-    # 2. Manual table
+    # 2. Manual table (uses semantic aliases for scene-specific room names)
     manual_scores = _manual_prior(query, known_rooms)
 
-    # 3. Scene evidence
+    # 3. Scene evidence (co-occurrence from observed objects)
     if objects_seen_by_room is None:
         objects_seen_by_room = {}
     evidence_scores = _evidence_prior(objects_seen_by_room, known_rooms)
 
-    # 4. Fuse
+    if heatmap_evidence is None:
+        heatmap_evidence = {}
+
+    # 4. Dynamic fusion: direct queries let heatmap evidence dominate
+    if query_type == "direct" and heatmap_evidence:
+        w_llm      = _W_DIRECT_LLM
+        w_manual   = _W_DIRECT_MANUAL
+        w_evidence = 0.0     # scene co-occurrence superseded by heatmap
+        w_heatmap  = _W_DIRECT_HEATMAP
+    else:
+        w_llm      = _W_LLM
+        w_manual   = _W_MANUAL
+        w_evidence = _W_EVIDENCE
+        w_heatmap  = 0.0
+
+    # 5. Fuse
     fused: Dict[str, float] = {}
     for room in known_rooms:
         s = (
-            _W_LLM      * llm_scores.get(room, 0.0)
-            + _W_MANUAL   * manual_scores.get(room, 0.0)
-            + _W_EVIDENCE * evidence_scores.get(room, 0.0)
+            w_llm      * llm_scores.get(room, 0.0)
+            + w_manual   * manual_scores.get(room, 0.0)
+            + w_evidence * evidence_scores.get(room, 0.0)
+            + w_heatmap  * heatmap_evidence.get(room, 0.0)
         )
         fused[room] = min(1.0, max(0.0, s))
 
-    # 5. Normalise
+    # 6. Normalise
     total = sum(fused.values())
     if total > 1e-6:
         fused = {r: v / total for r, v in fused.items()}

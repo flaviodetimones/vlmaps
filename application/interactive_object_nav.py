@@ -903,6 +903,101 @@ def select_safe_goal_from_path(
     return [int(last[0]), int(last[1])], obj_centroid
 
 
+def find_reachable_room_goal(
+    target_room: str,
+    room_provider,
+    obs_map: np.ndarray,
+    top_k: int = 8,
+    min_clearance: float = 3.0,
+) -> list:
+    """Return up to top_k safe navigable cells inside target_room.
+
+    Uses the room provider's region_grid to enumerate all cells that
+    belong to the target room, intersects with the free-space obstacle map,
+    then ranks by distance-to-obstacle (clearance) and returns the top-K.
+
+    This replaces raw geometric centroid navigation for room commands so
+    the planner gets a goal that is actually inside the room AND safe.
+
+    Returns:
+        List of [row, col] goals sorted by clearance descending.
+        Empty list if the target room is not found or has no navigable cells.
+    """
+    import re as _re_local
+
+    if room_provider is None or not room_provider.is_available():
+        return []
+
+    region_grid = getattr(room_provider, "_region_grid", None)
+    regions     = getattr(room_provider, "_regions", [])
+
+    if region_grid is None or not regions:
+        return []
+
+    # Find matching region id (same word-boundary logic as get_room_centroid)
+    query   = target_room.lower().strip()
+    pattern = _re_local.compile(r'\b' + _re_local.escape(query) + r'\b')
+    target_rid = None
+    for reg in regions:
+        label = reg["label"].lower()
+        if query == label:
+            target_rid = reg["id"]
+            break
+        if target_rid is None and pattern.search(label):
+            target_rid = reg["id"]
+
+    if target_rid is None:
+        print(f"  [room-goal] Room '{target_room}' not found in region grid")
+        return []
+
+    # Navigable cells inside the target room
+    room_mask       = (region_grid == target_rid)
+    free_mask       = (obs_map > 0)
+    navigable_room  = room_mask & free_mask
+
+    if not navigable_room.any():
+        print(f"  [room-goal] No navigable cells in room '{target_room}'")
+        return []
+
+    dist_map = distance_transform_edt(obs_map)
+    rows, cols = np.where(navigable_room)
+    clearances = dist_map[rows, cols]
+
+    # Sort by clearance descending
+    sorted_idx = np.argsort(-clearances)
+
+    candidates = []
+    for i in sorted_idx:
+        cl = float(clearances[i])
+        r, c = int(rows[i]), int(cols[i])
+        # Always include at least one candidate even if clearance is low
+        if cl >= min_clearance or not candidates:
+            candidates.append([r, c])
+        if len(candidates) >= top_k:
+            break
+
+    best_cl = float(clearances[sorted_idx[0]]) if len(sorted_idx) > 0 else 0.0
+    print(f"  [room-goal] Found {len(candidates)} safe goal(s) in '{target_room}' "
+          f"(best clearance: {best_cl:.1f} cells)")
+    return candidates
+
+
+def _room_instance_matches(actual_room, target_room: str) -> bool:
+    """Return True if actual_room satisfies the target_room navigation command.
+
+    Allows canonical-type match so 'kitchen.001' satisfies command 'kitchen'.
+    Rejects type mismatch so 'bathroom.001' does NOT satisfy 'dining room'.
+    """
+    from vlmaps.utils.room_priors import canonical_room_type
+    if actual_room is None:
+        return False
+    a = actual_room.lower().strip()
+    t = target_room.lower().strip()
+    if a == t:
+        return True
+    return canonical_room_type(a) == canonical_room_type(t)
+
+
 def find_best_start_pose(robot):
     """
     Scan ~30 evenly-spaced trajectory poses and return the one whose 2-D map
@@ -1073,12 +1168,31 @@ def main(config: DictConfig) -> None:
             if _ss:
                 _ss.update_current_room(current_room)
 
+            _room_safe_goals: list = []   # Bug 1: top-K safe goals for retry
+
             if room_goal is not None:
-                # Room-level: navigate directly to centroid, no heatmap/YOLOE
+                # Bug 1: replace raw centroid with safe reachable room goals
+                print(f"  Requested room command: {cat}")
                 print(f"  Current room: {current_room or 'unknown'}")
-                print(f"  Room match '{cat}': navigating to centroid {room_goal}")
-                goal_pos = list(room_goal)
-                _, planned_actions = robot.plan_path_only(goal_pos)
+                raw_centroid = list(room_goal)
+                print(f"  Raw centroid: {raw_centroid}")
+                _rc_r, _rc_c = int(raw_centroid[0]), int(raw_centroid[1])
+                _raw_nav = bool(robot.map.obstacles_map[_rc_r, _rc_c]) if (
+                    0 <= _rc_r < robot.map.obstacles_map.shape[0] and
+                    0 <= _rc_c < robot.map.obstacles_map.shape[1]
+                ) else False
+                print(f"  Raw centroid navigable: {_raw_nav}")
+
+                _room_safe_goals = find_reachable_room_goal(
+                    cat, _room_provider, robot.map.obstacles_map
+                )
+                if _room_safe_goals:
+                    goal_pos = _room_safe_goals[0]
+                    print(f"  Selected safe room goal: {goal_pos}")
+                else:
+                    goal_pos = raw_centroid
+                    print(f"  No safe interior goals found — falling back to raw centroid")
+
                 heatmap = np.zeros((robot.map.gs, robot.map.gs), dtype=np.float32)
                 kept_components = []
                 _yoloe_session = None
@@ -1099,6 +1213,32 @@ def main(config: DictConfig) -> None:
                     if rooms_count:
                         print(f"  Candidates by room: {rooms_count}")
 
+                # Bug 2: re-compute room priors with heatmap evidence as
+                # dominant signal (direct query — heatmap has signal).
+                if _ss and kept_components:
+                    from vlmaps.utils.room_priors import (
+                        compute_room_priors as _crp,
+                        compute_heatmap_room_evidence as _che,
+                    )
+                    _heatmap_ev = _che(kept_components)
+                    print(f"  Query type: direct")
+                    if _heatmap_ev:
+                        _ev_sorted = sorted(_heatmap_ev.items(), key=lambda x: -x[1])
+                        print(f"  Room evidence from heatmap: "
+                              f"{ {r: round(v, 3) for r, v in _ev_sorted} }")
+                    _known_rooms_list = list(_ss.rooms.keys())
+                    _seen_objs = {n: rs.objects_seen for n, rs in _ss.rooms.items()}
+                    _new_priors = _crp(
+                        cat, _known_rooms_list, _seen_objs,
+                        heatmap_evidence=_heatmap_ev, query_type="direct",
+                    )
+                    for _rn, _rv in _new_priors.items():
+                        if _rn in _ss.rooms:
+                            _ss.rooms[_rn].target_relevance = _rv
+                    _np_sorted = sorted(_new_priors.items(), key=lambda x: -x[1])
+                    print(f"  Final room priors after evidence fusion: "
+                          f"{ ', '.join(f'{r}={v:.2f}' for r, v in _np_sorted[:6] if v > 0.01) }")
+
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
                 cv2.waitKey(200)
 
@@ -1110,9 +1250,10 @@ def main(config: DictConfig) -> None:
                 _yoloe_session = get_session(cat, conf_thresh=0.3)
 
             if room_goal is not None:
-                goal_pos = list(room_goal)
+                # goal_pos already set to safe interior goal above (Bug 1 fix)
                 obj_centroid = goal_pos
                 _, planned_actions = robot.plan_path_only(goal_pos)
+                print(f"  Goal room instance: {_room_provider.get_room_at_cell(int(goal_pos[0]), int(goal_pos[1])) if _room_provider and _room_provider.is_available() else 'unknown'}")
             else:
                 # ── Task 1: current-compatible-room-first candidate selection ──
                 robot._set_nav_curr_pose()
@@ -1149,20 +1290,94 @@ def main(config: DictConfig) -> None:
             n_actions = len(planned_actions)
             print(f"  Path computed: {n_actions} actions.")
 
-            # ── Task 2: safety metrics log ────────────────────────────────────
+            # ── Safety metrics + Bug 3 execution gate ────────────────────────
+            _MIN_GOAL_CLEARANCE = 3.0   # cells (~15 cm at cs=0.05 m)
+            _MIN_PATH_CLEARANCE = 1.0   # cells — zero is definitely in obstacle
+
+            _goal_cl = 0.0
+            _safety  = {"path_length": 0, "min_clearance": 0.0,
+                        "mean_clearance": 0.0, "safety_penalty": 0.0,
+                        "safe_cost": 0.0}
+
             if path_cells and room_goal is None:
+                _dist_map_safety = distance_transform_edt(robot.map.obstacles_map)
                 _safety = _compute_path_safety(path_cells, robot.map.obstacles_map)
-                _goal_cl = 0.0
                 if goal_pos and 0 <= int(goal_pos[0]) < robot.map.obstacles_map.shape[0]:
-                    from scipy.ndimage import distance_transform_edt as _edt
-                    _d = _edt(robot.map.obstacles_map)
-                    _goal_cl = float(_d[int(goal_pos[0]), int(goal_pos[1])])
+                    _goal_cl = float(_dist_map_safety[int(goal_pos[0]), int(goal_pos[1])])
                 print(f"  [safety] length={_safety['path_length']} "
                       f"min_cl={_safety['min_clearance']:.1f} "
                       f"mean_cl={_safety['mean_clearance']:.1f} "
                       f"penalty={_safety['safety_penalty']:.1f} "
                       f"safe_cost={_safety['safe_cost']:.1f} "
                       f"goal_cl={_goal_cl:.1f}")
+
+                # Bug 3: reject unsafe paths before execution
+                _goal_unsafe = _goal_cl < _MIN_GOAL_CLEARANCE
+                _path_unsafe = _safety["min_clearance"] < _MIN_PATH_CLEARANCE
+
+                if _goal_unsafe or _path_unsafe:
+                    _reasons = []
+                    if _goal_unsafe:
+                        _reasons.append(f"goal_cl={_goal_cl:.1f}<{_MIN_GOAL_CLEARANCE}")
+                    if _path_unsafe:
+                        _reasons.append(f"min_cl={_safety['min_clearance']:.1f}<{_MIN_PATH_CLEARANCE}")
+                    print(f"  [safety] Unsafe path rejected before execution ({', '.join(_reasons)}).")
+
+                    # Mark current centroid as tried; try up to 3 alternatives
+                    _bc_r = int(best_comp["centroid"][0])
+                    _bc_c = int(best_comp["centroid"][1])
+                    _tried_set_now = getattr(_ss, "_tried_centroids", set()) if _ss else set()
+                    _tried_set_now.add((_bc_r, _bc_c))
+                    if _ss:
+                        _ss._tried_centroids = _tried_set_now
+
+                    _alt_untried = [
+                        c for c in kept_components
+                        if (int(c["centroid"][0]), int(c["centroid"][1])) not in _tried_set_now
+                    ]
+
+                    _safe_alt_found = False
+                    for _nc in _alt_untried[:3]:
+                        _nc_r, _nc_c = _nc["centroid"]
+                        _nc_target = [int(_nc_r), int(_nc_c)]
+                        print(f"  [safety] Trying next candidate: {_nc_target} "
+                              f"(room: {_nc.get('room', 'unknown')})")
+                        _nc_init, _ = robot.plan_path_only(_nc_target)
+                        _nc_goal, _nc_cen = select_safe_goal_from_path(
+                            _nc_init, heatmap, robot.map.obstacles_map
+                        )
+                        _, _nc_acts = robot.plan_path_only(_nc_goal)
+                        _nc_path = getattr(robot, "last_planned_path", None) or []
+                        _nc_safety = _compute_path_safety(_nc_path, robot.map.obstacles_map)
+                        _nc_gcl = 0.0
+                        if _nc_goal and 0 <= int(_nc_goal[0]) < _dist_map_safety.shape[0]:
+                            _nc_gcl = float(_dist_map_safety[int(_nc_goal[0]), int(_nc_goal[1])])
+                        print(f"  [safety] Alt candidate: goal_cl={_nc_gcl:.1f} "
+                              f"min_cl={_nc_safety['min_clearance']:.1f}")
+
+                        if (_nc_gcl >= _MIN_GOAL_CLEARANCE and
+                                _nc_safety["min_clearance"] >= _MIN_PATH_CLEARANCE):
+                            goal_pos      = _nc_goal
+                            obj_centroid  = _nc_cen
+                            planned_actions = _nc_acts
+                            path_cells    = _nc_path
+                            n_actions     = len(_nc_acts)
+                            best_comp     = _nc
+                            _goal_cl      = _nc_gcl
+                            print(f"  [safety] Safe alternative accepted: {goal_pos}")
+                            _safe_alt_found = True
+                            break
+                        else:
+                            _tried_set_now.add((int(_nc_r), int(_nc_c)))
+                            if _ss:
+                                _ss._tried_centroids = _tried_set_now
+
+                    if not _safe_alt_found:
+                        print(f"  [safety] No safe candidate found for '{cat}' — skipping.")
+                        if _yoloe_session is not None:
+                            from vlmaps.utils.yoloe_utils import shutdown_session
+                            shutdown_session()
+                        continue
 
             # n_actions == 0 means robot is already at the goal — treat as arrived.
             already_at_goal = (n_actions == 0)
@@ -1190,7 +1405,7 @@ def main(config: DictConfig) -> None:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Arrived: {cat}")
 
-            # ── Room-level navigation: just arrive, no verification needed ────
+            # ── Room-level navigation: arrival validation + retry (Bug 1) ────
             if room_goal is not None:
                 robot._set_nav_curr_pose()
                 _arrived_room = None
@@ -1198,9 +1413,48 @@ def main(config: DictConfig) -> None:
                     _arrived_room = _room_provider.get_room_at_cell(
                         int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
                     )
+                print(f"  Actual room after path: {_arrived_room or 'unknown'}")
+                _room_ok = _room_instance_matches(_arrived_room, cat)
+                print(f"  Room command success: {_room_ok}")
+
+                # Retry with alternate safe goals if first attempt failed
+                if not _room_ok and len(_room_safe_goals) > 1:
+                    for _alt_idx, _alt_goal in enumerate(_room_safe_goals[1:], start=2):
+                        print(f"  Retrying alternate goal inside target room "
+                              f"({_alt_idx}/{len(_room_safe_goals)}): {_alt_goal}")
+                        _, _alt_acts = robot.plan_path_only(_alt_goal)
+                        _n_alt = len(_alt_acts)
+                        if _n_alt == 0:
+                            print(f"  Already at alternate goal.")
+                            robot._set_nav_curr_pose()
+                        else:
+                            _alt_completed = execute_nav_replay(
+                                robot, _alt_acts, cat, rgb_map_2d, heatmap, []
+                            )
+                            if not _alt_completed:
+                                nav_recovery_and_replan(
+                                    robot, _alt_goal, cat, rgb_map_2d, heatmap
+                                )
+                        robot._set_nav_curr_pose()
+                        if _room_provider and _room_provider.is_available():
+                            _arrived_room = _room_provider.get_room_at_cell(
+                                int(robot.curr_pos_on_map[0]),
+                                int(robot.curr_pos_on_map[1])
+                            )
+                        print(f"  Actual room after retry: {_arrived_room or 'unknown'}")
+                        _room_ok = _room_instance_matches(_arrived_room, cat)
+                        print(f"  Room command success: {_room_ok}")
+                        if _room_ok:
+                            break
+
+                if _room_ok:
+                    print(f"  Arrived at room '{cat}' (actual: {_arrived_room}). Done.")
+                else:
+                    print(f"  Room navigation FAILED: requested '{cat}', "
+                          f"ended in '{_arrived_room or 'unknown'}'.")
+
                 if _ss:
                     _ss.update_current_room(_arrived_room)
-                print(f"  Arrived at room '{cat}' (actual: {_arrived_room or 'unknown'}). Done.")
                 from vlmaps.utils.habitat_utils import agent_state2tf
                 agent_state = robot.sim.get_agent(0).get_state()
                 start_tf = agent_state2tf(agent_state)
