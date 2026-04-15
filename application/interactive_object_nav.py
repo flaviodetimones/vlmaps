@@ -544,8 +544,12 @@ def execute_nav_replay(
         True  — replay completed without stuck event or collision.
         False — stuck or imminent collision detected; caller should recover.
     """
-    _STOP_CL = 2.0   # cells — hard stop (imminent collision)
-    _SLOW_CL = 5.0   # cells — warn but continue
+    # Thresholds based on the RAW (undilated) obstacle map distance transform.
+    # Doorways in HSSD are ~10 cells wide → center clearance ~5 cells (raw).
+    # The dilated map already shrinks free space by 3 cells per side, so
+    # using the raw map here keeps doorway traversal possible.
+    _STOP_CL = 1.0   # cells — hard stop (about to enter obstacle boundary)
+    _SLOW_CL = 2.5   # cells — low clearance debug warning
 
     low_motion_count = 0
     n = len(planned_actions)
@@ -1543,29 +1547,29 @@ def main(config: DictConfig) -> None:
                      path_cells=path_cells, label=f"Path planned: {cat}")
             cv2.waitKey(800)
 
-            # Precompute dist_map for the collision shield from the dilated map
-            _shield_obs = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
-            _dist_map_shield = distance_transform_edt(_shield_obs)
+            # Precompute dist_map for the collision shield from the RAW (undilated)
+            # obstacle map so doorways are not falsely flagged as low-clearance.
+            # The dilated _safe_obs_map is only for planning/goal validation.
+            _dist_map_shield = distance_transform_edt(robot.map.obstacles_map)
 
             if already_at_goal:
                 print(f"  Already at goal for '{cat}' — proceeding with verification.")
             else:
                 print(f"  Executing path ({n_actions} actions)…")
-                # Execute step by step — no teleport, robot moves from its current position
+                # One-shot execution: no recovery or replanning on failure.
                 completed = execute_nav_replay(
                     robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells,
                     dist_map=_dist_map_shield,
                 )
                 if not completed:
-                    nav_recovery_and_replan(
-                        robot, goal_pos, cat, rgb_map_2d, heatmap
-                    )
+                    print(f"  [nav] Path execution stopped early for '{cat}' "
+                          f"(stuck or shield). Continuing from current position.")
 
             show_obs(robot, f"Arrived: {cat}")
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Arrived: {cat}")
 
-            # ── Room-level navigation: arrival validation + retry (Bug 1) ────
+            # ── Room-level navigation: one-shot arrival check (no retry) ────
             if room_goal is not None:
                 robot._set_nav_curr_pose()
                 _arrived_room = None
@@ -1575,39 +1579,6 @@ def main(config: DictConfig) -> None:
                     )
                 print(f"  Actual room after path: {_arrived_room or 'unknown'}")
                 _room_ok = _room_instance_matches(_arrived_room, cat)
-                print(f"  Room command success: {_room_ok}")
-
-                # Retry with alternate safe goals if first attempt failed
-                if not _room_ok and len(_room_safe_goals) > 1:
-                    for _alt_idx, _alt_goal in enumerate(_room_safe_goals[1:], start=2):
-                        print(f"  Retrying alternate goal inside target room "
-                              f"({_alt_idx}/{len(_room_safe_goals)}): {_alt_goal}")
-                        _, _alt_acts = robot.plan_path_only(_alt_goal)
-                        _n_alt = len(_alt_acts)
-                        if _n_alt == 0:
-                            print(f"  Already at alternate goal.")
-                            robot._set_nav_curr_pose()
-                        else:
-                            _alt_completed = execute_nav_replay(
-                                robot, _alt_acts, cat, rgb_map_2d, heatmap, [],
-                                dist_map=_dist_map_shield,
-                            )
-                            if not _alt_completed:
-                                nav_recovery_and_replan(
-                                    robot, _alt_goal, cat, rgb_map_2d, heatmap
-                                )
-                        robot._set_nav_curr_pose()
-                        if _room_provider and _room_provider.is_available():
-                            _arrived_room = _room_provider.get_room_at_cell(
-                                int(robot.curr_pos_on_map[0]),
-                                int(robot.curr_pos_on_map[1])
-                            )
-                        print(f"  Actual room after retry: {_arrived_room or 'unknown'}")
-                        _room_ok = _room_instance_matches(_arrived_room, cat)
-                        print(f"  Room command success: {_room_ok}")
-                        if _room_ok:
-                            break
-
                 if _room_ok:
                     print(f"  Arrived at room '{cat}' (actual: {_arrived_room}). Done.")
                 else:
