@@ -225,6 +225,30 @@ def _evidence_prior(
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
+import re as _re
+
+
+def canonical_room_type(room_instance: str) -> str:
+    """Strip trailing numeric suffix to get the base room type.
+
+    Examples:
+        canonical_room_type("bathroom")      -> "bathroom"
+        canonical_room_type("bathroom.001")  -> "bathroom"
+        canonical_room_type("bedroom.002")   -> "bedroom"
+        canonical_room_type("closet.1")      -> "closet"
+    """
+    return _re.sub(r'\.\d+$', '', room_instance.lower().strip())
+
+
+def compatible_room_types(room_priors: Dict[str, float], threshold: float = 0.05) -> set:
+    """Return the set of canonical room types with prior above threshold."""
+    return {
+        canonical_room_type(r)
+        for r, s in room_priors.items()
+        if s > threshold
+    }
+
+
 def compute_room_priors(
     query: str,
     known_rooms: List[str],

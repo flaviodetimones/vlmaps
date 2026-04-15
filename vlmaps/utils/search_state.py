@@ -77,6 +77,7 @@ class SearchState:
         self.visit_history: List[str] = []   # ordered list of room visits
         self.current_room: Optional[str] = None
         self.found: bool = False
+        self._tried_centroids: set = set()   # Phase D gate: (int_r, int_c) tried
 
         self._build_rooms(room_provider, obstacles_map)
 
@@ -120,13 +121,16 @@ class SearchState:
             self.rooms[room_name].times_visited += 1
             self.visit_history.append(room_name)
 
-    def record_candidate(self, room_name: Optional[str], confirmed: bool) -> None:
+    def record_candidate(self, room_name: Optional[str], confirmed: bool,
+                         centroid: tuple = None) -> None:
         """Record that a heatmap candidate in *room_name* was inspected."""
         if room_name and room_name in self.rooms:
             rs = self.rooms[room_name]
             rs.candidates_tried += 1
             if confirmed:
                 rs.candidates_confirmed += 1
+        if centroid is not None:
+            self._tried_centroids.add((int(centroid[0]), int(centroid[1])))
 
     def record_object_seen(self, room_name: Optional[str], obj: str) -> None:
         """Record that *obj* was visually confirmed in *room_name*."""

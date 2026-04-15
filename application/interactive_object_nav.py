@@ -680,13 +680,156 @@ def fine_visual_center(
     return detected_once
 
 
+def select_best_candidate(
+    kept_components: list,
+    current_room: str,
+    query_priors: dict,
+    tried_centroids: set,
+    *,
+    local_min_quality: float = 0.25,
+    switch_margin: float = 0.40,
+    same_room_bonus: float = 0.35,
+) -> dict:
+    """Task 1 — current-compatible-room-first candidate selection.
+
+    Policy:
+      1. If the current room instance belongs to a semantically compatible room
+         type (e.g. bathroom.001 → bathroom), and there are untried local
+         candidates with acceptable quality, prefer them.
+      2. Only allow switching to an external room if the best external candidate
+         clearly outscores the best local one (margin > switch_margin).
+      3. Falls back to global best if current room is not compatible or has no
+         viable local candidates.
+
+    Args:
+        kept_components:  list of component dicts (quality-sorted, best first).
+        current_room:     room instance the robot is currently in.
+        query_priors:     {room: normalised_prior} from Phase C.
+        tried_centroids:  set of (int_r, int_c) already inspected this query.
+        local_min_quality: minimum quality for a local candidate to be accepted.
+        switch_margin:    external must beat local by this fraction to trigger switch.
+        same_room_bonus:  additive quality bonus applied to local candidates.
+
+    Returns:
+        The selected component dict.
+    """
+    from vlmaps.utils.room_priors import canonical_room_type, compatible_room_types
+
+    if not kept_components:
+        return None
+
+    # Separate tried vs untried
+    def _is_tried(comp):
+        cr, cc = comp["centroid"]
+        return (int(cr), int(cc)) in tried_centroids
+
+    untried = [c for c in kept_components if not _is_tried(c)]
+    if not untried:
+        # All tried — fall back to global best untried (might be empty)
+        return kept_components[0]
+
+    if not current_room or not query_priors:
+        return untried[0]
+
+    current_type = canonical_room_type(current_room)
+    compat_types = compatible_room_types(query_priors)
+    current_compatible = current_type in compat_types
+
+    print(f"  [room-gate] Instance: {current_room}  type: {current_type}")
+    print(f"  [room-gate] Compatible types for query: {sorted(compat_types)}")
+    print(f"  [room-gate] Current room compatible: {current_compatible}")
+
+    if not current_compatible:
+        print(f"  [room-gate] Switch allowed: True (current room not compatible)")
+        return untried[0]
+
+    # Separate local (same instance) vs external untried candidates
+    local_untried = [c for c in untried if c.get("room") == current_room]
+    external_untried = [c for c in untried if c.get("room") != current_room]
+
+    print(f"  [room-gate] Local untried: {len(local_untried)}  external untried: {len(external_untried)}")
+
+    if not local_untried:
+        reason = "local room exhausted" if any(c.get("room") == current_room for c in kept_components) else "no local candidates"
+        print(f"  [room-gate] Switch allowed: True ({reason})")
+        return untried[0]
+
+    best_local = local_untried[0]
+    best_ext = external_untried[0] if external_untried else None
+
+    # Apply same-room bonus to local score
+    local_effective = best_local["quality"] + same_room_bonus
+    ext_quality = best_ext["quality"] if best_ext else 0.0
+
+    print(f"  [room-gate] Best local quality: {best_local['quality']:.3f} "
+          f"(+bonus → {local_effective:.3f})")
+    if best_ext:
+        print(f"  [room-gate] Best external quality: {ext_quality:.3f}")
+
+    # Gate 1: local candidate too weak even with bonus
+    if best_local["quality"] < local_min_quality:
+        if best_ext and ext_quality > local_effective:
+            print(f"  [room-gate] Switch allowed: True (local quality {best_local['quality']:.3f} < threshold {local_min_quality})")
+            return untried[0]
+
+    # Gate 2: external must clearly beat boosted local to trigger switch
+    if best_ext and ext_quality > local_effective * (1.0 + switch_margin):
+        print(f"  [room-gate] Switch allowed: True "
+              f"(external {ext_quality:.3f} >> local {local_effective:.3f})")
+        return untried[0]
+
+    print(f"  [room-gate] Switch allowed: False "
+          f"— staying in compatible room, inspecting local candidate first")
+    return best_local
+
+
+def _compute_path_safety(path_cells: list, obs_map: np.ndarray) -> dict:
+    """Compute safety metrics for a planned path.
+
+    Returns a dict with: path_length, min_clearance, mean_clearance,
+    safety_penalty (sum of 1/clearance for risky cells), safe_cost.
+    """
+    if not path_cells:
+        return {"path_length": 0, "min_clearance": 0.0,
+                "mean_clearance": 0.0, "safety_penalty": 0.0, "safe_cost": 0.0}
+
+    dist = distance_transform_edt(obs_map)
+    clearances = []
+    penalty = 0.0
+    _PENALTY_RADIUS = 8.0   # cells within this radius incur cost (0.4 m)
+    _LAMBDA = 0.5            # weight of clearance penalty vs path length
+
+    for cell in path_cells:
+        r, c = int(cell[0]), int(cell[1])
+        if 0 <= r < dist.shape[0] and 0 <= c < dist.shape[1]:
+            cl = float(dist[r, c])
+        else:
+            cl = 0.0
+        clearances.append(cl)
+        if cl < _PENALTY_RADIUS:
+            penalty += (_PENALTY_RADIUS - cl) / _PENALTY_RADIUS
+
+    n = len(path_cells)
+    min_cl = float(min(clearances)) if clearances else 0.0
+    mean_cl = float(np.mean(clearances)) if clearances else 0.0
+    safe_cost = n + _LAMBDA * penalty
+
+    return {
+        "path_length": n,
+        "min_clearance": min_cl,
+        "mean_clearance": mean_cl,
+        "safety_penalty": penalty,
+        "safe_cost": safe_cost,
+    }
+
+
 def select_safe_goal_from_path(
     path_cells: list,
     heatmap: np.ndarray,
     obs_map: np.ndarray,
     min_dist_cells: float = 10.0,
     max_dist_cells: float = 24.0,
-    clearance_cells: float = 3.0,
+    clearance_cells: float = 5.0,   # Task 2: raised from 3.0 → 5.0 (25 cm)
 ) -> tuple:
     """Walk planned path backward to find the best final viewing position.
 
@@ -717,7 +860,10 @@ def select_safe_goal_from_path(
 
     dist_to_obs = distance_transform_edt(obs_map)
 
-    for cell in reversed(path_cells):
+    # Task 2: collect ALL valid candidates, then pick the one with best clearance
+    # (not just the first one found when walking backward).
+    candidates = []
+    for cell in path_cells:
         row, col = int(cell[0]), int(cell[1])
         dr = row - obj_row
         dc = col - obj_col
@@ -727,9 +873,32 @@ def select_safe_goal_from_path(
         else:
             clearance = 0.0
         if min_dist_cells <= dist <= max_dist_cells and clearance >= clearance_cells:
-            return [row, col], obj_centroid
+            candidates.append(([row, col], clearance))
 
-    # Fallback: use path end
+    if candidates:
+        # Pick the candidate with maximum clearance from obstacles
+        best = max(candidates, key=lambda x: x[1])
+        return best[0], obj_centroid
+
+    # Soft fallback: relax clearance requirement, still pick best clearance
+    soft_candidates = []
+    for cell in path_cells:
+        row, col = int(cell[0]), int(cell[1])
+        dr = row - obj_row
+        dc = col - obj_col
+        dist = float(np.sqrt(dr * dr + dc * dc))
+        if 0 <= row < obs_map.shape[0] and 0 <= col < obs_map.shape[1]:
+            clearance = float(dist_to_obs[row, col])
+        else:
+            clearance = 0.0
+        if min_dist_cells <= dist <= max_dist_cells:
+            soft_candidates.append(([row, col], clearance))
+
+    if soft_candidates:
+        best = max(soft_candidates, key=lambda x: x[1])
+        return best[0], obj_centroid
+
+    # Last resort: path end
     last = path_cells[-1]
     return [int(last[0]), int(last[1])], obj_centroid
 
@@ -945,23 +1114,33 @@ def main(config: DictConfig) -> None:
                 obj_centroid = goal_pos
                 _, planned_actions = robot.plan_path_only(goal_pos)
             else:
-                # Step 1: plan toward the best heatmap component centroid.
-                # Using the heatmap centroid (not get_standoff_pos) ensures the
-                # robot only travels to positions with real heatmap signal.
+                # ── Task 1: current-compatible-room-first candidate selection ──
                 robot._set_nav_curr_pose()
-                best_comp = kept_components[0]  # sorted by quality, best first
+                _tried = getattr(_ss, "_tried_centroids", set()) if _ss else set()
+                _query_priors = {r: rs.target_relevance for r, rs in _ss.rooms.items()} if _ss else {}
+
+                best_comp = select_best_candidate(
+                    kept_components,
+                    current_room,
+                    _query_priors,
+                    _tried,
+                )
+                if best_comp is None:
+                    print(f"  [skip] No viable candidate for '{cat}'.")
+                    continue
+
                 _hc_r, _hc_c = best_comp["centroid"]
                 _heatmap_target = [int(_hc_r), int(_hc_c)]
                 print(f"  Heatmap target: {_heatmap_target}  (room: {best_comp.get('room', 'unknown')})")
                 _initial_path, _ = robot.plan_path_only(_heatmap_target)
 
-                # Step 2: walk path backward to pick best viewpoint + object centroid
+                # Step 2: walk path backward to pick best viewpoint by clearance
                 goal_pos, obj_centroid = select_safe_goal_from_path(
                     _initial_path, heatmap, robot.map.obstacles_map
                 )
                 print(f"  Path-based goal: {goal_pos}  object centroid: {obj_centroid}")
 
-                # Step 3: plan (without executing) to the selected goal
+                # Step 3: plan to the selected goal
                 _, planned_actions = robot.plan_path_only(goal_pos)
 
             # Capture planned path for visualization
@@ -970,9 +1149,22 @@ def main(config: DictConfig) -> None:
             n_actions = len(planned_actions)
             print(f"  Path computed: {n_actions} actions.")
 
-            # n_actions == 0 means robot is already at the goal — treat as arrived,
-            # not as failure.  A truly unreachable goal produces a non-empty path that
-            # ends before reaching the destination (handled by execute_nav_replay).
+            # ── Task 2: safety metrics log ────────────────────────────────────
+            if path_cells and room_goal is None:
+                _safety = _compute_path_safety(path_cells, robot.map.obstacles_map)
+                _goal_cl = 0.0
+                if goal_pos and 0 <= int(goal_pos[0]) < robot.map.obstacles_map.shape[0]:
+                    from scipy.ndimage import distance_transform_edt as _edt
+                    _d = _edt(robot.map.obstacles_map)
+                    _goal_cl = float(_d[int(goal_pos[0]), int(goal_pos[1])])
+                print(f"  [safety] length={_safety['path_length']} "
+                      f"min_cl={_safety['min_clearance']:.1f} "
+                      f"mean_cl={_safety['mean_clearance']:.1f} "
+                      f"penalty={_safety['safety_penalty']:.1f} "
+                      f"safe_cost={_safety['safe_cost']:.1f} "
+                      f"goal_cl={_goal_cl:.1f}")
+
+            # n_actions == 0 means robot is already at the goal — treat as arrived.
             already_at_goal = (n_actions == 0)
 
 
@@ -1119,7 +1311,8 @@ def main(config: DictConfig) -> None:
                 )
             if _ss:
                 _ss.update_current_room(_end_room)
-                _ss.record_candidate(_end_room, _yoloe_confirmed)
+                _ss.record_candidate(_end_room, _yoloe_confirmed,
+                                     centroid=obj_centroid if 'obj_centroid' in dir() else None)
                 if _yoloe_confirmed:
                     _ss.record_object_seen(_end_room, cat)
                     _ss.mark_found(_end_room)
