@@ -1,10 +1,50 @@
 import numpy as np
 import cv2
 from scipy.spatial.distance import cdist
+from scipy.ndimage import distance_transform_edt
 import pyvisgraph as vg
 import matplotlib.pyplot as plt
 from PIL import Image
 from typing import Tuple, List, Dict
+
+
+def _snap_to_nearest_free(point, obstacles: np.ndarray, min_clearance: float = 2.0):
+    """Return the nearest free cell to *point* that also has >= min_clearance.
+
+    Uses the distance transform so the result is guaranteed navigable in the
+    same map the visgraph was built from.  Falls back to nearest free cell
+    (clearance=0 ok) if no cell with the requested clearance exists.
+
+    Parameters
+    ----------
+    point : (row, col) — may be inside an obstacle.
+    obstacles : 2-D uint8 array, 1=free 0=obstacle (cropped map space).
+    min_clearance : desired minimum clearance in cells.
+
+    Returns
+    -------
+    (row, col) tuple guaranteed to be inside the map bounds and free.
+    """
+    free_mask = (obstacles == 1)
+    if free_mask.sum() == 0:
+        return (int(point[0]), int(point[1]))  # nothing we can do
+
+    # Distance of every free cell from the nearest obstacle
+    dist_map = distance_transform_edt(free_mask)
+
+    rows, cols = np.where(free_mask)
+    dist_sq = (rows - point[0]) ** 2 + (cols - point[1]) ** 2
+
+    # Try to find the nearest free cell that also has enough clearance
+    cl = dist_map[rows, cols]
+    good_mask = cl >= min_clearance
+    if good_mask.any():
+        idx = np.argmin(np.where(good_mask, dist_sq, np.inf))
+    else:
+        # No cell with that clearance — just take the nearest free cell
+        idx = np.argmin(dist_sq)
+
+    return (int(rows[idx]), int(cols[idx]))
 
 
 def get_segment_islands_pos(segment_map, label_id, detect_internal_contours=False):
@@ -135,37 +175,54 @@ def plan_to_pos_v2(start, goal, obstacles, G: vg.VisGraph = None, vis=False):
 
     print("start: ", start)
     print("goal: ", goal)
+
+    # Clamp indices to valid map bounds before any indexing
+    h, w = obstacles.shape
+    start_r = int(np.clip(start[0], 0, h - 1))
+    start_c = int(np.clip(start[1], 0, w - 1))
+    goal_r  = int(np.clip(goal[0],  0, h - 1))
+    goal_c  = int(np.clip(goal[1],  0, w - 1))
+
+    start_nav = bool(obstacles[start_r, start_c])
+    goal_nav  = bool(obstacles[goal_r,  goal_c])
+    print(f"[planner] Start navigable: {start_nav}  Goal navigable: {goal_nav}")
+
     if vis:
         obs_map_vis = (obstacles[:, :, None] * 255).astype(np.uint8)
         obs_map_vis = np.tile(obs_map_vis, [1, 1, 3])
-        obs_map_vis = cv2.circle(obs_map_vis, (int(start[1]), int(start[0])), 3, (255, 0, 0), -1)
-        obs_map_vis = cv2.circle(obs_map_vis, (int(goal[1]), int(goal[0])), 3, (0, 0, 255), -1)
+        obs_map_vis = cv2.circle(obs_map_vis, (start_c, start_r), 3, (255, 0, 0), -1)
+        obs_map_vis = cv2.circle(obs_map_vis, (goal_c,  goal_r),  3, (0, 0, 255), -1)
         cv2.imshow("planned path", obs_map_vis)
         cv2.waitKey()
 
     path = []
-    startvg = vg.Point(start[0], start[1])
-    if obstacles[int(start[0]), int(start[1])] == 0:
-        print("start in obstacles")
-        rows, cols = np.where(obstacles == 1)
-        dist_sq = (rows - start[0]) ** 2 + (cols - start[1]) ** 2
-        id = np.argmin(dist_sq)
-        new_start = [rows[id], cols[id]]
-        path.append(new_start)
+
+    # ── Start snapping ───────────────────────────────────────────────────
+    if not start_nav:
+        print("[planner] Start in obstacle — snapping to nearest free cell")
+        new_start = _snap_to_nearest_free((start_r, start_c), obstacles, min_clearance=2.0)
+        print(f"[planner] Snapped start: {new_start}")
+        path.append(list(new_start))
         startvg = vg.Point(new_start[0], new_start[1])
+    else:
+        startvg = vg.Point(start_r, start_c)
 
-    goalvg = vg.Point(goal[0], goal[1])
-    poly_id = G.point_in_polygon(goalvg)
-    if obstacles[int(goal[0]), int(goal[1])] == 0:
-        print("goal in obstacles")
-        try:
-            goalvg = G.closest_point(goalvg, poly_id, length=1)
-        except:
-            goal_new = get_nearby_position(goal, G)
-            goalvg = vg.Point(goal_new[0], goal_new[1])
+    # ── Goal snapping ────────────────────────────────────────────────────
+    if not goal_nav:
+        print("[planner] Goal in obstacle — snapping to nearest free cell with clearance")
+        new_goal = _snap_to_nearest_free((goal_r, goal_c), obstacles, min_clearance=3.0)
+        print(f"[planner] Snapped goal: {new_goal}")
+        goalvg = vg.Point(new_goal[0], new_goal[1])
+    else:
+        goalvg = vg.Point(goal_r, goal_c)
 
-        print("goalvg: ", goalvg)
     path_vg = G.shortest_path(startvg, goalvg)
+
+    # Validate: shortest_path should return >= 2 waypoints for a real path.
+    # If start==goal the list may have 1 entry, which is fine.
+    if not path_vg:
+        print("[planner] WARNING: shortest_path returned empty path — check map connectivity")
+        return path
 
     for point in path_vg:
         subgoal = [point.x, point.y]

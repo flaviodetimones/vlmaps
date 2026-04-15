@@ -518,31 +518,74 @@ def execute_nav_replay(
     path_cells: list,
     motion_thresh: float = 0.4,
     stuck_threshold: int = 3,
+    dist_map: np.ndarray = None,
 ) -> bool:
-    """Replay a pre-planned action list with stuck detection.
+    """Replay a pre-planned action list with stuck detection and collision shield.
 
     Monitors actual displacement after each move_forward action.  If
     real displacement is below motion_thresh × forward_dist for
     stuck_threshold consecutive steps, returns False immediately so the
     caller can trigger recovery.  Turn actions are never counted as stuck.
 
+    Collision shield (Problem 3): before each move_forward, predicts the
+    cell one step ahead and checks its clearance from obstacles.  If the
+    clearance is below STOP_CLEARANCE the step is replaced with a corrective
+    turn (no damage done); if below SLOW_CLEARANCE a warning is logged.
+    Requires dist_map (full-map distance transform) to be passed in.
+
     Args:
         motion_thresh:   Fraction of forward_dist considered "barely moved".
         stuck_threshold: Consecutive low-motion steps before declaring stuck.
+        dist_map:        Precomputed distance transform of the safe obs map
+                         (full-map, same shape as robot._safe_obs_map).
+                         If None the shield is disabled.
 
     Returns:
-        True  — replay completed without stuck event.
-        False — stuck detected; caller should recover and re-plan.
+        True  — replay completed without stuck event or collision.
+        False — stuck or imminent collision detected; caller should recover.
     """
+    _STOP_CL = 2.0   # cells — hard stop (imminent collision)
+    _SLOW_CL = 5.0   # cells — warn but continue
+
     low_motion_count = 0
     n = len(planned_actions)
     expected_fwd = robot.forward_dist  # metres per move_forward action
+
+    # Forward step size in grid cells (approximate)
+    _cs = getattr(robot, "cs", 0.05)
+    _fwd_cells = max(1, int(round(expected_fwd / _cs)))
 
     for i, action in enumerate(planned_actions):
         if action == "stop":
             continue
 
         is_fwd = (action == "move_forward")
+
+        # ── Collision shield — check BEFORE executing forward step ────────
+        if is_fwd and dist_map is not None:
+            _r, _c = robot.curr_pos_on_map
+            _ang_deg = robot.curr_ang_deg_on_map
+            _ang_rad = float(_ang_deg) * np.pi / 180.0
+
+            # Map angle convention: 0° faces decreasing-row (north on map).
+            # dr = -cos(ang), dc = sin(ang)  in row/col space.
+            _dr = -np.cos(_ang_rad) * _fwd_cells
+            _dc =  np.sin(_ang_rad) * _fwd_cells
+
+            _nr = int(round(_r + _dr))
+            _nc = int(round(_c + _dc))
+            _h, _w = dist_map.shape
+
+            if 0 <= _nr < _h and 0 <= _nc < _w:
+                _next_cl = float(dist_map[_nr, _nc])
+                if _next_cl < _STOP_CL:
+                    print(f"  [shield] Step {i+1}/{n}: front clearance={_next_cl:.1f} "
+                          f"< {_STOP_CL} — hard stop, triggering recovery")
+                    return False
+                elif _next_cl < _SLOW_CL:
+                    print(f"  [shield] Step {i+1}/{n}: front clearance={_next_cl:.1f} "
+                          f"< {_SLOW_CL} — low clearance warning")
+
         if is_fwd:
             pre_xyz = _agent_xyz(robot)
 
@@ -903,6 +946,88 @@ def select_safe_goal_from_path(
     return [int(last[0]), int(last[1])], obj_centroid
 
 
+def find_safe_candidate_approach_goals(
+    component_centroid,
+    safe_obs_map: np.ndarray,
+    robot_pos=None,
+    min_dist: float = 8.0,
+    max_dist: float = 25.0,
+    min_clearance: float = 3.0,
+    n_angles: int = 16,
+    top_k: int = 5,
+) -> list:
+    """Generate safe approach positions around a heatmap component centroid.
+
+    Samples candidate approach cells in an annulus (min_dist..max_dist cells)
+    around *component_centroid*, filters by the dilated safe_obs_map and minimum
+    clearance, then ranks by (clearance DESC, proximity to robot ASC).
+
+    This replaces the raw centroid → plan_path_only → select_safe_goal_from_path
+    pipeline for the initial goal selection.  Because the candidates are validated
+    against the same map the visgraph uses, goal-in-obstacle crashes disappear.
+
+    Parameters
+    ----------
+    component_centroid : (row, col) of the heatmap component peak.
+    safe_obs_map       : uint8 ndarray, 1=free 0=obstacle (dilated, full-map).
+    robot_pos          : optional (row, col) — used for tie-breaking by proximity.
+    min_dist           : annulus inner radius in cells (default 8 = 0.4 m).
+    max_dist           : annulus outer radius in cells (default 25 = 1.25 m).
+    min_clearance      : minimum distance-to-obstacle in cells (default 3).
+    n_angles           : number of angle samples around the annulus (default 16).
+    top_k              : maximum candidates to return.
+
+    Returns
+    -------
+    List of [row, col] goals, sorted best-first.  Empty list if none found.
+    """
+    cr, cc = float(component_centroid[0]), float(component_centroid[1])
+    h, w   = safe_obs_map.shape
+
+    dist_map = distance_transform_edt(safe_obs_map)
+
+    candidates = []
+    # Sample at several radii within the annulus for better coverage
+    radii  = np.linspace(min_dist, max_dist, num=max(3, int((max_dist - min_dist) / 4) + 1))
+    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+
+    for r in radii:
+        for ang in angles:
+            row = int(round(cr + r * np.sin(ang)))
+            col = int(round(cc + r * np.cos(ang)))
+            if not (0 <= row < h and 0 <= col < w):
+                continue
+            if safe_obs_map[row, col] == 0:
+                continue
+            cl = float(dist_map[row, col])
+            if cl < min_clearance:
+                continue
+            candidates.append((row, col, cl))
+
+    if not candidates:
+        return []
+
+    # Deduplicate (keep highest-clearance per grid cell)
+    best_by_cell: dict = {}
+    for row, col, cl in candidates:
+        key = (row, col)
+        if key not in best_by_cell or cl > best_by_cell[key]:
+            best_by_cell[key] = cl
+
+    # Sort: clearance DESC, then proximity to robot ASC
+    def _sort_key(item):
+        (row, col), cl = item
+        prox = 0.0
+        if robot_pos is not None:
+            dr = row - robot_pos[0]
+            dc = col - robot_pos[1]
+            prox = float(dr * dr + dc * dc)
+        return (-cl, prox)
+
+    sorted_cells = sorted(best_by_cell.items(), key=_sort_key)
+    return [[r, c] for (r, c), _ in sorted_cells[:top_k]]
+
+
 def find_reachable_room_goal(
     target_room: str,
     room_provider,
@@ -1183,8 +1308,11 @@ def main(config: DictConfig) -> None:
                 ) else False
                 print(f"  Raw centroid navigable: {_raw_nav}")
 
+                # Use the dilated safe map (same map the visgraph was built from)
+                # so room goals are guaranteed navigable by the planner.
+                _safe_map_for_rooms = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
                 _room_safe_goals = find_reachable_room_goal(
-                    cat, _room_provider, robot.map.obstacles_map
+                    cat, _room_provider, _safe_map_for_rooms
                 )
                 if _room_safe_goals:
                     goal_pos = _room_safe_goals[0]
@@ -1271,15 +1399,33 @@ def main(config: DictConfig) -> None:
                     continue
 
                 _hc_r, _hc_c = best_comp["centroid"]
-                _heatmap_target = [int(_hc_r), int(_hc_c)]
-                print(f"  Heatmap target: {_heatmap_target}  (room: {best_comp.get('room', 'unknown')})")
-                _initial_path, _ = robot.plan_path_only(_heatmap_target)
+                obj_centroid = [int(_hc_r), int(_hc_c)]
+                print(f"  Heatmap target: {obj_centroid}  (room: {best_comp.get('room', 'unknown')})")
 
-                # Step 2: walk path backward to pick best viewpoint by clearance
-                goal_pos, obj_centroid = select_safe_goal_from_path(
-                    _initial_path, heatmap, robot.map.obstacles_map
+                # Step 2: generate safe approach goals around the component
+                # centroid using the dilated safe map (same as visgraph).
+                # This replaces the raw-centroid → path → walk-back chain that
+                # broke when the centroid was inside an obstacle cell.
+                _safe_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+                robot._set_nav_curr_pose()
+                _robot_rc = getattr(robot, "_nav_curr_pos", None)
+                _approach_goals = find_safe_candidate_approach_goals(
+                    obj_centroid, _safe_map,
+                    robot_pos=_robot_rc,
+                    min_dist=8.0, max_dist=25.0, min_clearance=3.0,
                 )
-                print(f"  Path-based goal: {goal_pos}  object centroid: {obj_centroid}")
+                if _approach_goals:
+                    goal_pos = _approach_goals[0]
+                    print(f"  Approach goal: {goal_pos}  "
+                          f"(from {len(_approach_goals)} safe candidates)")
+                else:
+                    # Fallback: plan to centroid then walk path backward
+                    print(f"  [approach] No annulus goals found — falling back to path walk")
+                    _initial_path, _ = robot.plan_path_only(obj_centroid)
+                    goal_pos, obj_centroid = select_safe_goal_from_path(
+                        _initial_path, heatmap, robot.map.obstacles_map
+                    )
+                    print(f"  Fallback path-based goal: {goal_pos}")
 
                 # Step 3: plan to the selected goal
                 _, planned_actions = robot.plan_path_only(goal_pos)
@@ -1339,13 +1485,22 @@ def main(config: DictConfig) -> None:
                     _safe_alt_found = False
                     for _nc in _alt_untried[:3]:
                         _nc_r, _nc_c = _nc["centroid"]
-                        _nc_target = [int(_nc_r), int(_nc_c)]
-                        print(f"  [safety] Trying next candidate: {_nc_target} "
+                        _nc_cen = [int(_nc_r), int(_nc_c)]
+                        print(f"  [safety] Trying next candidate: {_nc_cen} "
                               f"(room: {_nc.get('room', 'unknown')})")
-                        _nc_init, _ = robot.plan_path_only(_nc_target)
-                        _nc_goal, _nc_cen = select_safe_goal_from_path(
-                            _nc_init, heatmap, robot.map.obstacles_map
+                        # Use approach-goals for alt candidates too
+                        _nc_app = find_safe_candidate_approach_goals(
+                            _nc_cen, _safe_map,
+                            robot_pos=_robot_rc,
+                            min_dist=8.0, max_dist=25.0, min_clearance=3.0,
                         )
+                        if _nc_app:
+                            _nc_goal = _nc_app[0]
+                        else:
+                            _nc_init, _ = robot.plan_path_only(_nc_cen)
+                            _nc_goal, _nc_cen = select_safe_goal_from_path(
+                                _nc_init, heatmap, robot.map.obstacles_map
+                            )
                         _, _nc_acts = robot.plan_path_only(_nc_goal)
                         _nc_path = getattr(robot, "last_planned_path", None) or []
                         _nc_safety = _compute_path_safety(_nc_path, robot.map.obstacles_map)
@@ -1388,13 +1543,18 @@ def main(config: DictConfig) -> None:
                      path_cells=path_cells, label=f"Path planned: {cat}")
             cv2.waitKey(800)
 
+            # Precompute dist_map for the collision shield from the dilated map
+            _shield_obs = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+            _dist_map_shield = distance_transform_edt(_shield_obs)
+
             if already_at_goal:
                 print(f"  Already at goal for '{cat}' — proceeding with verification.")
             else:
                 print(f"  Executing path ({n_actions} actions)…")
                 # Execute step by step — no teleport, robot moves from its current position
                 completed = execute_nav_replay(
-                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells
+                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells,
+                    dist_map=_dist_map_shield,
                 )
                 if not completed:
                     nav_recovery_and_replan(
@@ -1429,7 +1589,8 @@ def main(config: DictConfig) -> None:
                             robot._set_nav_curr_pose()
                         else:
                             _alt_completed = execute_nav_replay(
-                                robot, _alt_acts, cat, rgb_map_2d, heatmap, []
+                                robot, _alt_acts, cat, rgb_map_2d, heatmap, [],
+                                dist_map=_dist_map_shield,
                             )
                             if not _alt_completed:
                                 nav_recovery_and_replan(

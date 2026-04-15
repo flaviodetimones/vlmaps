@@ -101,14 +101,30 @@ class HabitatLanguageRobot(LangRobot):
             cropped_obst_map = self.map.get_customized_obstacle_cropped()
 
         # Safety margin: dilate obstacles before building the visgraph.
-        # Task 2: increased from 3 → 5 iterations for safer navigation.
-        # 5 iterations at cell_size=0.05 m → ~25 cm clearance per side.
-        # This keeps paths further from walls and furniture, aligned with
-        # future ROS/HSR migration requirements.
+        # 3 iterations at cell_size=0.05 m → ~15 cm clearance per side.
+        # NOTE: 5 iterations was tried but closed narrow doorways in HSSD
+        # scenes (some passages are only ~0.5 m wide = 10 cells; 5-iter
+        # bilateral dilation removes the full passage).  3 iterations keeps
+        # all real doorways open while still giving adequate wall clearance.
         from scipy.ndimage import binary_dilation as _bdilate
         _obs_mask = (cropped_obst_map == 0).astype(bool)
-        _obs_mask_dilated = _bdilate(_obs_mask, iterations=5)
+        _obs_mask_dilated = _bdilate(_obs_mask, iterations=3)
         cropped_obst_map_safe = np.where(_obs_mask_dilated, 0, cropped_obst_map).astype(np.uint8)
+
+        # Expose the full-map dilated obstacle map for goal-selection functions.
+        # Goals must be navigable in THIS map (the one the visgraph uses), not
+        # only in the raw navmesh map, otherwise the planner receives goals that
+        # are in obstacle space and falls back to the degenerate boundary-snap.
+        _gs_full = self.map.gs
+        _safe_full = np.zeros((_gs_full, _gs_full), dtype=np.uint8)
+        _rm = self.vlmaps_dataloader.rmin
+        _cm = self.vlmaps_dataloader.cmin
+        _sh, _sw = cropped_obst_map_safe.shape
+        _safe_full[_rm:_rm + _sh, _cm:_cm + _sw] = cropped_obst_map_safe
+        self._safe_obs_map = _safe_full   # full-map, dilated — use for all goal queries
+
+        print(f"[planner] Map source: navmesh-based, dilation=3 iterations")
+        print(f"[planner] Navigable cells (dilated map): {int(_safe_full.sum())}")
 
         self.nav.build_visgraph(
             cropped_obst_map_safe,
