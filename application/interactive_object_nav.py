@@ -808,6 +808,12 @@ def main(config: DictConfig) -> None:
     if _room_provider and _room_provider.is_available():
         print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
 
+    # Show the VLMaps queryable object categories (excludes structural labels)
+    _STRUCTURAL = {"void", "wall", "floor", "ceiling"}
+    _map_cats = getattr(robot.map, "categories", [])
+    _queryable = [c for c in _map_cats if c not in _STRUCTURAL]
+    print(f"Queryable objects ({len(_queryable)}): {_queryable}")
+
     # ── Instruction loop ─────────────────────────────────────────────────────
     while True:
         print("\n" + "─" * 50)
