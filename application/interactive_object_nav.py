@@ -865,11 +865,19 @@ def main(config: DictConfig) -> None:
         show_obs(robot, "Start")
         show_map(robot, rgb_map_2d, label="Start")
 
-        # ── Phase B: build per-room search state for this instruction ────
+        # ── Phase B+C: build per-room search state and compute object→room priors ──
         _search_states: dict = {}  # cat → SearchState
         for cat in categories:
-            _ss = SearchState(cat.strip(), _room_provider, robot.map.obstacles_map)
-            _search_states[cat.strip()] = _ss
+            _c = cat.strip()
+            _ss = SearchState(_c, _room_provider, robot.map.obstacles_map)
+            if _ss.rooms:
+                # Phase C: compute priors (LLM + manual table + scene evidence)
+                _priors = _ss.compute_priors()
+                if _priors:
+                    _sorted = sorted(_priors.items(), key=lambda x: x[1], reverse=True)
+                    _prior_str = ", ".join(f"{r}={v:.2f}" for r, v in _sorted if v > 0.01)
+                    print(f"  Room priors for '{_c}': {_prior_str}")
+            _search_states[_c] = _ss
 
         for cat in categories:
             cat = cat.strip()

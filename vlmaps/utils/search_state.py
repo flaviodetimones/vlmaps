@@ -33,6 +33,9 @@ class RoomState:
     candidates_tried: int = 0             # heatmap components inspected here
     candidates_confirmed: int = 0         # YOLOE-confirmed detections here
 
+    # Phase C: prior plausibility that the target is in this room (0-1, normalised)
+    target_relevance: float = 0.0
+
     # Search result
     target_found_here: bool = False
 
@@ -47,7 +50,8 @@ class RoomState:
     def summary(self) -> str:
         """One-line human-readable summary for LLM context or logging."""
         return (
-            f"{self.name}: visited={self.times_visited}, "
+            f"{self.name}: prior={self.target_relevance:.2f}, "
+            f"visited={self.times_visited}, "
             f"candidates={self.candidates_tried}/{self.candidates_confirmed}, "
             f"objects={self.objects_seen}, "
             f"navigable={self.explored_ratio:.0%}, "
@@ -136,6 +140,28 @@ class SearchState:
         self.found = True
         if room_name and room_name in self.rooms:
             self.rooms[room_name].target_found_here = True
+
+    # ------------------------------------------------------------------
+    def compute_priors(self) -> Dict[str, float]:
+        """Phase C — compute and store object→room priors for this target.
+
+        Fuses three sources: LLM, manual table, scene evidence.
+        Stores the result in each RoomState.target_relevance and returns
+        the full prior dict for logging / downstream use.
+        """
+        from vlmaps.utils.room_priors import compute_room_priors
+
+        known_rooms = list(self.rooms.keys())
+        objects_seen_by_room = {
+            name: rs.objects_seen for name, rs in self.rooms.items()
+        }
+        priors = compute_room_priors(
+            self.target, known_rooms, objects_seen_by_room
+        )
+        for room, score in priors.items():
+            if room in self.rooms:
+                self.rooms[room].target_relevance = score
+        return priors
 
     # ------------------------------------------------------------------
     def summary(self) -> str:
