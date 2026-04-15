@@ -937,12 +937,15 @@ def main(config: DictConfig) -> None:
                 obj_centroid = goal_pos
                 _, planned_actions = robot.plan_path_only(goal_pos)
             else:
-                # Step 1: plan (without executing) to a close-approach standoff to get the path
+                # Step 1: plan toward the best heatmap component centroid.
+                # Using the heatmap centroid (not get_standoff_pos) ensures the
+                # robot only travels to positions with real heatmap signal.
                 robot._set_nav_curr_pose()
-                standoff_pos, _ = robot.map.get_standoff_pos(
-                    robot.curr_pos_on_map, cat, standoff_m=0.25)
-                print(f"  Planning initial path to standoff: {standoff_pos}")
-                _initial_path, _ = robot.plan_path_only(standoff_pos)
+                best_comp = kept_components[0]  # sorted by quality, best first
+                _hc_r, _hc_c = best_comp["centroid"]
+                _heatmap_target = [int(_hc_r), int(_hc_c)]
+                print(f"  Heatmap target: {_heatmap_target}  (room: {best_comp.get('room', 'unknown')})")
+                _initial_path, _ = robot.plan_path_only(_heatmap_target)
 
                 # Step 2: walk path backward to pick best viewpoint + object centroid
                 goal_pos, obj_centroid = select_safe_goal_from_path(
