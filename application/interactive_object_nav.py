@@ -956,22 +956,6 @@ def main(config: DictConfig) -> None:
             # ends before reaching the destination (handled by execute_nav_replay).
             already_at_goal = (n_actions == 0)
 
-            if not already_at_goal:
-                # Sanity-check: reject paths whose length is excessively longer than
-                # the straight-line distance (detour ratio).  Wild visgraph paths that
-                # leave the house and loop back produce ratios >> 5.
-                _MAX_DETOUR_RATIO = 4.0
-                robot._set_nav_curr_pose()
-                cr, cc = robot.curr_pos_on_map
-                gr, gc = goal_pos[0], goal_pos[1]
-                straight_dist = float(np.sqrt((cr - gr) ** 2 + (cc - gc) ** 2))
-                if straight_dist > 1.0 and n_actions > _MAX_DETOUR_RATIO * straight_dist:
-                    print(
-                        f"  [warn] Path too long ({n_actions} actions vs "
-                        f"{straight_dist:.0f}-cell straight line, ratio "
-                        f"{n_actions / straight_dist:.1f}x > {_MAX_DETOUR_RATIO}x) — skipping."
-                    )
-                    continue
 
             # Show heatmap + planned path BEFORE executing so the user can see the route
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
