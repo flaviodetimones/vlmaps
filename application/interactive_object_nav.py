@@ -326,6 +326,82 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
 
 # ── Navigation helpers ────────────────────────────────────────────────────────
 
+def _rasterize_segment_cells(start, end) -> list:
+    """Rasterize a map segment into integer cells, including endpoints."""
+    start_r, start_c = int(round(start[0])), int(round(start[1]))
+    end_r, end_c = int(round(end[0])), int(round(end[1]))
+
+    rmin = min(start_r, end_r)
+    rmax = max(start_r, end_r)
+    cmin = min(start_c, end_c)
+    cmax = max(start_c, end_c)
+
+    mask = np.zeros((rmax - rmin + 1, cmax - cmin + 1), dtype=np.uint8)
+    cv2.line(mask, (start_c - cmin, start_r - rmin), (end_c - cmin, end_r - rmin), 1, 1)
+    rows, cols = np.where(mask > 0)
+    if rows.size == 0:
+        if (start_r, start_c) == (end_r, end_c):
+            return [[start_r, start_c]]
+        return [[start_r, start_c], [end_r, end_c]]
+
+    pts = [[int(rmin + rr), int(cmin + cc)] for rr, cc in zip(rows, cols)]
+    pts.sort(key=lambda cell: (cell[0] - start_r) ** 2 + (cell[1] - start_c) ** 2)
+    return pts
+
+
+def densify_path_cells(path_cells: list) -> list:
+    """Expand sparse path vertices into a cell-by-cell polyline."""
+    if not path_cells:
+        return []
+    if len(path_cells) == 1:
+        return [[int(path_cells[0][0]), int(path_cells[0][1])]]
+
+    dense = []
+    for i in range(len(path_cells) - 1):
+        segment = _rasterize_segment_cells(path_cells[i], path_cells[i + 1])
+        if i > 0 and segment:
+            segment = segment[1:]
+        dense.extend(segment)
+    return dense
+
+
+def _closest_path_index(curr_cell, dense_path: list, hint_idx: int, backtrack: int = 12, ahead: int = 80) -> int:
+    """Find the closest path index near the current progress hint."""
+    if not dense_path:
+        return 0
+    start = max(0, hint_idx - backtrack)
+    end = min(len(dense_path), hint_idx + ahead + 1)
+    best_idx = hint_idx if 0 <= hint_idx < len(dense_path) else 0
+    best_dist = float("inf")
+    for idx in range(start, end):
+        cell = dense_path[idx]
+        dr = float(cell[0]) - float(curr_cell[0])
+        dc = float(cell[1]) - float(curr_cell[1])
+        dist_sq = dr * dr + dc * dc
+        # Small forward bias avoids oscillating backward on equally-close cells.
+        dist_sq += max(0, idx - hint_idx) * 1e-3
+        if dist_sq < best_dist:
+            best_dist = dist_sq
+            best_idx = idx
+    return best_idx
+
+
+def _lookahead_path_index(dense_path: list, start_idx: int, lookahead_cells: float) -> int:
+    """Advance along the dense path until the requested arc-length is reached."""
+    if not dense_path:
+        return 0
+    target_idx = start_idx
+    traveled = 0.0
+    for idx in range(start_idx, len(dense_path) - 1):
+        a = dense_path[idx]
+        b = dense_path[idx + 1]
+        traveled += float(np.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1])))
+        target_idx = idx + 1
+        if traveled >= lookahead_cells:
+            break
+    return target_idx
+
+
 def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     """Turn robot to face directly toward a specific map (row, col) position.
 
@@ -520,47 +596,15 @@ def execute_nav_replay(
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
 ) -> bool:
-    """Replay with footprint-aware shield and doorway traversal mode.
-
-    Planning vs execution safety separation (Fix 1)
-    ─────────────────────────────────────────────────
-    Global path planning uses the dilated safe_obs_map (planning inflation
-    iterations, ~15 cm/side) so routes have adequate clearance.  This shield
-    uses the RAW obstacle map distance transform so HSSD doorways (~10 cells
-    wide) are not falsely blocked.  The two maps are intentionally different:
-    planner = conservative routing; shield = actual collision detection only.
-
-    Footprint-aware checks (Fix 3)
-    ───────────────────────────────
-    Before each move_forward, three footprint points are evaluated at the
-    predicted next pose: front-center, front-left, front-right (offset by
-    ROBOT_HW cells laterally from heading).
-
-    Doorway / narrow-passage mode (Fix 2)
-    ──────────────────────────────────────
-    When both perpendicular side clearances at the current pose drop below
-    DOORWAY_SIDE_TH, the path segment is a narrow passage.  Hard-stop
-    threshold relaxes to STOP_CL_DOOR; every step is logged as cautious
-    doorway traversal.  The planner routes through valid doorways; the shield
-    lets the robot cross them without false hard stops.
-
-    Args:
-        motion_thresh:   Fraction of forward_dist considered "barely moved".
-        stuck_threshold: Consecutive low-motion steps before declaring stuck.
-        dist_map:        Distance transform of the RAW obstacle map.
-                         If None the shield is disabled.
-
-    Returns:
-        True  — replay completed.
-        False — stuck or imminent collision.
-    """
+    """Follow the planned polyline with lookahead and a footprint-aware shield."""
     # ── Open-space thresholds ─────────────────────────────────────────────
     _STOP_CL      = 1.0   # cells — hard stop on front center
     _SLOW_CL      = 3.0   # cells — low-clearance warning
     _SIDE_STOP_CL = 1.5   # cells — side-contact limit in open space
 
     # ── Doorway / narrow-passage thresholds ──────────────────────────────
-    _DOORWAY_SIDE_TH   = 5.0  # cells — both sides below this → narrow passage
+    _DOORWAY_SIDE_TH   = 5.0  # cells — narrow-passage detection threshold
+    _DOORWAY_SIDE_EXIT = 6.5  # cells — hysteresis to avoid doorway-mode flicker
     _DOORWAY_FRONT_MIN = 0.5  # cells — minimum front inside doorway mode
     _STOP_CL_DOOR      = 0.5  # cells — relaxed hard stop in doorway
 
@@ -571,16 +615,70 @@ def execute_nav_replay(
           f"stop={_STOP_CL} slow={_SLOW_CL} side_stop={_SIDE_STOP_CL} | "
           f"doorway: stop={_STOP_CL_DOOR} side_th={_DOORWAY_SIDE_TH}")
 
+    dense_path = densify_path_cells(path_cells)
+    if not dense_path:
+        return True
+
+    goal_cell = dense_path[-1]
     low_motion_count = 0
-    n = len(planned_actions)
     expected_fwd = robot.forward_dist
     _cs = getattr(robot, "cs", 0.05)
     _fwd_cells = max(1, int(round(expected_fwd / _cs)))
+    _LOOKAHEAD_OPEN_CELLS = max(6, _fwd_cells * 3)
+    _LOOKAHEAD_TIGHT_CELLS = max(3, _fwd_cells * 2)
+    _LOOKAHEAD_TIGHT_CL = 5.0
+    _GOAL_REACHED_TOL = max(3, _fwd_cells + 1)
+    _MAX_FOLLOW_STEPS = max(len(planned_actions) * 2, len(dense_path) * 3, 120)
     _doorway_mode = False  # updated before each forward step
+    progress_idx = 0
 
-    for i, action in enumerate(planned_actions):
-        if action == "stop":
-            continue
+    print(f"  [nav] Path follower: {len(dense_path)} dense path cell(s), "
+          f"lookahead={_LOOKAHEAD_OPEN_CELLS} open / {_LOOKAHEAD_TIGHT_CELLS} tight")
+
+    for i in range(_MAX_FOLLOW_STEPS):
+        robot._set_nav_curr_pose()
+        _curr_cell = [int(round(robot.curr_pos_on_map[0])), int(round(robot.curr_pos_on_map[1]))]
+        progress_idx = _closest_path_index(_curr_cell, dense_path, progress_idx)
+
+        _goal_dr = float(goal_cell[0]) - float(_curr_cell[0])
+        _goal_dc = float(goal_cell[1]) - float(_curr_cell[1])
+        _goal_dist = float(np.hypot(_goal_dr, _goal_dc))
+        if progress_idx >= len(dense_path) - 1 and _goal_dist <= _GOAL_REACHED_TOL:
+            print(f"  [nav] Goal reached on dense path "
+                  f"(dist={_goal_dist:.1f} cells, progress={progress_idx + 1}/{len(dense_path)})")
+            return True
+
+        _curr_clearance = float("inf")
+        if dist_map is not None:
+            _r = int(np.clip(_curr_cell[0], 0, dist_map.shape[0] - 1))
+            _c = int(np.clip(_curr_cell[1], 0, dist_map.shape[1] - 1))
+            _curr_clearance = float(dist_map[_r, _c])
+        _lookahead_cells = (
+            _LOOKAHEAD_TIGHT_CELLS if _curr_clearance < _LOOKAHEAD_TIGHT_CL else _LOOKAHEAD_OPEN_CELLS
+        )
+        target_idx = _lookahead_path_index(dense_path, progress_idx, _lookahead_cells)
+        target_cell = dense_path[target_idx]
+
+        _curr_pose = (
+            float(robot.curr_pos_on_map[0]),
+            float(robot.curr_pos_on_map[1]),
+            float(robot.curr_ang_deg_on_map),
+        )
+        _preview = robot.controller.convert_goal_to_actions(_curr_pose, target_cell)
+
+        if not _preview:
+            if target_idx < len(dense_path) - 1:
+                progress_idx = min(progress_idx + 1, len(dense_path) - 1)
+                continue
+            if _goal_dist <= _GOAL_REACHED_TOL + _fwd_cells:
+                print(f"  [nav] Goal reached after lookahead convergence "
+                      f"(dist={_goal_dist:.1f} cells)")
+                return True
+            _preview = robot.controller.convert_goal_to_actions(_curr_pose, goal_cell)
+            if not _preview:
+                return True
+
+        action = _preview[0]
 
         is_fwd = (action == "move_forward")
 
@@ -627,23 +725,53 @@ def execute_nav_replay(
             _side_r = float(dist_map[_sr_r, _sr_c])
 
             # ── Doorway detection ─────────────────────────────────────
-            _was_doorway = _doorway_mode
-            _doorway_mode = (
-                _side_l < _DOORWAY_SIDE_TH
-                and _side_r < _DOORWAY_SIDE_TH
+            # Two signals are useful here:
+            # 1) side clearance at current pose (robot already inside a narrow gap)
+            # 2) footprint side clearance at the NEXT pose (robot entering a doorway)
+            #
+            # Using only the current-pose side probes misses doorway entry and the
+            # robot gets blocked one step too early by the open-space lateral rule.
+            _curr_narrow = (
+                min(_side_l, _side_r) < _DOORWAY_SIDE_TH
+                and max(_side_l, _side_r) < _DOORWAY_SIDE_EXIT
                 and _cl_front > _DOORWAY_FRONT_MIN
             )
+            _next_narrow = (
+                min(_cl_left, _cl_right) < _DOORWAY_SIDE_TH
+                and max(_cl_left, _cl_right) < _DOORWAY_SIDE_EXIT
+                and _cl_front > _DOORWAY_FRONT_MIN
+            )
+            _entering_doorway = (
+                min(_cl_left, _cl_right) < _SIDE_STOP_CL
+                and max(_cl_left, _cl_right) < (_DOORWAY_SIDE_EXIT + 1.5)
+                and _cl_front < _DOORWAY_SIDE_EXIT
+                and _cl_front > _DOORWAY_FRONT_MIN
+            )
+            _was_doorway = _doorway_mode
+            if _doorway_mode:
+                _still_narrow = (
+                    min(_side_l, _side_r) < _DOORWAY_SIDE_EXIT
+                    or min(_cl_left, _cl_right) < _DOORWAY_SIDE_EXIT
+                    or _cl_front < _DOORWAY_SIDE_EXIT
+                )
+                _doorway_mode = (
+                    _cl_front > _DOORWAY_FRONT_MIN
+                    and _still_narrow
+                )
+            else:
+                _doorway_mode = _curr_narrow or _next_narrow or _entering_doorway
             if _doorway_mode != _was_doorway:
                 if _doorway_mode:
-                    print(f"  [shield] Step {i+1}/{n}: doorway mode ON — "
-                          f"sides=({_side_l:.1f}, {_side_r:.1f}) "
+                    print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: doorway mode ON — "
+                          f"curr-sides=({_side_l:.1f}, {_side_r:.1f}) "
+                          f"next-sides=({_cl_left:.1f}, {_cl_right:.1f}) "
                           f"front={_cl_front:.1f} — switching to cautious doorway traversal")
                 else:
-                    print(f"  [shield] Step {i+1}/{n}: doorway mode OFF")
+                    print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: doorway mode OFF")
 
             # ── Footprint log (always in doorway mode, or when close) ─
             if _doorway_mode or _cl_min < _SLOW_CL:
-                print(f"  [shield] Step {i+1}/{n}: "
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
                       f"front clearance={_cl_front:.1f} "
                       f"left clearance={_cl_left:.1f} "
                       f"right clearance={_cl_right:.1f} "
@@ -655,21 +783,21 @@ def execute_nav_replay(
             _side_thr  = _DOORWAY_FRONT_MIN if _doorway_mode else _SIDE_STOP_CL
 
             if _cl_front < _stop_thr:
-                print(f"  [shield] Step {i+1}/{n}: front clearance={_cl_front:.1f} "
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: front clearance={_cl_front:.1f} "
                       f"< {_stop_thr:.1f} — hard stop")
                 return False
             if not _doorway_mode and (_cl_left < _side_thr or _cl_right < _side_thr):
-                print(f"  [shield] Step {i+1}/{n}: "
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
                       f"step blocked by side clearance "
                       f"(left={_cl_left:.1f} right={_cl_right:.1f} < {_side_thr:.1f})")
                 return False
-            if _doorway_mode and _cl_min < _DOORWAY_FRONT_MIN:
-                print(f"  [shield] Step {i+1}/{n}: "
-                      f"footprint min clearance={_cl_min:.1f} "
+            if _doorway_mode and _cl_front < _DOORWAY_FRONT_MIN:
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
+                      f"front clearance={_cl_front:.1f} "
                       f"< {_DOORWAY_FRONT_MIN:.1f} — blocked in doorway mode")
                 return False
             if _cl_min < _SLOW_CL:
-                print(f"  [shield] Step {i+1}/{n}: "
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
                       f"continuing in cautious {'doorway' if _doorway_mode else 'close-walls'} mode")
 
         if is_fwd:
@@ -683,18 +811,20 @@ def execute_nav_replay(
             if disp < motion_thresh * expected_fwd:
                 low_motion_count += 1
                 if low_motion_count >= stuck_threshold:
-                    print(f"  [nav] Stuck after {i+1}/{n} actions "
+                    print(f"  [nav] Stuck after {i+1}/{_MAX_FOLLOW_STEPS} follower steps "
                           f"(last disp={disp*100:.1f} cm) — triggering recovery")
                     return False
             else:
                 low_motion_count = 0
 
-        show_obs(robot, f"[{i+1}/{n}] -> {cat}")
+        show_obs(robot, f"[{i+1}/{_MAX_FOLLOW_STEPS}] -> {cat}")
         show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                 path_cells=path_cells, label=f"[{i+1}/{n}] -> {cat}")
+                 path_cells=dense_path, label=f"[{i+1}/{_MAX_FOLLOW_STEPS}] -> {cat}")
         cv2.waitKey(_NAV_STEP_DELAY_MS)
 
-    return True
+    print(f"  [nav] Path follower exceeded safety step budget "
+          f"({_MAX_FOLLOW_STEPS}) before reaching goal")
+    return False
 
 
 def nav_recovery_and_replan(
@@ -918,7 +1048,8 @@ def _compute_path_safety(path_cells: list, obs_map: np.ndarray) -> dict:
     Returns a dict with: path_length, min_clearance, mean_clearance,
     safety_penalty (sum of 1/clearance for risky cells), safe_cost.
     """
-    if not path_cells:
+    dense_path = densify_path_cells(path_cells)
+    if not dense_path:
         return {"path_length": 0, "min_clearance": 0.0,
                 "mean_clearance": 0.0, "safety_penalty": 0.0, "safe_cost": 0.0}
 
@@ -928,7 +1059,7 @@ def _compute_path_safety(path_cells: list, obs_map: np.ndarray) -> dict:
     _PENALTY_RADIUS = 8.0   # cells within this radius incur cost (0.4 m)
     _LAMBDA = 0.5            # weight of clearance penalty vs path length
 
-    for cell in path_cells:
+    for cell in dense_path:
         r, c = int(cell[0]), int(cell[1])
         if 0 <= r < dist.shape[0] and 0 <= c < dist.shape[1]:
             cl = float(dist[r, c])
@@ -938,7 +1069,7 @@ def _compute_path_safety(path_cells: list, obs_map: np.ndarray) -> dict:
         if cl < _PENALTY_RADIUS:
             penalty += (_PENALTY_RADIUS - cl) / _PENALTY_RADIUS
 
-    n = len(path_cells)
+    n = len(dense_path)
     min_cl = float(min(clearances)) if clearances else 0.0
     mean_cl = float(np.mean(clearances)) if clearances else 0.0
     safe_cost = n + _LAMBDA * penalty
@@ -984,7 +1115,8 @@ def select_safe_goal_from_path(
     obj_row, obj_col = np.unravel_index(np.argmax(heatmap), heatmap.shape)
     obj_centroid = [int(obj_row), int(obj_col)]
 
-    if not path_cells:
+    dense_path = densify_path_cells(path_cells)
+    if not dense_path:
         return obj_centroid, obj_centroid
 
     dist_to_obs = distance_transform_edt(obs_map)
@@ -992,7 +1124,7 @@ def select_safe_goal_from_path(
     # Task 2: collect ALL valid candidates, then pick the one with best clearance
     # (not just the first one found when walking backward).
     candidates = []
-    for cell in path_cells:
+    for cell in dense_path:
         row, col = int(cell[0]), int(cell[1])
         dr = row - obj_row
         dc = col - obj_col
@@ -1011,7 +1143,7 @@ def select_safe_goal_from_path(
 
     # Soft fallback: relax clearance requirement, still pick best clearance
     soft_candidates = []
-    for cell in path_cells:
+    for cell in dense_path:
         row, col = int(cell[0]), int(cell[1])
         dr = row - obj_row
         dc = col - obj_col
@@ -1028,7 +1160,7 @@ def select_safe_goal_from_path(
         return best[0], obj_centroid
 
     # Last resort: path end
-    last = path_cells[-1]
+    last = dense_path[-1]
     return [int(last[0]), int(last[1])], obj_centroid
 
 
@@ -1517,10 +1649,11 @@ def main(config: DictConfig) -> None:
                 _, planned_actions = robot.plan_path_only(goal_pos)
 
             # Capture planned path for visualization
-            path_cells = getattr(robot, "last_planned_path", None) or []
+            path_cells = densify_path_cells(getattr(robot, "last_planned_path", None) or [])
 
             n_actions = len(planned_actions)
-            print(f"  Path computed: {n_actions} actions.")
+            print(f"  Path computed: {len(path_cells)} dense path cell(s) "
+                  f"(controller preview: {n_actions} actions).")
 
             # ── Safety metrics + Bug 3 execution gate ────────────────────────
             _MIN_GOAL_CLEARANCE = 3.0   # cells (~15 cm at cs=0.05 m)
@@ -1588,7 +1721,7 @@ def main(config: DictConfig) -> None:
                                 _nc_init, heatmap, robot.map.obstacles_map
                             )
                         _, _nc_acts = robot.plan_path_only(_nc_goal)
-                        _nc_path = getattr(robot, "last_planned_path", None) or []
+                        _nc_path = densify_path_cells(getattr(robot, "last_planned_path", None) or [])
                         _nc_safety = _compute_path_safety(_nc_path, robot.map.obstacles_map)
                         _nc_gcl = 0.0
                         if _nc_goal and 0 <= int(_nc_goal[0]) < _dist_map_safety.shape[0]:
@@ -1637,7 +1770,7 @@ def main(config: DictConfig) -> None:
             if already_at_goal:
                 print(f"  Already at goal for '{cat}' — proceeding with verification.")
             else:
-                print(f"  Executing path ({n_actions} actions)…")
+                print(f"  Executing path follower over {len(path_cells)} dense cell(s)…")
                 # One-shot execution: no recovery or replanning on failure.
                 completed = execute_nav_replay(
                     robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells,

@@ -138,6 +138,7 @@ class HabitatLanguageRobot(LangRobot):
             self.vlmaps_dataloader.rmin,
             self.vlmaps_dataloader.cmin,
             vis=self.config["nav"]["vis"],
+            raw_obstacle_map=cropped_obst_map,
         )
 
         # ── Room provider (HSSD: native semantic_config.json polygons) ───────

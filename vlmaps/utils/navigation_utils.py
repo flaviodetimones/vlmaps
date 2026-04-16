@@ -47,6 +47,319 @@ def _snap_to_nearest_free(point, obstacles: np.ndarray, min_clearance: float = 2
     return (int(rows[idx]), int(cols[idx]))
 
 
+def _clip_cell(point, shape: Tuple[int, int]) -> Tuple[int, int]:
+    """Clamp a floating-point cell position to valid integer grid bounds."""
+    h, w = shape
+    row = int(np.clip(np.round(point[0]), 0, h - 1))
+    col = int(np.clip(np.round(point[1]), 0, w - 1))
+    return (row, col)
+
+
+def _disk_cells(center: Tuple[int, int], radius: int, shape: Tuple[int, int]) -> List[Tuple[int, int]]:
+    """Enumerate integer cells inside a disk centered at *center*."""
+    row, col = center
+    rmin = max(0, row - radius)
+    rmax = min(shape[0] - 1, row + radius)
+    cmin = max(0, col - radius)
+    cmax = min(shape[1] - 1, col + radius)
+    cells = []
+    rad_sq = radius * radius
+    for rr in range(rmin, rmax + 1):
+        dr_sq = (rr - row) * (rr - row)
+        for cc in range(cmin, cmax + 1):
+            if dr_sq + (cc - col) * (cc - col) <= rad_sq:
+                cells.append((rr, cc))
+    return cells
+
+
+def _segment_is_free(
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+    free_map: np.ndarray,
+) -> bool:
+    """Return True if the rasterized line segment lies entirely in free space."""
+    start = _clip_cell(start, free_map.shape)
+    end = _clip_cell(end, free_map.shape)
+
+    rmin = min(start[0], end[0])
+    rmax = max(start[0], end[0])
+    cmin = min(start[1], end[1])
+    cmax = max(start[1], end[1])
+
+    mask = np.zeros((rmax - rmin + 1, cmax - cmin + 1), dtype=np.uint8)
+    cv2.line(
+        mask,
+        (start[1] - cmin, start[0] - rmin),
+        (end[1] - cmin, end[0] - rmin),
+        1,
+        1,
+    )
+    rows, cols = np.where(mask > 0)
+    if rows.size == 0:
+        return bool(free_map[start[0], start[1]]) and bool(free_map[end[0], end[1]])
+    return bool(np.all(free_map[rmin + rows, cmin + cols] == 1))
+
+
+def _segment_cells(start: Tuple[int, int], end: Tuple[int, int]) -> List[Tuple[int, int]]:
+    """Rasterize a grid segment into integer cells, including endpoints."""
+    start = (int(start[0]), int(start[1]))
+    end = (int(end[0]), int(end[1]))
+
+    rmin = min(start[0], end[0])
+    rmax = max(start[0], end[0])
+    cmin = min(start[1], end[1])
+    cmax = max(start[1], end[1])
+
+    mask = np.zeros((rmax - rmin + 1, cmax - cmin + 1), dtype=np.uint8)
+    cv2.line(
+        mask,
+        (start[1] - cmin, start[0] - rmin),
+        (end[1] - cmin, end[0] - rmin),
+        1,
+        1,
+    )
+    rows, cols = np.where(mask > 0)
+    if rows.size == 0:
+        return [start, end] if start != end else [start]
+    pts = [(int(rmin + rr), int(cmin + cc)) for rr, cc in zip(rows, cols)]
+    pts.sort(key=lambda cell: (cell[0] - start[0]) ** 2 + (cell[1] - start[1]) ** 2)
+    return pts
+
+
+def _find_best_centered_cell(
+    waypoint: Tuple[int, int],
+    prev_waypoint: Tuple[int, int],
+    next_waypoint: Tuple[int, int],
+    dist_map: np.ndarray,
+    support_map: np.ndarray,
+    search_radius: int,
+) -> Tuple[int, int]:
+    """Find the highest-clearance nearby cell that preserves local connectivity."""
+    waypoint = _clip_cell(waypoint, dist_map.shape)
+    prev_waypoint = _clip_cell(prev_waypoint, dist_map.shape)
+    next_waypoint = _clip_cell(next_waypoint, dist_map.shape)
+
+    base_len = float(np.linalg.norm(np.subtract(prev_waypoint, waypoint))) + float(
+        np.linalg.norm(np.subtract(next_waypoint, waypoint))
+    )
+    best_cell = waypoint
+    best_key = (
+        float(dist_map[waypoint[0], waypoint[1]]),
+        -0.0,
+        -0.0,
+    )
+
+    for cand in _disk_cells(waypoint, search_radius, dist_map.shape):
+        if not support_map[cand[0], cand[1]]:
+            continue
+        if not _segment_is_free(prev_waypoint, cand, support_map):
+            continue
+        if not _segment_is_free(cand, next_waypoint, support_map):
+            continue
+
+        detour = (
+            float(np.linalg.norm(np.subtract(prev_waypoint, cand)))
+            + float(np.linalg.norm(np.subtract(next_waypoint, cand)))
+            - base_len
+        )
+        disp = float(np.linalg.norm(np.subtract(cand, waypoint)))
+        cand_key = (
+            float(dist_map[cand[0], cand[1]]),
+            -detour,
+            -disp,
+        )
+        if cand_key > best_key:
+            best_cell = cand
+            best_key = cand_key
+
+    return best_cell
+
+
+def _smooth_centered_path(
+    path: List[List[float]],
+    shifted_flags: List[bool],
+    dist_map: np.ndarray,
+    support_map: np.ndarray,
+    snap_radius: int = 2,
+) -> List[List[float]]:
+    """Apply a conservative 3-point smoothing pass on already-centered waypoints."""
+    if len(path) < 3:
+        return path
+
+    smoothed = [list(point) for point in path]
+    for i in range(1, len(path) - 1):
+        if not shifted_flags[i]:
+            continue
+        prev_cell = _clip_cell(smoothed[i - 1], dist_map.shape)
+        curr_cell = _clip_cell(smoothed[i], dist_map.shape)
+        next_cell = _clip_cell(smoothed[i + 1], dist_map.shape)
+
+        weighted = (
+            0.25 * np.asarray(prev_cell, dtype=np.float32)
+            + 0.5 * np.asarray(curr_cell, dtype=np.float32)
+            + 0.25 * np.asarray(next_cell, dtype=np.float32)
+        )
+        target = _clip_cell(weighted, dist_map.shape)
+        best_cell = curr_cell
+        best_key = (
+            -float(np.linalg.norm(np.subtract(curr_cell, target))),
+            float(dist_map[curr_cell[0], curr_cell[1]]),
+        )
+
+        for cand in _disk_cells(target, snap_radius, dist_map.shape):
+            if not support_map[cand[0], cand[1]]:
+                continue
+            if not _segment_is_free(prev_cell, cand, support_map):
+                continue
+            if not _segment_is_free(cand, next_cell, support_map):
+                continue
+            # Smoothing should not undo the gained clearance in tight spaces.
+            if dist_map[cand[0], cand[1]] + 0.25 < dist_map[curr_cell[0], curr_cell[1]]:
+                continue
+
+            cand_key = (
+                -float(np.linalg.norm(np.subtract(cand, target))),
+                float(dist_map[cand[0], cand[1]]),
+            )
+            if cand_key > best_key:
+                best_cell = cand
+                best_key = cand_key
+
+        smoothed[i] = [int(best_cell[0]), int(best_cell[1])]
+
+    return smoothed
+
+
+def _insert_narrow_passage_waypoints(
+    path: List[List[float]],
+    dist_map: np.ndarray,
+    support_map: np.ndarray,
+    narrow_th: float,
+    search_radius: int,
+) -> Tuple[List[List[float]], int, List[bool]]:
+    """Insert helper waypoints where a long segment crosses a narrow passage."""
+    if len(path) < 2:
+        return [list(point) for point in path], 0, [False] * len(path)
+
+    augmented = [[int(path[0][0]), int(path[0][1])]]
+    inserted_flags = [False]
+    inserted_count = 0
+
+    for i in range(len(path) - 1):
+        seg_start = _clip_cell(path[i], dist_map.shape)
+        seg_end = _clip_cell(path[i + 1], dist_map.shape)
+        cells = _segment_cells(seg_start, seg_end)
+
+        run_start = None
+        for idx, cell in enumerate(cells):
+            is_narrow = float(dist_map[cell[0], cell[1]]) < narrow_th
+            if is_narrow and run_start is None:
+                run_start = idx
+            is_run_end = run_start is not None and (not is_narrow or idx == len(cells) - 1)
+            if not is_run_end:
+                continue
+
+            run_end = idx if is_narrow and idx == len(cells) - 1 else idx - 1
+            run_cells = cells[run_start:run_end + 1]
+            narrow_cell = min(run_cells, key=lambda cell_: float(dist_map[cell_[0], cell_[1]]))
+            centered_cell = _find_best_centered_cell(
+                narrow_cell,
+                seg_start,
+                seg_end,
+                dist_map,
+                support_map,
+                search_radius,
+            )
+            if centered_cell != augmented[-1] and centered_cell != seg_end:
+                augmented.append([int(centered_cell[0]), int(centered_cell[1])])
+                inserted_flags.append(True)
+                inserted_count += 1
+            run_start = None
+
+        end_cell = [int(seg_end[0]), int(seg_end[1])]
+        if end_cell != augmented[-1]:
+            augmented.append(end_cell)
+            inserted_flags.append(False)
+
+    return augmented, inserted_count, inserted_flags
+
+
+def center_path_on_medial_axis(
+    path: List[List[float]],
+    dist_map: np.ndarray,
+    support_map: np.ndarray = None,
+    narrow_th: float = 4.0,
+    search_radius: int = 6,
+    smooth: bool = True,
+    tight_clearance_th: float = 1.5,
+) -> List[List[float]]:
+    """Shift narrow-passage waypoints toward higher-clearance cells.
+
+    The path is assumed to be valid in *support_map* (typically the planner's
+    dilated free-space map). Clearance is measured in *dist_map* computed from
+    the raw obstacle map so doorway centering reflects physical wall distance.
+    """
+    if len(path) < 3:
+        return [list(point) for point in path]
+
+    if support_map is None:
+        support_map = (dist_map > 0).astype(np.uint8)
+
+    centered, inserted_count, inserted_flags = _insert_narrow_passage_waypoints(
+        path,
+        dist_map,
+        support_map,
+        narrow_th,
+        search_radius,
+    )
+    shifted_flags = list(inserted_flags)
+    shifted_count = 0
+    tight_count = 0
+
+    for i in range(1, len(centered) - 1):
+        waypoint = _clip_cell(centered[i], dist_map.shape)
+        clearance = float(dist_map[waypoint[0], waypoint[1]])
+        if clearance >= narrow_th:
+            centered[i] = [int(waypoint[0]), int(waypoint[1])]
+            continue
+
+        prev_waypoint = _clip_cell(centered[i - 1], dist_map.shape)
+        next_waypoint = _clip_cell(centered[i + 1], dist_map.shape)
+        best_cell = _find_best_centered_cell(
+            waypoint,
+            prev_waypoint,
+            next_waypoint,
+            dist_map,
+            support_map,
+            search_radius,
+        )
+        best_clearance = float(dist_map[best_cell[0], best_cell[1]])
+        centered[i] = [int(best_cell[0]), int(best_cell[1])]
+
+        if best_cell != waypoint:
+            shifted_flags[i] = True
+            shifted_count += 1
+        if best_clearance < tight_clearance_th:
+            tight_count += 1
+
+    if smooth:
+        centered = _smooth_centered_path(centered, shifted_flags, dist_map, support_map)
+
+    if inserted_count > 0 or shifted_count > 0:
+        print(
+            f"[planner] Medial-axis centered {shifted_count} waypoint(s), "
+            f"inserted {inserted_count} narrow-passage waypoint(s) "
+            f"(narrow_th={narrow_th:.1f}, radius={search_radius})"
+        )
+    if tight_count > 0:
+        print(
+            f"[planner] WARNING: {tight_count} centered waypoint(s) remain below "
+            f"{tight_clearance_th:.1f} cells of raw clearance"
+        )
+
+    return centered
+
+
 def get_segment_islands_pos(segment_map, label_id, detect_internal_contours=False):
     mask = segment_map == label_id
     mask = mask.astype(np.uint8)

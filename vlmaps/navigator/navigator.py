@@ -1,6 +1,11 @@
 import numpy as np
 import pyvisgraph as vg
-from vlmaps.utils.navigation_utils import build_visgraph_with_obs_map, plan_to_pos_v2
+from scipy.ndimage import distance_transform_edt
+from vlmaps.utils.navigation_utils import (
+    build_visgraph_with_obs_map,
+    center_path_on_medial_axis,
+    plan_to_pos_v2,
+)
 from typing import Tuple, List, Dict
 
 
@@ -8,8 +13,17 @@ class Navigator:
     def __init__(self):
         pass
 
-    def build_visgraph(self, obstacle_map: np.ndarray, rowmin: float, colmin: float, vis: bool = False):
+    def build_visgraph(
+        self,
+        obstacle_map: np.ndarray,
+        rowmin: float,
+        colmin: float,
+        vis: bool = False,
+        raw_obstacle_map: np.ndarray = None,
+    ):
         self.obs_map = obstacle_map
+        self.raw_obs_map = raw_obstacle_map if raw_obstacle_map is not None else obstacle_map
+        self.raw_dist_map = distance_transform_edt(self.raw_obs_map)
         self.visgraph = build_visgraph_with_obs_map(obstacle_map, vis=vis)
         self.rowmin = rowmin
         self.colmin = colmin
@@ -40,6 +54,15 @@ class Navigator:
                     best = int(np.argmin(dist_sq))
                     start = [float(free_rows[best]), float(free_cols[best])]
         paths = plan_to_pos_v2(start, goal, self.obs_map, self.visgraph, vis)
+        if len(paths) >= 3:
+            paths = center_path_on_medial_axis(
+                paths,
+                self.raw_dist_map,
+                support_map=self.obs_map,
+                narrow_th=4.0,
+                search_radius=6,
+                smooth=True,
+            )
         paths = self.shift_path(paths, self.rowmin, self.colmin)
         return paths
 
