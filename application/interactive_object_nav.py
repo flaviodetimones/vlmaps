@@ -372,6 +372,11 @@ def normalize_path_cells(path_cells: list) -> list:
     return [[int(round(cell[0])), int(round(cell[1]))] for cell in path_cells]
 
 
+def _normalize_turn_error(angle_deg: float) -> float:
+    """Wrap an angle difference to [-180, 180)."""
+    return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+
 def _closest_path_index(curr_cell, dense_path: list, hint_idx: int, backtrack: int = 12, ahead: int = 80) -> int:
     """Find the closest path index near the current progress hint."""
     if not dense_path:
@@ -683,6 +688,8 @@ def execute_nav_replay(
     _LOOKAHEAD_TIGHT_CL = 5.0
     _GOAL_REACHED_TOL = max(3, _fwd_cells + 1)
     _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
+    _FORWARD_HEADING_TOL_OPEN = 10.0
+    _FORWARD_HEADING_TOL_TIGHT = 18.0
     _doorway_mode = False  # updated before each forward step
     progress_idx = 0
 
@@ -726,6 +733,11 @@ def execute_nav_replay(
             float(robot.curr_pos_on_map[1]),
             float(robot.curr_ang_deg_on_map),
         )
+        _target_dr = float(target_cell[0]) - _curr_pose[0]
+        _target_dc = float(target_cell[1]) - _curr_pose[1]
+        _target_dist = float(np.hypot(_target_dr, _target_dc))
+        _target_angle = float(np.degrees(np.arctan2(-_target_dc, -_target_dr)))
+        _heading_err = _normalize_turn_error(_curr_pose[2] - _target_angle)
         _preview = robot.controller.convert_goal_to_actions(_curr_pose, target_cell)
 
         if not _preview:
@@ -745,6 +757,19 @@ def execute_nav_replay(
                   f"{preferred_idx - progress_idx} -> {target_idx - progress_idx} cells ahead")
 
         action = _preview[0]
+        _heading_tol = (
+            _FORWARD_HEADING_TOL_TIGHT if _curr_clearance < _LOOKAHEAD_TIGHT_CL else _FORWARD_HEADING_TOL_OPEN
+        )
+        if (
+            action in ("turn_left", "turn_right")
+            and abs(_heading_err) <= _heading_tol
+            and _target_dist >= max(1.0, 0.75 * _fwd_cells)
+            and (len(_preview) < 2 or _preview[1] == "move_forward")
+        ):
+            if i == 0 or i % 20 == 0:
+                print(f"  [nav] Heading deadband: |err|={abs(_heading_err):.1f}° "
+                      f"<= {_heading_tol:.1f}° — prioritizing forward motion")
+            action = "move_forward"
 
         is_fwd = (action == "move_forward")
 
