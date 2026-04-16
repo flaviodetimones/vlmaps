@@ -402,6 +402,48 @@ def _lookahead_path_index(dense_path: list, start_idx: int, lookahead_cells: flo
     return target_idx
 
 
+def _segment_is_free_on_map(start, end, free_map: np.ndarray) -> bool:
+    """Return True if the integer segment lies entirely inside free cells."""
+    if free_map is None:
+        return True
+    h, w = free_map.shape
+    for row, col in _rasterize_segment_cells(start, end):
+        rr = int(np.clip(row, 0, h - 1))
+        cc = int(np.clip(col, 0, w - 1))
+        if not bool(free_map[rr, cc]):
+            return False
+    return True
+
+
+def _visible_lookahead_index(
+    curr_cell,
+    dense_path: list,
+    start_idx: int,
+    preferred_idx: int,
+    free_map: np.ndarray,
+) -> int:
+    """Pick the farthest lookahead target that is still line-of-sight reachable.
+
+    This stops the follower from aiming around a blind corner and trying to cut
+    through the wall with the first forward action.
+    """
+    if not dense_path:
+        return 0
+    if free_map is None:
+        return preferred_idx
+
+    start_idx = int(np.clip(start_idx, 0, len(dense_path) - 1))
+    preferred_idx = int(np.clip(preferred_idx, start_idx, len(dense_path) - 1))
+
+    for idx in range(preferred_idx, start_idx, -1):
+        if _segment_is_free_on_map(curr_cell, dense_path[idx], free_map):
+            return idx
+
+    if preferred_idx == start_idx:
+        return start_idx
+    return min(len(dense_path) - 1, start_idx + 1)
+
+
 def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     """Turn robot to face directly toward a specific map (row, col) position.
 
@@ -620,6 +662,9 @@ def execute_nav_replay(
         return True
 
     goal_cell = dense_path[-1]
+    free_map = getattr(robot, "_safe_obs_map", None)
+    if free_map is None:
+        free_map = getattr(robot.map, "obstacles_map", None)
     low_motion_count = 0
     expected_fwd = robot.forward_dist
     _cs = getattr(robot, "cs", 0.05)
@@ -656,7 +701,14 @@ def execute_nav_replay(
         _lookahead_cells = (
             _LOOKAHEAD_TIGHT_CELLS if _curr_clearance < _LOOKAHEAD_TIGHT_CL else _LOOKAHEAD_OPEN_CELLS
         )
-        target_idx = _lookahead_path_index(dense_path, progress_idx, _lookahead_cells)
+        preferred_idx = _lookahead_path_index(dense_path, progress_idx, _lookahead_cells)
+        target_idx = _visible_lookahead_index(
+            _curr_cell,
+            dense_path,
+            progress_idx,
+            preferred_idx,
+            free_map,
+        )
         target_cell = dense_path[target_idx]
 
         _curr_pose = (
@@ -677,6 +729,10 @@ def execute_nav_replay(
             _preview = robot.controller.convert_goal_to_actions(_curr_pose, goal_cell)
             if not _preview:
                 return True
+
+        if preferred_idx != target_idx and (i == 0 or i % 20 == 0):
+            print(f"  [nav] Lookahead clipped by local visibility: "
+                  f"{preferred_idx - progress_idx} -> {target_idx - progress_idx} cells ahead")
 
         action = _preview[0]
 
@@ -1769,6 +1825,7 @@ def main(config: DictConfig) -> None:
 
             if already_at_goal:
                 print(f"  Already at goal for '{cat}' — proceeding with verification.")
+                completed = True
             else:
                 print(f"  Executing path follower over {len(path_cells)} dense cell(s)…")
                 # One-shot execution: no recovery or replanning on failure.
@@ -1780,10 +1837,6 @@ def main(config: DictConfig) -> None:
                     print(f"  [nav] Path execution stopped early for '{cat}' "
                           f"(stuck or shield). Continuing from current position.")
 
-            show_obs(robot, f"Arrived: {cat}")
-            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Arrived: {cat}")
-
             # ── Room-level navigation: one-shot arrival check (no retry) ────
             if room_goal is not None:
                 robot._set_nav_curr_pose()
@@ -1794,6 +1847,10 @@ def main(config: DictConfig) -> None:
                     )
                 print(f"  Actual room after path: {_arrived_room or 'unknown'}")
                 _room_ok = _room_instance_matches(_arrived_room, cat)
+                _room_status = f"Arrived: {cat}" if _room_ok else f"Not reached: {cat}"
+                show_obs(robot, _room_status)
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         path_cells=path_cells, label=_room_status)
                 if _room_ok:
                     print(f"  Arrived at room '{cat}' (actual: {_arrived_room}). Done.")
                 else:
@@ -1806,6 +1863,11 @@ def main(config: DictConfig) -> None:
                 agent_state = robot.sim.get_agent(0).get_state()
                 start_tf = agent_state2tf(agent_state)
                 continue
+
+            _arrival_label = f"Arrived: {cat}" if completed else f"Stopped before goal: {cat}"
+            show_obs(robot, _arrival_label)
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=path_cells, label=_arrival_label)
 
             # Stage 0: YOLOE check at raw arrival (before any rotation)
             _yoloe_confirmed = False
