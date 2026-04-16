@@ -365,6 +365,13 @@ def densify_path_cells(path_cells: list) -> list:
     return dense
 
 
+def normalize_path_cells(path_cells: list) -> list:
+    """Convert a path to integer grid cells while preserving vertex structure."""
+    if not path_cells:
+        return []
+    return [[int(round(cell[0])), int(round(cell[1]))] for cell in path_cells]
+
+
 def _closest_path_index(curr_cell, dense_path: list, hint_idx: int, backtrack: int = 12, ahead: int = 80) -> int:
     """Find the closest path index near the current progress hint."""
     if not dense_path:
@@ -634,11 +641,12 @@ def execute_nav_replay(
     rgb_map_2d: np.ndarray,
     heatmap: np.ndarray,
     path_cells: list,
+    display_path_cells: list = None,
     motion_thresh: float = 0.4,
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
 ) -> bool:
-    """Follow the planned polyline with lookahead and a footprint-aware shield."""
+    """Follow the geometric path polyline with lookahead and a footprint-aware shield."""
     # ── Open-space thresholds ─────────────────────────────────────────────
     _STOP_CL      = 1.0   # cells — hard stop on front center
     _SLOW_CL      = 3.0   # cells — low-clearance warning
@@ -657,11 +665,12 @@ def execute_nav_replay(
           f"stop={_STOP_CL} slow={_SLOW_CL} side_stop={_SIDE_STOP_CL} | "
           f"doorway: stop={_STOP_CL_DOOR} side_th={_DOORWAY_SIDE_TH}")
 
-    dense_path = densify_path_cells(path_cells)
-    if not dense_path:
+    follow_path = normalize_path_cells(path_cells)
+    if not follow_path:
         return True
+    dense_path = display_path_cells if display_path_cells is not None else densify_path_cells(follow_path)
 
-    goal_cell = dense_path[-1]
+    goal_cell = follow_path[-1]
     free_map = getattr(robot, "_safe_obs_map", None)
     if free_map is None:
         free_map = getattr(robot.map, "obstacles_map", None)
@@ -673,24 +682,25 @@ def execute_nav_replay(
     _LOOKAHEAD_TIGHT_CELLS = max(3, _fwd_cells * 2)
     _LOOKAHEAD_TIGHT_CL = 5.0
     _GOAL_REACHED_TOL = max(3, _fwd_cells + 1)
-    _MAX_FOLLOW_STEPS = max(len(planned_actions) * 2, len(dense_path) * 3, 120)
+    _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
     _doorway_mode = False  # updated before each forward step
     progress_idx = 0
 
-    print(f"  [nav] Path follower: {len(dense_path)} dense path cell(s), "
+    print(f"  [nav] Path follower: {len(follow_path)} polyline waypoint(s), "
+          f"{len(dense_path)} dense display cell(s), "
           f"lookahead={_LOOKAHEAD_OPEN_CELLS} open / {_LOOKAHEAD_TIGHT_CELLS} tight")
 
     for i in range(_MAX_FOLLOW_STEPS):
         robot._set_nav_curr_pose()
         _curr_cell = [int(round(robot.curr_pos_on_map[0])), int(round(robot.curr_pos_on_map[1]))]
-        progress_idx = _closest_path_index(_curr_cell, dense_path, progress_idx)
+        progress_idx = _closest_path_index(_curr_cell, follow_path, progress_idx)
 
         _goal_dr = float(goal_cell[0]) - float(_curr_cell[0])
         _goal_dc = float(goal_cell[1]) - float(_curr_cell[1])
         _goal_dist = float(np.hypot(_goal_dr, _goal_dc))
-        if progress_idx >= len(dense_path) - 1 and _goal_dist <= _GOAL_REACHED_TOL:
-            print(f"  [nav] Goal reached on dense path "
-                  f"(dist={_goal_dist:.1f} cells, progress={progress_idx + 1}/{len(dense_path)})")
+        if progress_idx >= len(follow_path) - 1 and _goal_dist <= _GOAL_REACHED_TOL:
+            print(f"  [nav] Goal reached on path polyline "
+                  f"(dist={_goal_dist:.1f} cells, progress={progress_idx + 1}/{len(follow_path)})")
             return True
 
         _curr_clearance = float("inf")
@@ -701,15 +711,15 @@ def execute_nav_replay(
         _lookahead_cells = (
             _LOOKAHEAD_TIGHT_CELLS if _curr_clearance < _LOOKAHEAD_TIGHT_CL else _LOOKAHEAD_OPEN_CELLS
         )
-        preferred_idx = _lookahead_path_index(dense_path, progress_idx, _lookahead_cells)
+        preferred_idx = _lookahead_path_index(follow_path, progress_idx, _lookahead_cells)
         target_idx = _visible_lookahead_index(
             _curr_cell,
-            dense_path,
+            follow_path,
             progress_idx,
             preferred_idx,
             free_map,
         )
-        target_cell = dense_path[target_idx]
+        target_cell = follow_path[target_idx]
 
         _curr_pose = (
             float(robot.curr_pos_on_map[0]),
@@ -719,8 +729,8 @@ def execute_nav_replay(
         _preview = robot.controller.convert_goal_to_actions(_curr_pose, target_cell)
 
         if not _preview:
-            if target_idx < len(dense_path) - 1:
-                progress_idx = min(progress_idx + 1, len(dense_path) - 1)
+            if target_idx < len(follow_path) - 1:
+                progress_idx = min(progress_idx + 1, len(follow_path) - 1)
                 continue
             if _goal_dist <= _GOAL_REACHED_TOL + _fwd_cells:
                 print(f"  [nav] Goal reached after lookahead convergence "
@@ -1704,11 +1714,13 @@ def main(config: DictConfig) -> None:
                 # Step 3: plan to the selected goal
                 _, planned_actions = robot.plan_path_only(goal_pos)
 
-            # Capture planned path for visualization
-            path_cells = densify_path_cells(getattr(robot, "last_planned_path", None) or [])
+            # Capture planned path both as geometric polyline and dense raster.
+            path_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+            path_cells = densify_path_cells(path_polyline)
 
             n_actions = len(planned_actions)
-            print(f"  Path computed: {len(path_cells)} dense path cell(s) "
+            print(f"  Path computed: {len(path_polyline)} polyline waypoint(s), "
+                  f"{len(path_cells)} dense path cell(s) "
                   f"(controller preview: {n_actions} actions).")
 
             # ── Safety metrics + Bug 3 execution gate ────────────────────────
@@ -1777,7 +1789,8 @@ def main(config: DictConfig) -> None:
                                 _nc_init, heatmap, robot.map.obstacles_map
                             )
                         _, _nc_acts = robot.plan_path_only(_nc_goal)
-                        _nc_path = densify_path_cells(getattr(robot, "last_planned_path", None) or [])
+                        _nc_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+                        _nc_path = densify_path_cells(_nc_polyline)
                         _nc_safety = _compute_path_safety(_nc_path, robot.map.obstacles_map)
                         _nc_gcl = 0.0
                         if _nc_goal and 0 <= int(_nc_goal[0]) < _dist_map_safety.shape[0]:
@@ -1790,6 +1803,7 @@ def main(config: DictConfig) -> None:
                             goal_pos      = _nc_goal
                             obj_centroid  = _nc_cen
                             planned_actions = _nc_acts
+                            path_polyline = _nc_polyline
                             path_cells    = _nc_path
                             n_actions     = len(_nc_acts)
                             best_comp     = _nc
@@ -1827,10 +1841,12 @@ def main(config: DictConfig) -> None:
                 print(f"  Already at goal for '{cat}' — proceeding with verification.")
                 completed = True
             else:
-                print(f"  Executing path follower over {len(path_cells)} dense cell(s)…")
+                print(f"  Executing path follower over {len(path_polyline)} polyline waypoint(s) "
+                      f"/ {len(path_cells)} dense cell(s)…")
                 # One-shot execution: no recovery or replanning on failure.
                 completed = execute_nav_replay(
-                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_cells,
+                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_polyline,
+                    display_path_cells=path_cells,
                     dist_map=_dist_map_shield,
                 )
                 if not completed:
