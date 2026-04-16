@@ -520,44 +520,63 @@ def execute_nav_replay(
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
 ) -> bool:
-    """Replay a pre-planned action list with stuck detection and collision shield.
+    """Replay with footprint-aware shield and doorway traversal mode.
 
-    Monitors actual displacement after each move_forward action.  If
-    real displacement is below motion_thresh × forward_dist for
-    stuck_threshold consecutive steps, returns False immediately so the
-    caller can trigger recovery.  Turn actions are never counted as stuck.
+    Planning vs execution safety separation (Fix 1)
+    ─────────────────────────────────────────────────
+    Global path planning uses the dilated safe_obs_map (planning inflation
+    iterations, ~15 cm/side) so routes have adequate clearance.  This shield
+    uses the RAW obstacle map distance transform so HSSD doorways (~10 cells
+    wide) are not falsely blocked.  The two maps are intentionally different:
+    planner = conservative routing; shield = actual collision detection only.
 
-    Collision shield (Problem 3): before each move_forward, predicts the
-    cell one step ahead and checks its clearance from obstacles.  If the
-    clearance is below STOP_CLEARANCE the step is replaced with a corrective
-    turn (no damage done); if below SLOW_CLEARANCE a warning is logged.
-    Requires dist_map (full-map distance transform) to be passed in.
+    Footprint-aware checks (Fix 3)
+    ───────────────────────────────
+    Before each move_forward, three footprint points are evaluated at the
+    predicted next pose: front-center, front-left, front-right (offset by
+    ROBOT_HW cells laterally from heading).
+
+    Doorway / narrow-passage mode (Fix 2)
+    ──────────────────────────────────────
+    When both perpendicular side clearances at the current pose drop below
+    DOORWAY_SIDE_TH, the path segment is a narrow passage.  Hard-stop
+    threshold relaxes to STOP_CL_DOOR; every step is logged as cautious
+    doorway traversal.  The planner routes through valid doorways; the shield
+    lets the robot cross them without false hard stops.
 
     Args:
         motion_thresh:   Fraction of forward_dist considered "barely moved".
         stuck_threshold: Consecutive low-motion steps before declaring stuck.
-        dist_map:        Precomputed distance transform of the safe obs map
-                         (full-map, same shape as robot._safe_obs_map).
+        dist_map:        Distance transform of the RAW obstacle map.
                          If None the shield is disabled.
 
     Returns:
-        True  — replay completed without stuck event or collision.
-        False — stuck or imminent collision detected; caller should recover.
+        True  — replay completed.
+        False — stuck or imminent collision.
     """
-    # Thresholds based on the RAW (undilated) obstacle map distance transform.
-    # Doorways in HSSD are ~10 cells wide → center clearance ~5 cells (raw).
-    # The dilated map already shrinks free space by 3 cells per side, so
-    # using the raw map here keeps doorway traversal possible.
-    _STOP_CL = 1.0   # cells — hard stop (about to enter obstacle boundary)
-    _SLOW_CL = 2.5   # cells — low clearance debug warning
+    # ── Open-space thresholds ─────────────────────────────────────────────
+    _STOP_CL      = 1.0   # cells — hard stop on front center
+    _SLOW_CL      = 3.0   # cells — low-clearance warning
+    _SIDE_STOP_CL = 1.5   # cells — side-contact limit in open space
+
+    # ── Doorway / narrow-passage thresholds ──────────────────────────────
+    _DOORWAY_SIDE_TH   = 5.0  # cells — both sides below this → narrow passage
+    _DOORWAY_FRONT_MIN = 0.5  # cells — minimum front inside doorway mode
+    _STOP_CL_DOOR      = 0.5  # cells — relaxed hard stop in doorway
+
+    # ── Robot footprint half-width for lateral footprint sampling ─────────
+    _ROBOT_HW = 2  # cells (~0.10 m per side at cs=0.05 m)
+
+    print(f"  [shield] execution thresholds: "
+          f"stop={_STOP_CL} slow={_SLOW_CL} side_stop={_SIDE_STOP_CL} | "
+          f"doorway: stop={_STOP_CL_DOOR} side_th={_DOORWAY_SIDE_TH}")
 
     low_motion_count = 0
     n = len(planned_actions)
-    expected_fwd = robot.forward_dist  # metres per move_forward action
-
-    # Forward step size in grid cells (approximate)
+    expected_fwd = robot.forward_dist
     _cs = getattr(robot, "cs", 0.05)
     _fwd_cells = max(1, int(round(expected_fwd / _cs)))
+    _doorway_mode = False  # updated before each forward step
 
     for i, action in enumerate(planned_actions):
         if action == "stop":
@@ -565,30 +584,93 @@ def execute_nav_replay(
 
         is_fwd = (action == "move_forward")
 
-        # ── Collision shield — check BEFORE executing forward step ────────
+        # ── Footprint-aware shield — check BEFORE executing forward step ────
         if is_fwd and dist_map is not None:
-            _r, _c = robot.curr_pos_on_map
-            _ang_deg = robot.curr_ang_deg_on_map
-            _ang_rad = float(_ang_deg) * np.pi / 180.0
+            _r  = float(robot.curr_pos_on_map[0])
+            _c  = float(robot.curr_pos_on_map[1])
+            _ang_rad = float(robot.curr_ang_deg_on_map) * np.pi / 180.0
+            _h, _w   = dist_map.shape
 
-            # Map angle convention: 0° faces decreasing-row (north on map).
-            # dr = -cos(ang), dc = sin(ang)  in row/col space.
-            _dr = -np.cos(_ang_rad) * _fwd_cells
-            _dc =  np.sin(_ang_rad) * _fwd_cells
+            # Direction vectors (map: 0°=north=decreasing-row)
+            # forward:  dr=-cos, dc=+sin
+            # left:     CCW 90° of forward → dr=-sin, dc=-cos   (→ (-dc_fwd, dr_fwd))
+            # right:    CW  90° of forward → dr=+sin, dc=+cos   (→ (+dc_fwd, -dr_fwd))
+            _dr_fwd   = -np.cos(_ang_rad)
+            _dc_fwd   =  np.sin(_ang_rad)
+            _dr_left  = -_dc_fwd    # = -sin
+            _dc_left  =  _dr_fwd    # = -cos
+            _dr_right =  _dc_fwd    # = +sin
+            _dc_right = -_dr_fwd    # = +cos
 
-            _nr = int(round(_r + _dr))
-            _nc = int(round(_c + _dc))
-            _h, _w = dist_map.shape
+            # ── Predicted next front-center ───────────────────────────
+            _nr = int(np.clip(round(_r + _dr_fwd * _fwd_cells), 0, _h - 1))
+            _nc = int(np.clip(round(_c + _dc_fwd * _fwd_cells), 0, _w - 1))
 
-            if 0 <= _nr < _h and 0 <= _nc < _w:
-                _next_cl = float(dist_map[_nr, _nc])
-                if _next_cl < _STOP_CL:
-                    print(f"  [shield] Step {i+1}/{n}: front clearance={_next_cl:.1f} "
-                          f"< {_STOP_CL} — hard stop, triggering recovery")
-                    return False
-                elif _next_cl < _SLOW_CL:
-                    print(f"  [shield] Step {i+1}/{n}: front clearance={_next_cl:.1f} "
-                          f"< {_SLOW_CL} — low clearance warning")
+            # ── Front-left / front-right at next pose ─────────────────
+            _fl_r = int(np.clip(round(_nr + _dr_left  * _ROBOT_HW), 0, _h - 1))
+            _fl_c = int(np.clip(round(_nc + _dc_left  * _ROBOT_HW), 0, _w - 1))
+            _fr_r = int(np.clip(round(_nr + _dr_right * _ROBOT_HW), 0, _h - 1))
+            _fr_c = int(np.clip(round(_nc + _dc_right * _ROBOT_HW), 0, _w - 1))
+
+            _cl_front = float(dist_map[_nr,   _nc  ])
+            _cl_left  = float(dist_map[_fl_r, _fl_c])
+            _cl_right = float(dist_map[_fr_r, _fr_c])
+            _cl_min   = min(_cl_front, _cl_left, _cl_right)
+
+            # ── Side clearances at current pose (perpendicular, 2×HW) ──
+            # Used only for doorway detection, not for blocking.
+            _sl_r = int(np.clip(round(_r + _dr_left  * _ROBOT_HW * 2), 0, _h - 1))
+            _sl_c = int(np.clip(round(_c + _dc_left  * _ROBOT_HW * 2), 0, _w - 1))
+            _sr_r = int(np.clip(round(_r + _dr_right * _ROBOT_HW * 2), 0, _h - 1))
+            _sr_c = int(np.clip(round(_c + _dc_right * _ROBOT_HW * 2), 0, _w - 1))
+            _side_l = float(dist_map[_sl_r, _sl_c])
+            _side_r = float(dist_map[_sr_r, _sr_c])
+
+            # ── Doorway detection ─────────────────────────────────────
+            _was_doorway = _doorway_mode
+            _doorway_mode = (
+                _side_l < _DOORWAY_SIDE_TH
+                and _side_r < _DOORWAY_SIDE_TH
+                and _cl_front > _DOORWAY_FRONT_MIN
+            )
+            if _doorway_mode != _was_doorway:
+                if _doorway_mode:
+                    print(f"  [shield] Step {i+1}/{n}: doorway mode ON — "
+                          f"sides=({_side_l:.1f}, {_side_r:.1f}) "
+                          f"front={_cl_front:.1f} — switching to cautious doorway traversal")
+                else:
+                    print(f"  [shield] Step {i+1}/{n}: doorway mode OFF")
+
+            # ── Footprint log (always in doorway mode, or when close) ─
+            if _doorway_mode or _cl_min < _SLOW_CL:
+                print(f"  [shield] Step {i+1}/{n}: "
+                      f"front clearance={_cl_front:.1f} "
+                      f"left clearance={_cl_left:.1f} "
+                      f"right clearance={_cl_right:.1f} "
+                      f"footprint min clearance={_cl_min:.1f} "
+                      f"[doorway mode: {'ON' if _doorway_mode else 'OFF'}]")
+
+            # ── Block / warn ──────────────────────────────────────────
+            _stop_thr  = _STOP_CL_DOOR if _doorway_mode else _STOP_CL
+            _side_thr  = _DOORWAY_FRONT_MIN if _doorway_mode else _SIDE_STOP_CL
+
+            if _cl_front < _stop_thr:
+                print(f"  [shield] Step {i+1}/{n}: front clearance={_cl_front:.1f} "
+                      f"< {_stop_thr:.1f} — hard stop")
+                return False
+            if not _doorway_mode and (_cl_left < _side_thr or _cl_right < _side_thr):
+                print(f"  [shield] Step {i+1}/{n}: "
+                      f"step blocked by side clearance "
+                      f"(left={_cl_left:.1f} right={_cl_right:.1f} < {_side_thr:.1f})")
+                return False
+            if _doorway_mode and _cl_min < _DOORWAY_FRONT_MIN:
+                print(f"  [shield] Step {i+1}/{n}: "
+                      f"footprint min clearance={_cl_min:.1f} "
+                      f"< {_DOORWAY_FRONT_MIN:.1f} — blocked in doorway mode")
+                return False
+            if _cl_min < _SLOW_CL:
+                print(f"  [shield] Step {i+1}/{n}: "
+                      f"continuing in cautious {'doorway' if _doorway_mode else 'close-walls'} mode")
 
         if is_fwd:
             pre_xyz = _agent_xyz(robot)
@@ -1607,6 +1689,30 @@ def main(config: DictConfig) -> None:
                             print(f"  YOLOE stage 0: ✓ Found '{cat}' at arrival (no rotation needed)!")
                             if _ann_frame is not None:
                                 _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                            # Fix 4: room-entry gate — reject if robot hasn't crossed doorway
+                            _s0_comp_room = best_comp.get("room") if best_comp is not None else None
+                            if (_s0_comp_room and _room_provider
+                                    and _room_provider.is_available()):
+                                robot._set_nav_curr_pose()
+                                _s0_actual = _room_provider.get_room_at_cell(
+                                    int(robot.curr_pos_on_map[0]),
+                                    int(robot.curr_pos_on_map[1]),
+                                )
+                                if _s0_actual != _s0_comp_room:
+                                    _s0_dr = obj_centroid[0] - robot.curr_pos_on_map[0]
+                                    _s0_dc = obj_centroid[1] - robot.curr_pos_on_map[1]
+                                    _s0_dist = float(np.sqrt(_s0_dr**2 + _s0_dc**2))
+                                    if _s0_dist > 20:
+                                        print(f"  [room-gate] Object visible but room not yet "
+                                              f"entered (robot: {_s0_actual}, "
+                                              f"target: {_s0_comp_room}, "
+                                              f"dist={_s0_dist:.1f} cells) "
+                                              f"\u2192 tentative only")
+                                        _yoloe_confirmed = False
+                                    else:
+                                        print(f"  [room-gate] Room entry confirmed "
+                                              f"(dist={_s0_dist:.1f} \u2264 20 cells) "
+                                              f"\u2014 accepting")
                         else:
                             print(f"  YOLOE stage 0: ✗ not visible at arrival.")
                 except Exception as e:
@@ -1642,7 +1748,31 @@ def main(config: DictConfig) -> None:
                                 print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
                                 if _ann_frame is not None:
                                     _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                                fine_visual_center(robot, _yoloe_session, cat)
+                                # Fix 4: room-entry gate for Stage 1
+                                _s1_comp_room = best_comp.get("room") if best_comp is not None else None
+                                if (_s1_comp_room and _room_provider
+                                        and _room_provider.is_available()):
+                                    robot._set_nav_curr_pose()
+                                    _s1_actual = _room_provider.get_room_at_cell(
+                                        int(robot.curr_pos_on_map[0]),
+                                        int(robot.curr_pos_on_map[1]),
+                                    )
+                                    if _s1_actual != _s1_comp_room:
+                                        _s1_dr = obj_centroid[0] - robot.curr_pos_on_map[0]
+                                        _s1_dc = obj_centroid[1] - robot.curr_pos_on_map[1]
+                                        _s1_dist = float(np.sqrt(_s1_dr**2 + _s1_dc**2))
+                                        if _s1_dist > 20:
+                                            print(f"  [room-gate] Object visible but room not yet "
+                                                  f"entered (robot: {_s1_actual}, "
+                                                  f"target: {_s1_comp_room}, "
+                                                  f"dist={_s1_dist:.1f} cells) "
+                                                  f"\u2192 tentative only")
+                                            _yoloe_confirmed = False
+                                        else:
+                                            print(f"  [room-gate] Room entry confirmed "
+                                                  f"(dist={_s1_dist:.1f} \u2264 20) \u2014 accepting")
+                                if _yoloe_confirmed:
+                                    fine_visual_center(robot, _yoloe_session, cat)
                             else:
                                 print(f"  YOLOE: ✗ '{cat}' not detected.")
                     except Exception as e:

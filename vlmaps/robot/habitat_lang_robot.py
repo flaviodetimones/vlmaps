@@ -106,9 +106,14 @@ class HabitatLanguageRobot(LangRobot):
         # scenes (some passages are only ~0.5 m wide = 10 cells; 5-iter
         # bilateral dilation removes the full passage).  3 iterations keeps
         # all real doorways open while still giving adequate wall clearance.
+        # Planning inflation: moderate dilation keeps HSSD doorways (~10 cells)
+        # open while giving adequate clearance (~15 cm/side at cs=0.05 m).
+        # 5 iterations closed narrow passages; 3 is the safe minimum here.
+        # The execution shield uses the RAW map — intentionally different.
+        _PLAN_DILATION_ITERS = 3
         from scipy.ndimage import binary_dilation as _bdilate
         _obs_mask = (cropped_obst_map == 0).astype(bool)
-        _obs_mask_dilated = _bdilate(_obs_mask, iterations=3)
+        _obs_mask_dilated = _bdilate(_obs_mask, iterations=_PLAN_DILATION_ITERS)
         cropped_obst_map_safe = np.where(_obs_mask_dilated, 0, cropped_obst_map).astype(np.uint8)
 
         # Expose the full-map dilated obstacle map for goal-selection functions.
@@ -123,7 +128,9 @@ class HabitatLanguageRobot(LangRobot):
         _safe_full[_rm:_rm + _sh, _cm:_cm + _sw] = cropped_obst_map_safe
         self._safe_obs_map = _safe_full   # full-map, dilated — use for all goal queries
 
-        print(f"[planner] Map source: navmesh-based, dilation=3 iterations")
+        print(f"[planner] planning inflation: {_PLAN_DILATION_ITERS} iterations "
+              f"({_PLAN_DILATION_ITERS * 5} cm/side) — global planner only; "
+              f"execution shield uses raw map")
         print(f"[planner] Navigable cells (dilated map): {int(_safe_full.sum())}")
 
         self.nav.build_visgraph(
