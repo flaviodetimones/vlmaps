@@ -245,10 +245,24 @@ def _insert_narrow_passage_waypoints(
     inserted_flags = [False]
     inserted_count = 0
 
+    # Minimum segment length (cells) to insert a centering waypoint.
+    # Short segments (< MIN_SEG) already have their endpoints close to the bottleneck;
+    # adding an intermediate waypoint just creates more heading corrections.
+    _MIN_SEG_FOR_INSERTION = 10
+
     for i in range(len(path) - 1):
         seg_start = _clip_cell(path[i], dist_map.shape)
         seg_end = _clip_cell(path[i + 1], dist_map.shape)
         cells = _segment_cells(seg_start, seg_end)
+
+        # Skip insertion for short segments — the visgraph vertex is already close
+        # to the bottleneck, so a mid-segment waypoint would only add corrections.
+        if len(cells) < _MIN_SEG_FOR_INSERTION:
+            end_cell = [int(seg_end[0]), int(seg_end[1])]
+            if end_cell != augmented[-1]:
+                augmented.append(end_cell)
+                inserted_flags.append(False)
+            continue
 
         run_start = None
         for idx, cell in enumerate(cells):

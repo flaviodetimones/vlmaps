@@ -655,16 +655,23 @@ def execute_nav_replay(
     # ── Open-space thresholds ─────────────────────────────────────────────
     _STOP_CL      = 1.0   # cells — hard stop on front center
     _SLOW_CL      = 3.0   # cells — low-clearance warning
-    _SIDE_STOP_CL = 1.5   # cells — side-contact limit in open space
+    # _SIDE_STOP_CL: probe at ±_ROBOT_HW from next center (navmesh clearance).
+    # With _ROBOT_HW=5 (≈agent radius), the probe is at the physical edge of the
+    # robot body. 0.5 cells means the body edge is within 0.5 cells of non-navigable
+    # space — any less and the robot would actually contact the wall.
+    _SIDE_STOP_CL = 0.5   # cells — side-contact limit in open space (was 1.5)
 
     # ── Doorway / narrow-passage thresholds ──────────────────────────────
     _DOORWAY_SIDE_TH   = 5.0  # cells — narrow-passage detection threshold
     _DOORWAY_SIDE_EXIT = 6.5  # cells — hysteresis to avoid doorway-mode flicker
     _DOORWAY_FRONT_MIN = 0.5  # cells — minimum front inside doorway mode
     _STOP_CL_DOOR      = 0.5  # cells — relaxed hard stop in doorway
+    _DOORWAY_EXIT_STEPS = 4   # steps — keep doorway mode active after gap widens
 
     # ── Robot footprint half-width for lateral footprint sampling ─────────
-    _ROBOT_HW = 2  # cells (~0.10 m per side at cs=0.05 m)
+    # agent_radius=0.25 m, cs=0.05 m → 5 cells. Probing at ±5 from next center
+    # places the sample point at the real physical edge of the robot body.
+    _ROBOT_HW = 5  # cells (= agent_radius / cs — was 2)
 
     print(f"  [shield] execution thresholds: "
           f"stop={_STOP_CL} slow={_SLOW_CL} side_stop={_SIDE_STOP_CL} | "
@@ -690,7 +697,8 @@ def execute_nav_replay(
     _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
     _FORWARD_HEADING_TOL_OPEN = 10.0
     _FORWARD_HEADING_TOL_TIGHT = 18.0
-    _doorway_mode = False  # updated before each forward step
+    _doorway_mode = False         # updated before each forward step
+    _doorway_exit_countdown = 0  # keeps doorway mode alive N steps after gap widens
     progress_idx = 0
 
     print(f"  [nav] Path follower: {len(follow_path)} polyline waypoint(s), "
@@ -764,7 +772,9 @@ def execute_nav_replay(
             action in ("turn_left", "turn_right")
             and abs(_heading_err) <= _heading_tol
             and _target_dist >= max(1.0, 0.75 * _fwd_cells)
-            and (len(_preview) < 2 or _preview[1] == "move_forward")
+            # Do NOT require _preview[1]=="move_forward": when heading error is
+            # small, forward motion is always preferable regardless of how many
+            # turns the controller would plan after the current one.
         ):
             if i == 0 or i % 20 == 0:
                 print(f"  [nav] Heading deadband: |err|={abs(_heading_err):.1f}° "
@@ -845,12 +855,21 @@ def execute_nav_replay(
                     or min(_cl_left, _cl_right) < _DOORWAY_SIDE_EXIT
                     or _cl_front < _DOORWAY_SIDE_EXIT
                 )
-                _doorway_mode = (
-                    _cl_front > _DOORWAY_FRONT_MIN
-                    and _still_narrow
-                )
+                _geometry_clear = _cl_front > _DOORWAY_FRONT_MIN and _still_narrow
+                if _geometry_clear:
+                    _doorway_mode = True
+                    _doorway_exit_countdown = _DOORWAY_EXIT_STEPS
+                elif _doorway_exit_countdown > 0:
+                    # Gap widened but keep doorway mode active for a few more steps
+                    # so the doorframe corner doesn't trigger the open-space side check.
+                    _doorway_exit_countdown -= 1
+                    _doorway_mode = True
+                else:
+                    _doorway_mode = False
             else:
                 _doorway_mode = _curr_narrow or _next_narrow or _entering_doorway
+                if _doorway_mode:
+                    _doorway_exit_countdown = _DOORWAY_EXIT_STEPS
             if _doorway_mode != _was_doorway:
                 if _doorway_mode:
                     print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: doorway mode ON — "
