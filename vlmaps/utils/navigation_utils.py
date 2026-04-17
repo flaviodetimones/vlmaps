@@ -1,3 +1,5 @@
+import heapq
+
 import numpy as np
 import cv2
 from scipy.spatial.distance import cdist
@@ -372,6 +374,162 @@ def center_path_on_medial_axis(
         )
 
     return centered
+
+
+def _segment_min_clearance(
+    start: Tuple[int, int],
+    end: Tuple[int, int],
+    dist_map: np.ndarray,
+) -> float:
+    """Return the minimum clearance value along the rasterized segment."""
+    cells = _segment_cells(start, end)
+    if not cells:
+        return float("inf")
+    h, w = dist_map.shape
+    min_cl = float("inf")
+    for r, c in cells:
+        cl = float(dist_map[int(np.clip(r, 0, h - 1)), int(np.clip(c, 0, w - 1))])
+        if cl < min_cl:
+            min_cl = cl
+    return min_cl
+
+
+def _shortcut_path_clearance(
+    path: List[List[float]],
+    free_map: np.ndarray,
+    dist_map: np.ndarray,
+    min_shortcut_clearance: float = 1.5,
+) -> List[List[float]]:
+    """Reduce A* path by skipping intermediate waypoints when the direct segment
+    is free and maintains at least *min_shortcut_clearance* raw clearance.
+
+    This converts the dense grid path into a compact polyline while preserving
+    the clearance property of the A* solution.
+    """
+    if len(path) < 3:
+        return [list(p) for p in path]
+
+    result = [list(path[0])]
+    i = 0
+    while i < len(path) - 1:
+        # Scan from the current waypoint toward the end; take the farthest
+        # reachable waypoint with both free line-of-sight and adequate clearance.
+        j = len(path) - 1
+        while j > i + 1:
+            a = _clip_cell(result[-1], dist_map.shape)
+            b = _clip_cell(path[j], dist_map.shape)
+            if (
+                _segment_is_free(a, b, free_map)
+                and _segment_min_clearance(a, b, dist_map) >= min_shortcut_clearance
+            ):
+                break
+            j -= 1
+        result.append(list(path[j]))
+        i = j
+
+    return result
+
+
+def plan_clearance_aware_astar(
+    start: Tuple[int, int],
+    goal: Tuple[int, int],
+    free_map: np.ndarray,
+    dist_map: np.ndarray,
+    clearance_weight: float = 2.0,
+    min_shortcut_clearance: float = 1.5,
+) -> List[List[float]]:
+    """Plan a path from *start* to *goal* that explicitly trades path length
+    for clearance from obstacles.
+
+    Parameters
+    ----------
+    start, goal : (row, col) in cropped-map coordinates.
+    free_map    : 2-D uint8 array — 1=free, 0=obstacle (dilated planning map).
+    dist_map    : 2-D float array — EDT of the RAW obstacle map; gives physical
+                  clearance in cells. High values = far from walls.
+    clearance_weight : λ in the per-cell cost  ``1 + λ/(cl + 0.5)``.
+                  Higher → stronger preference for high-clearance cells.
+    min_shortcut_clearance : minimum clearance preserved during post-A* shortcutting.
+
+    Returns
+    -------
+    Compact list of [row, col] waypoints in cropped-map coordinates.
+    Falls back to [start, goal] if no path is found.
+    """
+    h, w = free_map.shape
+    sr = int(np.clip(round(start[0]), 0, h - 1))
+    sc = int(np.clip(round(start[1]), 0, w - 1))
+    gr = int(np.clip(round(goal[0]),  0, h - 1))
+    gc = int(np.clip(round(goal[1]),  0, w - 1))
+
+    # Snap start / goal to nearest free cell if they land in an obstacle.
+    if not free_map[sr, sc]:
+        snap = _snap_to_nearest_free((sr, sc), free_map, min_clearance=1.0)
+        sr, sc = snap
+    if not free_map[gr, gc]:
+        snap = _snap_to_nearest_free((gr, gc), free_map, min_clearance=2.0)
+        gr, gc = snap
+
+    if (sr, sc) == (gr, gc):
+        return [[sr, sc]]
+
+    # Pre-compute cost map: traversing a cell costs (1 + λ/(cl+0.5)).
+    # Cells with higher clearance are cheaper → A* naturally prefers them.
+    cl_map = dist_map.astype(np.float32)
+    cost_map = (1.0 + clearance_weight / (cl_map + 0.5)).astype(np.float32)
+
+    # 8-connected A* with diagonal step-cost √2.
+    _DIRS = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+    _DIAG = {(-1,-1),(-1,1),(1,-1),(1,1)}
+
+    def heuristic(r: int, c: int) -> float:
+        return float(np.hypot(r - gr, c - gc))
+
+    g_score: dict = {(sr, sc): 0.0}
+    came_from: dict = {}
+    # heap entries: (f, g, row, col)
+    heap = [(heuristic(sr, sc), 0.0, sr, sc)]
+
+    while heap:
+        f, g, r, c = heapq.heappop(heap)
+        if (r, c) == (gr, gc):
+            break
+        if g > g_score.get((r, c), float("inf")) + 1e-9:
+            continue
+        for dr, dc in _DIRS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < h and 0 <= nc < w):
+                continue
+            if not free_map[nr, nc]:
+                continue
+            step = (1.41421356 if (dr, dc) in _DIAG else 1.0)
+            new_g = g + step * float(cost_map[nr, nc])
+            if new_g < g_score.get((nr, nc), float("inf")):
+                g_score[(nr, nc)] = new_g
+                came_from[(nr, nc)] = (r, c)
+                heapq.heappush(heap, (new_g + heuristic(nr, nc), new_g, nr, nc))
+
+    # Reconstruct dense path
+    if (gr, gc) not in came_from and (gr, gc) != (sr, sc):
+        print(f"[astar] WARNING: no path found from {(sr,sc)} to {(gr,gc)} — falling back")
+        return [[sr, sc], [gr, gc]]
+
+    dense: list = []
+    cur = (gr, gc)
+    while cur in came_from:
+        dense.append(list(cur))
+        cur = came_from[cur]
+    dense.append([sr, sc])
+    dense.reverse()
+
+    # Reduce dense path to compact waypoints while preserving clearance.
+    compact = _shortcut_path_clearance(dense, free_map, dist_map, min_shortcut_clearance)
+
+    print(
+        f"[astar] Path: {len(dense)} dense cells → {len(compact)} waypoints "
+        f"(clearance_weight={clearance_weight:.1f})"
+    )
+    return compact
 
 
 def get_segment_islands_pos(segment_map, label_id, detect_internal_contours=False):

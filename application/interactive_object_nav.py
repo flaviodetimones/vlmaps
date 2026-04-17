@@ -651,31 +651,24 @@ def execute_nav_replay(
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
 ) -> bool:
-    """Follow the geometric path polyline with lookahead and a footprint-aware shield."""
-    # ── Open-space thresholds ─────────────────────────────────────────────
-    _STOP_CL      = 1.0   # cells — hard stop on front center
-    _SLOW_CL      = 3.0   # cells — low-clearance warning
-    # _SIDE_STOP_CL: probe at ±_ROBOT_HW from next center (navmesh clearance).
-    # With _ROBOT_HW=5 (≈agent radius), the probe is at the physical edge of the
-    # robot body. 0.5 cells means the body edge is within 0.5 cells of non-navigable
-    # space — any less and the robot would actually contact the wall.
-    _SIDE_STOP_CL = 0.5   # cells — side-contact limit in open space (was 1.5)
+    """Follow the geometric path polyline with lookahead and a minimal safety shield.
 
-    # ── Doorway / narrow-passage thresholds ──────────────────────────────
-    _DOORWAY_SIDE_TH   = 5.0  # cells — narrow-passage detection threshold
-    _DOORWAY_SIDE_EXIT = 6.5  # cells — hysteresis to avoid doorway-mode flicker
-    _DOORWAY_FRONT_MIN = 0.5  # cells — minimum front inside doorway mode
-    _STOP_CL_DOOR      = 0.5  # cells — relaxed hard stop in doorway
-    _DOORWAY_EXIT_STEPS = 4   # steps — keep doorway mode active after gap widens
+    The shield is a last-resort emergency stop only.  Path quality (clearance,
+    centering through doorways) is the responsibility of the clearance-aware A*
+    planner — the follower simply tracks the planned route.
+    """
+    # ── Shield thresholds — emergency stop only ───────────────────────────
+    # With clearance-aware A* the path already avoids obstacles, so the shield
+    # should fire only when the robot is about to physically collide.
+    # _ROBOT_HW = agent_radius / cs = 0.25 / 0.05 = 5 cells: probe at body edge.
+    # _STOP_CL = 0.5 cells: body edge within 0.5 navmesh cells of non-navigable.
+    _STOP_CL  = 0.5   # cells — hard stop, front center
+    _SLOW_CL  = 2.0   # cells — log warning only, no stop
+    _ROBOT_HW = 5     # cells — footprint probe offset (≈ agent radius)
+    _SIDE_STOP_CL = 0.5  # cells — body-edge side contact limit
 
-    # ── Robot footprint half-width for lateral footprint sampling ─────────
-    # agent_radius=0.25 m, cs=0.05 m → 5 cells. Probing at ±5 from next center
-    # places the sample point at the real physical edge of the robot body.
-    _ROBOT_HW = 5  # cells (= agent_radius / cs — was 2)
-
-    print(f"  [shield] execution thresholds: "
-          f"stop={_STOP_CL} slow={_SLOW_CL} side_stop={_SIDE_STOP_CL} | "
-          f"doorway: stop={_STOP_CL_DOOR} side_th={_DOORWAY_SIDE_TH}")
+    print(f"  [shield] thresholds: front_stop={_STOP_CL} side_stop={_SIDE_STOP_CL} "
+          f"ROBOT_HW={_ROBOT_HW} (emergency stop only — path is clearance-aware)")
 
     follow_path = normalize_path_cells(path_cells)
     if not follow_path:
@@ -697,8 +690,6 @@ def execute_nav_replay(
     _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
     _FORWARD_HEADING_TOL_OPEN = 10.0
     _FORWARD_HEADING_TOL_TIGHT = 18.0
-    _doorway_mode = False         # updated before each forward step
-    _doorway_exit_countdown = 0  # keeps doorway mode alive N steps after gap widens
     progress_idx = 0
 
     print(f"  [nav] Path follower: {len(follow_path)} polyline waypoint(s), "
@@ -783,7 +774,9 @@ def execute_nav_replay(
 
         is_fwd = (action == "move_forward")
 
-        # ── Footprint-aware shield — check BEFORE executing forward step ────
+        # ── Safety shield — emergency stop only ──────────────────────────────
+        # The clearance-aware A* planner is responsible for path quality.
+        # The shield only prevents physically impossible steps (body-edge contact).
         if is_fwd and dist_map is not None:
             _r  = float(robot.curr_pos_on_map[0])
             _c  = float(robot.curr_pos_on_map[1])
@@ -791,21 +784,16 @@ def execute_nav_replay(
             _h, _w   = dist_map.shape
 
             # Direction vectors (map: 0°=north=decreasing-row)
-            # forward:  dr=-cos, dc=+sin
-            # left:     CCW 90° of forward → dr=-sin, dc=-cos   (→ (-dc_fwd, dr_fwd))
-            # right:    CW  90° of forward → dr=+sin, dc=+cos   (→ (+dc_fwd, -dr_fwd))
             _dr_fwd   = -np.cos(_ang_rad)
             _dc_fwd   =  np.sin(_ang_rad)
-            _dr_left  = -_dc_fwd    # = -sin
-            _dc_left  =  _dr_fwd    # = -cos
-            _dr_right =  _dc_fwd    # = +sin
-            _dc_right = -_dr_fwd    # = +cos
+            _dr_left  = -_dc_fwd
+            _dc_left  =  _dr_fwd
+            _dr_right =  _dc_fwd
+            _dc_right = -_dr_fwd
 
-            # ── Predicted next front-center ───────────────────────────
+            # Predicted next pose: front-center and body-edge probes.
             _nr = int(np.clip(round(_r + _dr_fwd * _fwd_cells), 0, _h - 1))
             _nc = int(np.clip(round(_c + _dc_fwd * _fwd_cells), 0, _w - 1))
-
-            # ── Front-left / front-right at next pose ─────────────────
             _fl_r = int(np.clip(round(_nr + _dr_left  * _ROBOT_HW), 0, _h - 1))
             _fl_c = int(np.clip(round(_nc + _dc_left  * _ROBOT_HW), 0, _w - 1))
             _fr_r = int(np.clip(round(_nr + _dr_right * _ROBOT_HW), 0, _h - 1))
@@ -816,99 +804,19 @@ def execute_nav_replay(
             _cl_right = float(dist_map[_fr_r, _fr_c])
             _cl_min   = min(_cl_front, _cl_left, _cl_right)
 
-            # ── Side clearances at current pose (perpendicular, 2×HW) ──
-            # Used only for doorway detection, not for blocking.
-            _sl_r = int(np.clip(round(_r + _dr_left  * _ROBOT_HW * 2), 0, _h - 1))
-            _sl_c = int(np.clip(round(_c + _dc_left  * _ROBOT_HW * 2), 0, _w - 1))
-            _sr_r = int(np.clip(round(_r + _dr_right * _ROBOT_HW * 2), 0, _h - 1))
-            _sr_c = int(np.clip(round(_c + _dc_right * _ROBOT_HW * 2), 0, _w - 1))
-            _side_l = float(dist_map[_sl_r, _sl_c])
-            _side_r = float(dist_map[_sr_r, _sr_c])
-
-            # ── Doorway detection ─────────────────────────────────────
-            # Two signals are useful here:
-            # 1) side clearance at current pose (robot already inside a narrow gap)
-            # 2) footprint side clearance at the NEXT pose (robot entering a doorway)
-            #
-            # Using only the current-pose side probes misses doorway entry and the
-            # robot gets blocked one step too early by the open-space lateral rule.
-            _curr_narrow = (
-                min(_side_l, _side_r) < _DOORWAY_SIDE_TH
-                and max(_side_l, _side_r) < _DOORWAY_SIDE_EXIT
-                and _cl_front > _DOORWAY_FRONT_MIN
-            )
-            _next_narrow = (
-                min(_cl_left, _cl_right) < _DOORWAY_SIDE_TH
-                and max(_cl_left, _cl_right) < _DOORWAY_SIDE_EXIT
-                and _cl_front > _DOORWAY_FRONT_MIN
-            )
-            _entering_doorway = (
-                min(_cl_left, _cl_right) < _SIDE_STOP_CL
-                and max(_cl_left, _cl_right) < (_DOORWAY_SIDE_EXIT + 1.5)
-                and _cl_front < _DOORWAY_SIDE_EXIT
-                and _cl_front > _DOORWAY_FRONT_MIN
-            )
-            _was_doorway = _doorway_mode
-            if _doorway_mode:
-                _still_narrow = (
-                    min(_side_l, _side_r) < _DOORWAY_SIDE_EXIT
-                    or min(_cl_left, _cl_right) < _DOORWAY_SIDE_EXIT
-                    or _cl_front < _DOORWAY_SIDE_EXIT
-                )
-                _geometry_clear = _cl_front > _DOORWAY_FRONT_MIN and _still_narrow
-                if _geometry_clear:
-                    _doorway_mode = True
-                    _doorway_exit_countdown = _DOORWAY_EXIT_STEPS
-                elif _doorway_exit_countdown > 0:
-                    # Gap widened but keep doorway mode active for a few more steps
-                    # so the doorframe corner doesn't trigger the open-space side check.
-                    _doorway_exit_countdown -= 1
-                    _doorway_mode = True
-                else:
-                    _doorway_mode = False
-            else:
-                _doorway_mode = _curr_narrow or _next_narrow or _entering_doorway
-                if _doorway_mode:
-                    _doorway_exit_countdown = _DOORWAY_EXIT_STEPS
-            if _doorway_mode != _was_doorway:
-                if _doorway_mode:
-                    print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: doorway mode ON — "
-                          f"curr-sides=({_side_l:.1f}, {_side_r:.1f}) "
-                          f"next-sides=({_cl_left:.1f}, {_cl_right:.1f}) "
-                          f"front={_cl_front:.1f} — switching to cautious doorway traversal")
-                else:
-                    print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: doorway mode OFF")
-
-            # ── Footprint log (always in doorway mode, or when close) ─
-            if _doorway_mode or _cl_min < _SLOW_CL:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"front clearance={_cl_front:.1f} "
-                      f"left clearance={_cl_left:.1f} "
-                      f"right clearance={_cl_right:.1f} "
-                      f"footprint min clearance={_cl_min:.1f} "
-                      f"[doorway mode: {'ON' if _doorway_mode else 'OFF'}]")
-
-            # ── Block / warn ──────────────────────────────────────────
-            _stop_thr  = _STOP_CL_DOOR if _doorway_mode else _STOP_CL
-            _side_thr  = _DOORWAY_FRONT_MIN if _doorway_mode else _SIDE_STOP_CL
-
-            if _cl_front < _stop_thr:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: front clearance={_cl_front:.1f} "
-                      f"< {_stop_thr:.1f} — hard stop")
-                return False
-            if not _doorway_mode and (_cl_left < _side_thr or _cl_right < _side_thr):
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"step blocked by side clearance "
-                      f"(left={_cl_left:.1f} right={_cl_right:.1f} < {_side_thr:.1f})")
-                return False
-            if _doorway_mode and _cl_front < _DOORWAY_FRONT_MIN:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"front clearance={_cl_front:.1f} "
-                      f"< {_DOORWAY_FRONT_MIN:.1f} — blocked in doorway mode")
-                return False
             if _cl_min < _SLOW_CL:
                 print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"continuing in cautious {'doorway' if _doorway_mode else 'close-walls'} mode")
+                      f"front={_cl_front:.1f} left={_cl_left:.1f} right={_cl_right:.1f}")
+
+            if _cl_front < _STOP_CL:
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
+                      f"front={_cl_front:.1f} < {_STOP_CL:.1f} — hard stop")
+                return False
+            if _cl_left < _SIDE_STOP_CL or _cl_right < _SIDE_STOP_CL:
+                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
+                      f"body-edge contact (left={_cl_left:.1f} right={_cl_right:.1f} "
+                      f"< {_SIDE_STOP_CL:.1f}) — hard stop")
+                return False
 
         if is_fwd:
             pre_xyz = _agent_xyz(robot)
