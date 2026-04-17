@@ -942,9 +942,11 @@ def select_best_candidate(
     query_priors: dict,
     tried_centroids: set,
     *,
+    robot_pos=None,
     local_min_quality: float = 0.25,
     switch_margin: float = 0.40,
     same_room_bonus: float = 0.35,
+    proximity_weight: float = 0.3,
 ) -> dict:
     """Task 1 — current-compatible-room-first candidate selection.
 
@@ -956,15 +958,20 @@ def select_best_candidate(
          clearly outscores the best local one (margin > switch_margin).
       3. Falls back to global best if current room is not compatible or has no
          viable local candidates.
+      4. Among candidates with similar quality, prefer the nearest one to the
+         robot (proximity_weight controls the trade-off).
 
     Args:
         kept_components:  list of component dicts (quality-sorted, best first).
         current_room:     room instance the robot is currently in.
         query_priors:     {room: normalised_prior} from Phase C.
         tried_centroids:  set of (int_r, int_c) already inspected this query.
+        robot_pos:        (row, col) current robot position on map; if provided,
+                          nearer candidates are boosted.
         local_min_quality: minimum quality for a local candidate to be accepted.
         switch_margin:    external must beat local by this fraction to trigger switch.
         same_room_bonus:  additive quality bonus applied to local candidates.
+        proximity_weight: weight for the proximity bonus (0 = ignore distance).
 
     Returns:
         The selected component dict.
@@ -973,6 +980,30 @@ def select_best_candidate(
 
     if not kept_components:
         return None
+
+    # ── Proximity-adjusted ranking ──────────────────────────────────────────
+    # Compute effective_quality = quality + proximity_weight * (1 - norm_dist)
+    # so that among similar-quality candidates the nearest one wins.
+    if robot_pos is not None and proximity_weight > 0:
+        _rr, _rc = float(robot_pos[0]), float(robot_pos[1])
+        _dists = []
+        for c in kept_components:
+            cr, cc = c["centroid"]
+            _dists.append(np.sqrt((cr - _rr)**2 + (cc - _rc)**2))
+        _max_dist = max(_dists) if _dists else 1.0
+        _max_dist = max(_max_dist, 1.0)  # avoid div-by-zero
+        for c, d in zip(kept_components, _dists):
+            c["_proximity_bonus"] = proximity_weight * (1.0 - d / _max_dist)
+            c["_effective_quality"] = c["quality"] + c["_proximity_bonus"]
+        # Re-sort by effective quality
+        kept_components = sorted(kept_components, key=lambda x: -x["_effective_quality"])
+        print(f"  [candidate] Proximity ranking (top 3): "
+              + ", ".join(
+                  f"q={c['quality']:.3f}+prox={c.get('_proximity_bonus',0):.3f}"
+                  f"→{c.get('_effective_quality', c['quality']):.3f} "
+                  f"d={d:.0f}"
+                  for c, d in list(zip(kept_components, sorted(_dists)))[:3]
+              ))
 
     # Separate tried vs untried
     def _is_tried(comp):
@@ -1014,24 +1045,25 @@ def select_best_candidate(
     best_ext = external_untried[0] if external_untried else None
 
     # Apply same-room bonus to local score
-    local_effective = best_local["quality"] + same_room_bonus
-    ext_quality = best_ext["quality"] if best_ext else 0.0
+    _local_q = best_local.get("_effective_quality", best_local["quality"])
+    local_effective = _local_q + same_room_bonus
+    _ext_q = best_ext.get("_effective_quality", best_ext["quality"]) if best_ext else 0.0
 
-    print(f"  [room-gate] Best local quality: {best_local['quality']:.3f} "
+    print(f"  [room-gate] Best local quality: {_local_q:.3f} "
           f"(+bonus → {local_effective:.3f})")
     if best_ext:
-        print(f"  [room-gate] Best external quality: {ext_quality:.3f}")
+        print(f"  [room-gate] Best external quality: {_ext_q:.3f}")
 
     # Gate 1: local candidate too weak even with bonus
     if best_local["quality"] < local_min_quality:
-        if best_ext and ext_quality > local_effective:
+        if best_ext and _ext_q > local_effective:
             print(f"  [room-gate] Switch allowed: True (local quality {best_local['quality']:.3f} < threshold {local_min_quality})")
             return untried[0]
 
     # Gate 2: external must clearly beat boosted local to trigger switch
-    if best_ext and ext_quality > local_effective * (1.0 + switch_margin):
+    if best_ext and _ext_q > local_effective * (1.0 + switch_margin):
         print(f"  [room-gate] Switch allowed: True "
-              f"(external {ext_quality:.3f} >> local {local_effective:.3f})")
+              f"(external {_ext_q:.3f} >> local {local_effective:.3f})")
         return untried[0]
 
     print(f"  [room-gate] Switch allowed: False "
@@ -1300,25 +1332,38 @@ def find_reachable_room_goal(
         return []
 
     dist_map = distance_transform_edt(obs_map)
+    # Room-interior depth: how far each cell is from the room boundary.
+    # This prevents picking goals right at the room edge where the robot
+    # might end up classified in the adjacent room.
+    room_depth_map = distance_transform_edt(room_mask)
     rows, cols = np.where(navigable_room)
     clearances = dist_map[rows, cols]
+    room_depths = room_depth_map[rows, cols]
 
-    # Sort by clearance descending
-    sorted_idx = np.argsort(-clearances)
+    # Combined score: obstacle clearance + room depth bonus.
+    # Room depth is weighted so goals deep inside the room are preferred
+    # over boundary cells, even if boundary cells have slightly higher clearance.
+    _ROOM_DEPTH_WEIGHT = 0.5
+    combined = clearances + _ROOM_DEPTH_WEIGHT * room_depths
+
+    # Sort by combined score descending
+    sorted_idx = np.argsort(-combined)
 
     candidates = []
     for i in sorted_idx:
         cl = float(clearances[i])
+        rd = float(room_depths[i])
         r, c = int(rows[i]), int(cols[i])
         # Always include at least one candidate even if clearance is low
-        if cl >= min_clearance or not candidates:
+        if (cl >= min_clearance and rd >= 2.0) or not candidates:
             candidates.append([r, c])
         if len(candidates) >= top_k:
             break
 
     best_cl = float(clearances[sorted_idx[0]]) if len(sorted_idx) > 0 else 0.0
+    best_rd = float(room_depths[sorted_idx[0]]) if len(sorted_idx) > 0 else 0.0
     print(f"  [room-goal] Found {len(candidates)} safe goal(s) in '{target_room}' "
-          f"(best clearance: {best_cl:.1f} cells)")
+          f"(best clearance: {best_cl:.1f} cells, room depth: {best_rd:.1f} cells)")
     return candidates
 
 
@@ -1603,11 +1648,13 @@ def main(config: DictConfig) -> None:
                 _tried = getattr(_ss, "_tried_centroids", set()) if _ss else set()
                 _query_priors = {r: rs.target_relevance for r, rs in _ss.rooms.items()} if _ss else {}
 
+                _robot_rc_sel = [robot.curr_pos_on_map[0], robot.curr_pos_on_map[1]]
                 best_comp = select_best_candidate(
                     kept_components,
                     current_room,
                     _query_priors,
                     _tried,
+                    robot_pos=_robot_rc_sel,
                 )
                 if best_comp is None:
                     print(f"  [skip] No viable candidate for '{cat}'.")
