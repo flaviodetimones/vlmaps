@@ -651,24 +651,15 @@ def execute_nav_replay(
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
 ) -> bool:
-    """Follow the geometric path polyline with lookahead and a minimal safety shield.
+    """Follow the geometric path polyline with lookahead.
 
-    The shield is a last-resort emergency stop only.  Path quality (clearance,
-    centering through doorways) is the responsibility of the clearance-aware A*
-    planner — the follower simply tracks the planned route.
+    No pre-step shield — Habitat's navmesh handles collisions natively
+    (sliding along obstacles).  The follower detects actual stuck conditions
+    via displacement monitoring and aborts if the robot makes no real progress.
     """
-    # ── Shield thresholds — emergency stop only ───────────────────────────
-    # With clearance-aware A* the path already avoids obstacles, so the shield
-    # should fire only when the robot is about to physically collide.
-    # _ROBOT_HW = agent_radius / cs = 0.25 / 0.05 = 5 cells: probe at body edge.
-    # _STOP_CL = 0.5 cells: body edge within 0.5 navmesh cells of non-navigable.
-    _STOP_CL  = 0.5   # cells — hard stop, front center
-    _SLOW_CL  = 2.0   # cells — log warning only, no stop
-    _ROBOT_HW = 5     # cells — footprint probe offset (≈ agent radius)
-    _SIDE_STOP_CL = 0.5  # cells — body-edge side contact limit
+    _STALL_STEPS = max(10, stuck_threshold * 3)
 
-    print(f"  [shield] thresholds: front_stop={_STOP_CL} side_stop={_SIDE_STOP_CL} "
-          f"ROBOT_HW={_ROBOT_HW} (emergency stop only — path is clearance-aware)")
+    print(f"  [nav] No pre-step shield — using Habitat navmesh collision")
 
     follow_path = normalize_path_cells(path_cells)
     if not follow_path:
@@ -690,7 +681,13 @@ def execute_nav_replay(
     _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
     _FORWARD_HEADING_TOL_OPEN = 10.0
     _FORWARD_HEADING_TOL_TIGHT = 18.0
+    _STALL_HEADING_EPS = max(2.5, float(robot.turn_angle) * 0.5)
     progress_idx = 0
+    last_progress_idx = -1
+    last_cell = None
+    last_heading = None
+    stall_count = 0
+    preview_stall_count = 0
 
     print(f"  [nav] Path follower: {len(follow_path)} polyline waypoint(s), "
           f"{len(dense_path)} dense display cell(s), "
@@ -699,7 +696,27 @@ def execute_nav_replay(
     for i in range(_MAX_FOLLOW_STEPS):
         robot._set_nav_curr_pose()
         _curr_cell = [int(round(robot.curr_pos_on_map[0])), int(round(robot.curr_pos_on_map[1]))]
+        _curr_heading = float(robot.curr_ang_deg_on_map)
         progress_idx = _closest_path_index(_curr_cell, follow_path, progress_idx)
+        _heading_changed = (
+            last_heading is None
+            or abs(_normalize_turn_error(_curr_heading - last_heading)) > _STALL_HEADING_EPS
+        )
+        if (
+            last_cell == tuple(_curr_cell)
+            and progress_idx <= last_progress_idx
+            and not _heading_changed
+        ):
+            stall_count += 1
+            if stall_count >= _STALL_STEPS:
+                print(f"  [nav] No progress for {stall_count} steps at cell {_curr_cell} "
+                      f"(progress={progress_idx}) — aborting early")
+                return False
+        else:
+            stall_count = 0
+            last_cell = tuple(_curr_cell)
+            last_progress_idx = progress_idx
+            last_heading = _curr_heading
 
         _goal_dr = float(goal_cell[0]) - float(_curr_cell[0])
         _goal_dc = float(goal_cell[1]) - float(_curr_cell[1])
@@ -741,6 +758,11 @@ def execute_nav_replay(
 
         if not _preview:
             if target_idx < len(follow_path) - 1:
+                preview_stall_count += 1
+                if preview_stall_count >= _STALL_STEPS:
+                    print(f"  [nav] Preview produced no action for {preview_stall_count} steps "
+                          f"at progress={progress_idx} target={target_idx} — aborting")
+                    return False
                 progress_idx = min(progress_idx + 1, len(follow_path) - 1)
                 continue
             if _goal_dist <= _GOAL_REACHED_TOL + _fwd_cells:
@@ -750,6 +772,7 @@ def execute_nav_replay(
             _preview = robot.controller.convert_goal_to_actions(_curr_pose, goal_cell)
             if not _preview:
                 return True
+        preview_stall_count = 0
 
         if preferred_idx != target_idx and (i == 0 or i % 20 == 0):
             print(f"  [nav] Lookahead clipped by local visibility: "
@@ -773,50 +796,6 @@ def execute_nav_replay(
             action = "move_forward"
 
         is_fwd = (action == "move_forward")
-
-        # ── Safety shield — emergency stop only ──────────────────────────────
-        # The clearance-aware A* planner is responsible for path quality.
-        # The shield only prevents physically impossible steps (body-edge contact).
-        if is_fwd and dist_map is not None:
-            _r  = float(robot.curr_pos_on_map[0])
-            _c  = float(robot.curr_pos_on_map[1])
-            _ang_rad = float(robot.curr_ang_deg_on_map) * np.pi / 180.0
-            _h, _w   = dist_map.shape
-
-            # Direction vectors (map: 0°=north=decreasing-row)
-            _dr_fwd   = -np.cos(_ang_rad)
-            _dc_fwd   =  np.sin(_ang_rad)
-            _dr_left  = -_dc_fwd
-            _dc_left  =  _dr_fwd
-            _dr_right =  _dc_fwd
-            _dc_right = -_dr_fwd
-
-            # Predicted next pose: front-center and body-edge probes.
-            _nr = int(np.clip(round(_r + _dr_fwd * _fwd_cells), 0, _h - 1))
-            _nc = int(np.clip(round(_c + _dc_fwd * _fwd_cells), 0, _w - 1))
-            _fl_r = int(np.clip(round(_nr + _dr_left  * _ROBOT_HW), 0, _h - 1))
-            _fl_c = int(np.clip(round(_nc + _dc_left  * _ROBOT_HW), 0, _w - 1))
-            _fr_r = int(np.clip(round(_nr + _dr_right * _ROBOT_HW), 0, _h - 1))
-            _fr_c = int(np.clip(round(_nc + _dc_right * _ROBOT_HW), 0, _w - 1))
-
-            _cl_front = float(dist_map[_nr,   _nc  ])
-            _cl_left  = float(dist_map[_fl_r, _fl_c])
-            _cl_right = float(dist_map[_fr_r, _fr_c])
-            _cl_min   = min(_cl_front, _cl_left, _cl_right)
-
-            if _cl_min < _SLOW_CL:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"front={_cl_front:.1f} left={_cl_left:.1f} right={_cl_right:.1f}")
-
-            if _cl_front < _STOP_CL:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"front={_cl_front:.1f} < {_STOP_CL:.1f} — hard stop")
-                return False
-            if _cl_left < _SIDE_STOP_CL or _cl_right < _SIDE_STOP_CL:
-                print(f"  [shield] Step {i+1}/{_MAX_FOLLOW_STEPS}: "
-                      f"body-edge contact (left={_cl_left:.1f} right={_cl_right:.1f} "
-                      f"< {_SIDE_STOP_CL:.1f}) — hard stop")
-                return False
 
         if is_fwd:
             pre_xyz = _agent_xyz(robot)

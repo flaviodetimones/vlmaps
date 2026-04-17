@@ -62,8 +62,22 @@ class Navigator:
             free_map=self.obs_map,
             dist_map=self.raw_dist_map,
             clearance_weight=2.0,
-            min_shortcut_clearance=1.5,
+            min_shortcut_clearance=3.0,
         )
+        if paths:
+            path_cls = [
+                float(
+                    self.raw_dist_map[
+                        int(np.clip(p[0], 0, self.raw_dist_map.shape[0] - 1)),
+                        int(np.clip(p[1], 0, self.raw_dist_map.shape[1] - 1)),
+                    ]
+                )
+                for p in paths
+            ]
+            print(
+                f"[navigator] Path clearances: min={min(path_cls):.1f} "
+                f"mean={float(np.mean(path_cls)):.1f} waypoints={len(paths)}"
+            )
         paths = self.shift_path(paths, self.rowmin, self.colmin)
         return paths
 
