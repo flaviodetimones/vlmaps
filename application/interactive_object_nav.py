@@ -24,6 +24,7 @@ from collections import deque
 from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
+from typing import Optional, Tuple
 from vlmaps.utils.search_state import SearchState
 
 # Milliseconds to wait after each discrete sim step for demo playback.
@@ -45,6 +46,7 @@ from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 _closed_windows: set = set()
 _shown_windows: set = set()   # windows that have been successfully shown at least once
 _frozen_detection_bgr = None  # frozen YOLOE frame shown until next search
+_frozen_target_cell = None    # last confirmed map target marker
 
 
 def safe_imshow(name: str, img: np.ndarray) -> None:
@@ -253,7 +255,8 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
              path_cells: list = None, label: str = "",
-             zoom_radius: int = 300, output_px: int = 700):
+             zoom_radius: int = 300, output_px: int = 700,
+             target_cell: list = None):
     """Display a top-down semantic map with optional zoom centered on the robot.
 
     Args:
@@ -304,6 +307,17 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
     robot_c = col - c0
     cv2.circle(canvas_bgr, (robot_c, robot_r), 5, (0, 255, 0), -1)
     cv2.circle(canvas_bgr, (robot_c, robot_r), 7, (255, 255, 255), 1)
+
+    # ── Frozen / explicit target marker ──────────────────────────────────────
+    global _frozen_target_cell
+    marker = target_cell if target_cell is not None else _frozen_target_cell
+    if marker is not None:
+        mr = int(marker[0]) - r0
+        mc = int(marker[1]) - c0
+        if 0 <= mr < (r1 - r0) and 0 <= mc < (c1 - c0):
+            cv2.circle(canvas_bgr, (mc, mr), 7, (0, 215, 255), 2)
+            cv2.drawMarker(canvas_bgr, (mc, mr), (0, 215, 255),
+                           markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2)
 
     # ── Label ─────────────────────────────────────────────────────────────────
     if label:
@@ -513,6 +527,7 @@ def scan_360_and_verify(
 
     Returns True if YOLOE detects the object during the scan.
     """
+    global _frozen_detection_bgr
     from vlmaps.utils.yoloe_utils import get_session
 
     session = get_session(cat, conf_thresh=0.3)
@@ -1027,6 +1042,15 @@ def fine_visual_center(
     return detected_once
 
 
+def freeze_found_target(cat: str, ann_frame_rgb, target_cell) -> None:
+    """Persist the last positive YOLOE result in both the RGB and map views."""
+    global _frozen_detection_bgr, _frozen_target_cell
+    if ann_frame_rgb is not None:
+        _frozen_detection_bgr = cv2.cvtColor(ann_frame_rgb, cv2.COLOR_RGB2BGR)
+    if target_cell is not None:
+        _frozen_target_cell = [int(target_cell[0]), int(target_cell[1])]
+
+
 def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20):
     """Return the nearest free grid cell to *cell* inside *free_map*."""
     if free_map is None:
@@ -1201,6 +1225,8 @@ def select_best_candidate(
     tried_centroids: set,
     *,
     robot_pos=None,
+    enable_room_gate: bool = True,
+    prefer_nearest_only: bool = False,
     local_min_quality: float = 0.25,
     switch_margin: float = 0.40,
     same_room_bonus: float = 0.35,
@@ -1242,26 +1268,29 @@ def select_best_candidate(
     # ── Proximity-adjusted ranking ──────────────────────────────────────────
     # Compute effective_quality = quality + proximity_weight * (1 - norm_dist)
     # so that among similar-quality candidates the nearest one wins.
-    if robot_pos is not None and proximity_weight > 0:
+    if robot_pos is not None:
         _rr, _rc = float(robot_pos[0]), float(robot_pos[1])
         _dists = []
         for c in kept_components:
             cr, cc = c["centroid"]
-            _dists.append(np.sqrt((cr - _rr)**2 + (cc - _rc)**2))
-        _max_dist = max(_dists) if _dists else 1.0
-        _max_dist = max(_max_dist, 1.0)  # avoid div-by-zero
+            _dists.append(float(np.sqrt((cr - _rr)**2 + (cc - _rc)**2)))
         for c, d in zip(kept_components, _dists):
-            c["_proximity_bonus"] = proximity_weight * (1.0 - d / _max_dist)
-            c["_effective_quality"] = c["quality"] + c["_proximity_bonus"]
-        # Re-sort by effective quality
-        kept_components = sorted(kept_components, key=lambda x: -x["_effective_quality"])
-        print(f"  [candidate] Proximity ranking (top 3): "
-              + ", ".join(
-                  f"q={c['quality']:.3f}+prox={c.get('_proximity_bonus',0):.3f}"
-                  f"→{c.get('_effective_quality', c['quality']):.3f} "
-                  f"d={d:.0f}"
-                  for c, d in list(zip(kept_components, sorted(_dists)))[:3]
-              ))
+            c["_distance_to_robot"] = d
+
+        if proximity_weight > 0:
+            _max_dist = max(_dists) if _dists else 1.0
+            _max_dist = max(_max_dist, 1.0)  # avoid div-by-zero
+            for c, d in zip(kept_components, _dists):
+                c["_proximity_bonus"] = proximity_weight * (1.0 - d / _max_dist)
+                c["_effective_quality"] = c["quality"] + c["_proximity_bonus"]
+            kept_components = sorted(kept_components, key=lambda x: -x["_effective_quality"])
+            print(f"  [candidate] Proximity ranking (top 3): "
+                  + ", ".join(
+                      f"q={c['quality']:.3f}+prox={c.get('_proximity_bonus',0):.3f}"
+                      f"→{c.get('_effective_quality', c['quality']):.3f} "
+                      f"d={c.get('_distance_to_robot', 0):.0f}"
+                      for c in kept_components[:3]
+                  ))
 
     # Separate tried vs untried
     def _is_tried(comp):
@@ -1273,7 +1302,22 @@ def select_best_candidate(
         # All tried — fall back to global best untried (might be empty)
         return kept_components[0]
 
-    if not current_room or not query_priors:
+    if prefer_nearest_only:
+        if robot_pos is None:
+            return untried[0]
+        nearest = sorted(
+            untried,
+            key=lambda c: (
+                c.get("_distance_to_robot", float("inf")),
+                -c.get("_effective_quality", c["quality"]),
+            ),
+        )[0]
+        print(f"  [candidate] Direct furniture mode — picking nearest candidate "
+              f"(d={nearest.get('_distance_to_robot', float('nan')):.1f}, "
+              f"q={nearest.get('_effective_quality', nearest['quality']):.3f})")
+        return nearest
+
+    if not enable_room_gate or not current_room or not query_priors:
         return untried[0]
 
     current_type = canonical_room_type(current_room)
@@ -1374,6 +1418,8 @@ def select_safe_goal_from_path(
     path_cells: list,
     heatmap: np.ndarray,
     obs_map: np.ndarray,
+    room_provider=None,
+    required_room: str = None,
     min_dist_cells: float = 10.0,
     max_dist_cells: float = 24.0,
     clearance_cells: float = 5.0,   # Task 2: raised from 3.0 → 5.0 (25 cm)
@@ -1413,6 +1459,10 @@ def select_safe_goal_from_path(
     candidates = []
     for cell in dense_path:
         row, col = int(cell[0]), int(cell[1])
+        if required_room and room_provider is not None:
+            _room_here = room_provider.get_room_at_cell(row, col)
+            if _room_here != required_room:
+                continue
         dr = row - obj_row
         dc = col - obj_col
         dist = float(np.sqrt(dr * dr + dc * dc))
@@ -1432,6 +1482,10 @@ def select_safe_goal_from_path(
     soft_candidates = []
     for cell in dense_path:
         row, col = int(cell[0]), int(cell[1])
+        if required_room and room_provider is not None:
+            _room_here = room_provider.get_room_at_cell(row, col)
+            if _room_here != required_room:
+                continue
         dr = row - obj_row
         dc = col - obj_col
         dist = float(np.sqrt(dr * dr + dc * dc))
@@ -1455,6 +1509,8 @@ def find_safe_candidate_approach_goals(
     component_centroid,
     safe_obs_map: np.ndarray,
     robot_pos=None,
+    room_provider=None,
+    required_room: str = None,
     min_dist: float = 8.0,
     max_dist: float = 25.0,
     min_clearance: float = 3.0,
@@ -1504,8 +1560,14 @@ def find_safe_candidate_approach_goals(
                 continue
             if safe_obs_map[row, col] == 0:
                 continue
+            if required_room and room_provider is not None:
+                _room_here = room_provider.get_room_at_cell(row, col)
+                if _room_here != required_room:
+                    continue
             cl = float(dist_map[row, col])
             if cl < min_clearance:
+                continue
+            if not _segment_is_free_on_map([row, col], [cr, cc], safe_obs_map):
                 continue
             candidates.append((row, col, cl))
 
@@ -1635,6 +1697,60 @@ def find_reachable_room_goal(
     return candidates
 
 
+def navigate_to_room_stage(
+    robot,
+    room_name: str,
+    room_provider,
+    rgb_map_2d: np.ndarray,
+    obs_map: np.ndarray,
+    *,
+    label_prefix: str = "Room stage",
+) -> Tuple[bool, Optional[str]]:
+    """Move to a safe interior goal of *room_name* before candidate inspection."""
+    if room_provider is None or not room_provider.is_available():
+        return False, None
+
+    safe_goals = find_reachable_room_goal(room_name, room_provider, obs_map)
+    if not safe_goals:
+        print(f"  [room-stage] No safe interior goals found for '{room_name}'.")
+        return False, None
+
+    stage_goal = safe_goals[0]
+    _, stage_actions = robot.plan_path_only(stage_goal)
+    stage_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+    stage_cells = densify_path_cells(stage_polyline)
+    stage_steps = len(stage_actions)
+
+    print(f"  [room-stage] Moving to room '{room_name}' via {stage_goal} "
+          f"({len(stage_polyline)} waypoint(s), {len(stage_cells)} dense cell(s), "
+          f"preview={stage_steps} actions)")
+    show_map(robot, rgb_map_2d, path_cells=stage_cells,
+             label=f"{label_prefix}: {room_name}")
+    cv2.waitKey(300)
+
+    if stage_steps == 0:
+        stage_ok = True
+    else:
+        stage_ok = execute_nav_replay(
+            robot,
+            stage_actions,
+            room_name,
+            rgb_map_2d,
+            None,
+            stage_polyline,
+            display_path_cells=stage_cells,
+            dist_map=distance_transform_edt(robot.map.obstacles_map),
+            goal_reached_tol_cells=1.0,
+        )
+
+    robot._set_nav_curr_pose()
+    arrived_room = room_provider.get_room_at_cell(
+        int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+    )
+    print(f"  [room-stage] Actual room after staging: {arrived_room or 'unknown'}")
+    return stage_ok, arrived_room
+
+
 def _room_instance_matches(actual_room, target_room: str) -> bool:
     """Return True if actual_room satisfies the target_room navigation command.
 
@@ -1693,6 +1809,7 @@ def find_best_start_pose(robot):
     config_name="object_goal_navigation_cfg.yaml",
 )
 def main(config: DictConfig) -> None:
+    global _frozen_detection_bgr, _frozen_target_cell
     # ── Setup ────────────────────────────────────────────────────────────────
     robot = HabitatLanguageRobot(config)
     robot.setup_scene(config.scene_id)
@@ -1801,6 +1918,7 @@ def main(config: DictConfig) -> None:
             if not cat:
                 continue
             _frozen_detection_bgr = None  # clear previous detection freeze
+            _frozen_target_cell = None
             _ss = _search_states.get(cat)
             print(f"\nPlanning path to: {cat}")
 
@@ -1859,6 +1977,10 @@ def main(config: DictConfig) -> None:
                 heatmap, kept_components = compute_heatmap(robot, cat)
                 _heatmap_ev = {}
                 _selected_room = None
+                _present_set = {c.lower() for c in _present_categories}
+                _direct_query_mode = (
+                    len(categories) == 1 and cat.lower() in _present_set
+                )
 
                 # Annotate each component with its room
                 if _room_provider and _room_provider.is_available():
@@ -1898,7 +2020,7 @@ def main(config: DictConfig) -> None:
                           f"{ ', '.join(f'{r}={v:.2f}' for r, v in _np_sorted[:6] if v > 0.01) }")
 
                 # ── Phase D: choose the room first, then inspect candidates inside it ──
-                if _ss and kept_components and _ss.rooms:
+                if _ss and kept_components and _ss.rooms and not _direct_query_mode:
                     robot._set_nav_curr_pose()
                     _robot_rc_room = [robot.curr_pos_on_map[0], robot.curr_pos_on_map[1]]
                     _selected_room, _room_scores = select_best_room(
@@ -1918,6 +2040,25 @@ def main(config: DictConfig) -> None:
                         else:
                             print(f"  [room-select] Chosen room '{_selected_room}' has no direct "
                                   f"candidates — falling back to global ranking")
+                elif _direct_query_mode:
+                    print(f"  [room-select] Direct furniture query for '{cat}' "
+                          f"— room selector disabled, nearest candidate policy active")
+
+                if _selected_room and current_room != _selected_room:
+                    _safe_map_for_rooms = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+                    _stage_ok, _stage_room = navigate_to_room_stage(
+                        robot,
+                        _selected_room,
+                        _room_provider,
+                        rgb_map_2d,
+                        _safe_map_for_rooms,
+                    )
+                    current_room = _stage_room
+                    if _ss:
+                        _ss.update_current_room(current_room)
+                    if not _stage_ok:
+                        print(f"  [room-stage] Warning: staging move toward '{_selected_room}' "
+                              f"did not complete cleanly; continuing with candidate approach.")
 
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
                 cv2.waitKey(200)
@@ -1947,6 +2088,8 @@ def main(config: DictConfig) -> None:
                     _query_priors,
                     _tried,
                     robot_pos=_robot_rc_sel,
+                    enable_room_gate=not _direct_query_mode,
+                    prefer_nearest_only=_direct_query_mode,
                 )
                 if best_comp is None:
                     print(f"  [skip] No viable candidate for '{cat}'.")
@@ -1966,6 +2109,8 @@ def main(config: DictConfig) -> None:
                 _approach_goals = find_safe_candidate_approach_goals(
                     obj_centroid, _safe_map,
                     robot_pos=_robot_rc,
+                    room_provider=_room_provider,
+                    required_room=best_comp.get("room"),
                     min_dist=8.0, max_dist=25.0, min_clearance=3.0,
                 )
                 if _approach_goals:
@@ -1977,7 +2122,9 @@ def main(config: DictConfig) -> None:
                     print(f"  [approach] No annulus goals found — falling back to path walk")
                     _initial_path, _ = robot.plan_path_only(obj_centroid)
                     goal_pos, obj_centroid = select_safe_goal_from_path(
-                        _initial_path, heatmap, robot.map.obstacles_map
+                        _initial_path, heatmap, robot.map.obstacles_map,
+                        room_provider=_room_provider,
+                        required_room=best_comp.get("room"),
                     )
                     print(f"  Fallback path-based goal: {goal_pos}")
 
@@ -2049,6 +2196,8 @@ def main(config: DictConfig) -> None:
                         _nc_app = find_safe_candidate_approach_goals(
                             _nc_cen, _safe_map,
                             robot_pos=_robot_rc,
+                            room_provider=_room_provider,
+                            required_room=_nc.get("room"),
                             min_dist=8.0, max_dist=25.0, min_clearance=3.0,
                         )
                         if _nc_app:
@@ -2056,7 +2205,9 @@ def main(config: DictConfig) -> None:
                         else:
                             _nc_init, _ = robot.plan_path_only(_nc_cen)
                             _nc_goal, _nc_cen = select_safe_goal_from_path(
-                                _nc_init, heatmap, robot.map.obstacles_map
+                                _nc_init, heatmap, robot.map.obstacles_map,
+                                room_provider=_room_provider,
+                                required_room=_nc.get("room"),
                             )
                         _, _nc_acts = robot.plan_path_only(_nc_goal)
                         _nc_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
@@ -2169,8 +2320,7 @@ def main(config: DictConfig) -> None:
                             show_obs(robot, f"YOLOE arrival: {cat}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
                             print(f"  YOLOE stage 0: ✓ Found '{cat}' at arrival (no rotation needed)!")
-                            if _ann_frame is not None:
-                                _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                            freeze_found_target(cat, _ann_frame, obj_centroid)
                             # Fix 4: room-entry gate — reject if robot hasn't crossed doorway
                             _s0_comp_room = best_comp.get("room") if best_comp is not None else None
                             if (_s0_comp_room and _room_provider
@@ -2228,8 +2378,7 @@ def main(config: DictConfig) -> None:
                                 show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
-                                if _ann_frame is not None:
-                                    _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                                freeze_found_target(cat, _ann_frame, obj_centroid)
                                 # Fix 4: room-entry gate for Stage 1
                                 _s1_comp_room = best_comp.get("room") if best_comp is not None else None
                                 if (_s1_comp_room and _room_provider
@@ -2290,8 +2439,7 @@ def main(config: DictConfig) -> None:
                                 show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
-                                if _ann_frame is not None:
-                                    _frozen_detection_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
+                                freeze_found_target(cat, _ann_frame, obj_centroid)
                                 fine_visual_center(robot, _yoloe_session, cat)
                             else:
                                 print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
@@ -2314,6 +2462,12 @@ def main(config: DictConfig) -> None:
                 if _yoloe_confirmed:
                     _ss.record_object_seen(_end_room, cat)
                     _ss.mark_found(_end_room)
+
+            if _yoloe_confirmed:
+                show_obs(robot, f"FOUND: {cat}")
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         path_cells=path_cells, label=f"FOUND: {cat}",
+                         target_cell=_frozen_target_cell)
 
             print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
 
