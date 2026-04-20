@@ -25,9 +25,10 @@ from pathlib import Path
 from scipy.ndimage import distance_transform_edt
 from vlmaps.utils.search_state import SearchState
 
-# Milliseconds to wait after each discrete sim step for smooth demo playback.
-# Increase for slower, more visible movements; decrease to speed up.
-_NAV_STEP_DELAY_MS: int = 80
+# Milliseconds to wait after each discrete sim step for demo playback.
+# Keep this low and throttle heavy redraws separately so the UI stays fluid.
+_NAV_STEP_DELAY_MS: int = 1
+_MAP_REFRESH_STRIDE: int = 2
 
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
 from vlmaps.utils.llm_utils import parse_object_goal_instruction
@@ -179,15 +180,15 @@ def postprocess_heatmap(
     best_score = max(c["score"] for c in components)
     kept = [c for c in components if c["score"] >= keep_ratio * best_score]
 
-    # Paso B — region quality: 0.3·norm_area + 0.4·mean_score + 0.3·density
+    # Region quality: favour semantically strong regions with real spatial support.
+    # Tiny high-density blobs should not beat a large sofa-sized region.
     max_area = max(c["area"] for c in kept) if kept else 1
+    max_sum = max(c["sum_val"] for c in kept) if kept else 1.0
     for c in kept:
         norm_area = c["area"] / max_area
         mean_score = c["mean_val"]
-        bx, by, bw, bh = c["bbox"]
-        bbox_area = bw * bh
-        density = c["area"] / bbox_area if bbox_area > 0 else 0.0
-        c["quality"] = 0.3 * norm_area + 0.4 * mean_score + 0.3 * density
+        norm_sum = c["sum_val"] / max_sum if max_sum > 1e-6 else 0.0
+        c["quality"] = 0.20 * norm_area + 0.35 * mean_score + 0.45 * norm_sum
 
     kept.sort(key=lambda c: c["quality"], reverse=True)
 
@@ -414,6 +415,11 @@ def _lookahead_path_index(dense_path: list, start_idx: int, lookahead_cells: flo
     return target_idx
 
 
+def _path_cell_distance(a, b) -> float:
+    """Euclidean distance between two grid cells."""
+    return float(np.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1])))
+
+
 def _segment_is_free_on_map(start, end, free_map: np.ndarray) -> bool:
     """Return True if the integer segment lies entirely inside free cells."""
     if free_map is None:
@@ -433,6 +439,7 @@ def _visible_lookahead_index(
     start_idx: int,
     preferred_idx: int,
     free_map: np.ndarray,
+    min_target_dist_cells: float = 0.0,
 ) -> int:
     """Pick the farthest lookahead target that is still line-of-sight reachable.
 
@@ -447,12 +454,22 @@ def _visible_lookahead_index(
     start_idx = int(np.clip(start_idx, 0, len(dense_path) - 1))
     preferred_idx = int(np.clip(preferred_idx, start_idx, len(dense_path) - 1))
 
+    fallback_idx = None
+    fallback_dist = -1.0
+
     for idx in range(preferred_idx, start_idx, -1):
         if _segment_is_free_on_map(curr_cell, dense_path[idx], free_map):
-            return idx
+            cand_dist = _path_cell_distance(curr_cell, dense_path[idx])
+            if fallback_idx is None or cand_dist > fallback_dist:
+                fallback_idx = idx
+                fallback_dist = cand_dist
+            if cand_dist >= min_target_dist_cells:
+                return idx
 
     if preferred_idx == start_idx:
         return start_idx
+    if fallback_idx is not None:
+        return fallback_idx
     return min(len(dense_path) - 1, start_idx + 1)
 
 
@@ -650,12 +667,15 @@ def execute_nav_replay(
     motion_thresh: float = 0.4,
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
+    goal_reached_tol_cells: float = None,
 ) -> bool:
-    """Follow the geometric path polyline with lookahead.
+    """Follow the planned route using the dense rasterized path as control reference.
 
-    No pre-step shield — Habitat's navmesh handles collisions natively
-    (sliding along obstacles).  The follower detects actual stuck conditions
-    via displacement monitoring and aborts if the robot makes no real progress.
+    The planner may compact A* output into a short polyline, but executing
+    against only those sparse vertices lets the discrete controller cut corners
+    and drift away from the intended corridor.  This follower therefore uses
+    the dense rasterized path for progress tracking and target selection, while
+    still applying lookahead for smoother motion.
     """
     _STALL_STEPS = max(10, stuck_threshold * 3)
 
@@ -665,8 +685,11 @@ def execute_nav_replay(
     if not follow_path:
         return True
     dense_path = display_path_cells if display_path_cells is not None else densify_path_cells(follow_path)
+    control_path = normalize_path_cells(dense_path)
+    if not control_path:
+        control_path = follow_path
 
-    goal_cell = follow_path[-1]
+    goal_cell = control_path[-1]
     free_map = getattr(robot, "_safe_obs_map", None)
     if free_map is None:
         free_map = getattr(robot.map, "obstacles_map", None)
@@ -677,27 +700,43 @@ def execute_nav_replay(
     _LOOKAHEAD_OPEN_CELLS = max(6, _fwd_cells * 3)
     _LOOKAHEAD_TIGHT_CELLS = max(3, _fwd_cells * 2)
     _LOOKAHEAD_TIGHT_CL = 5.0
-    _GOAL_REACHED_TOL = max(3, _fwd_cells + 1)
-    _MAX_FOLLOW_STEPS = max(len(dense_path) * 2, len(follow_path) * 12, 120)
+    _GOAL_REACHED_TOL = (
+        float(goal_reached_tol_cells)
+        if goal_reached_tol_cells is not None
+        else float(max(3, _fwd_cells + 1))
+    )
+    _MAX_FOLLOW_STEPS = max(len(control_path) * 2, len(follow_path) * 12, 120)
     _FORWARD_HEADING_TOL_OPEN = 10.0
     _FORWARD_HEADING_TOL_TIGHT = 18.0
+    _OFFTRACK_REATTACH_TH = max(1.5, 0.75 * _fwd_cells)
+    _OFFTRACK_DEADBAND_TH = max(1.0, 0.5 * _fwd_cells)
+    _MIN_ACTIONABLE_TARGET_DIST = max(1.0, 0.75 * _fwd_cells)
     _STALL_HEADING_EPS = max(2.5, float(robot.turn_angle) * 0.5)
     progress_idx = 0
+    progress_floor_idx = 0
     last_progress_idx = -1
     last_cell = None
     last_heading = None
     stall_count = 0
     preview_stall_count = 0
+    offtrack_log_counter = 0
 
     print(f"  [nav] Path follower: {len(follow_path)} polyline waypoint(s), "
-          f"{len(dense_path)} dense display cell(s), "
+          f"{len(control_path)} control cell(s), {len(dense_path)} dense display cell(s), "
           f"lookahead={_LOOKAHEAD_OPEN_CELLS} open / {_LOOKAHEAD_TIGHT_CELLS} tight")
 
     for i in range(_MAX_FOLLOW_STEPS):
         robot._set_nav_curr_pose()
         _curr_cell = [int(round(robot.curr_pos_on_map[0])), int(round(robot.curr_pos_on_map[1]))]
         _curr_heading = float(robot.curr_ang_deg_on_map)
-        progress_idx = _closest_path_index(_curr_cell, follow_path, progress_idx)
+        progress_idx = _closest_path_index(
+            _curr_cell,
+            control_path,
+            progress_idx,
+            backtrack=16,
+            ahead=max(120, _LOOKAHEAD_OPEN_CELLS * 8),
+        )
+        progress_idx = max(progress_idx, progress_floor_idx)
         _heading_changed = (
             last_heading is None
             or abs(_normalize_turn_error(_curr_heading - last_heading)) > _STALL_HEADING_EPS
@@ -718,12 +757,16 @@ def execute_nav_replay(
             last_progress_idx = progress_idx
             last_heading = _curr_heading
 
+        _path_anchor = control_path[progress_idx]
+        _path_offset = float(
+            np.hypot(float(_path_anchor[0]) - float(_curr_cell[0]), float(_path_anchor[1]) - float(_curr_cell[1]))
+        )
         _goal_dr = float(goal_cell[0]) - float(_curr_cell[0])
         _goal_dc = float(goal_cell[1]) - float(_curr_cell[1])
         _goal_dist = float(np.hypot(_goal_dr, _goal_dc))
-        if progress_idx >= len(follow_path) - 1 and _goal_dist <= _GOAL_REACHED_TOL:
-            print(f"  [nav] Goal reached on path polyline "
-                  f"(dist={_goal_dist:.1f} cells, progress={progress_idx + 1}/{len(follow_path)})")
+        if progress_idx >= len(control_path) - 1 and _goal_dist <= _GOAL_REACHED_TOL:
+            print(f"  [nav] Goal reached on control path "
+                  f"(dist={_goal_dist:.1f} cells, progress={progress_idx + 1}/{len(control_path)})")
             return True
 
         _curr_clearance = float("inf")
@@ -734,15 +777,29 @@ def execute_nav_replay(
         _lookahead_cells = (
             _LOOKAHEAD_TIGHT_CELLS if _curr_clearance < _LOOKAHEAD_TIGHT_CL else _LOOKAHEAD_OPEN_CELLS
         )
-        preferred_idx = _lookahead_path_index(follow_path, progress_idx, _lookahead_cells)
+        if _path_offset > _OFFTRACK_REATTACH_TH:
+            _lookahead_cells = max(1, min(_lookahead_cells, _fwd_cells + 1))
+            if offtrack_log_counter == 0 or i % 15 == 0:
+                print(f"  [nav] Off-path by {_path_offset:.1f} cells at progress={progress_idx} "
+                      f"— shortening lookahead to {_lookahead_cells}")
+            offtrack_log_counter += 1
+        else:
+            offtrack_log_counter = 0
+        _min_target_dist = (
+            0.0
+            if (_path_offset > _OFFTRACK_REATTACH_TH or _goal_dist <= _GOAL_REACHED_TOL + _fwd_cells)
+            else _MIN_ACTIONABLE_TARGET_DIST
+        )
+        preferred_idx = _lookahead_path_index(control_path, progress_idx, _lookahead_cells)
         target_idx = _visible_lookahead_index(
             _curr_cell,
-            follow_path,
+            control_path,
             progress_idx,
             preferred_idx,
             free_map,
+            min_target_dist_cells=_min_target_dist,
         )
-        target_cell = follow_path[target_idx]
+        target_cell = control_path[target_idx]
 
         _curr_pose = (
             float(robot.curr_pos_on_map[0]),
@@ -756,14 +813,41 @@ def execute_nav_replay(
         _heading_err = _normalize_turn_error(_curr_pose[2] - _target_angle)
         _preview = robot.controller.convert_goal_to_actions(_curr_pose, target_cell)
 
+        if not _preview and target_idx < len(control_path) - 1:
+            _search_end = min(len(control_path) - 1, max(preferred_idx, target_idx + _lookahead_cells))
+            for cand_idx in range(target_idx + 1, _search_end + 1):
+                cand_cell = control_path[cand_idx]
+                cand_dist = _path_cell_distance(_curr_cell, cand_cell)
+                if cand_dist < _min_target_dist and cand_idx < len(control_path) - 1:
+                    continue
+                if free_map is not None and not _segment_is_free_on_map(_curr_cell, cand_cell, free_map):
+                    continue
+                cand_preview = robot.controller.convert_goal_to_actions(_curr_pose, cand_cell)
+                if cand_preview:
+                    if i == 0 or i % 20 == 0:
+                        print(f"  [nav] Advancing target for actionable preview: "
+                              f"{target_idx - progress_idx} -> {cand_idx - progress_idx} cells ahead")
+                    target_idx = cand_idx
+                    target_cell = cand_cell
+                    _target_dr = float(target_cell[0]) - _curr_pose[0]
+                    _target_dc = float(target_cell[1]) - _curr_pose[1]
+                    _target_dist = float(np.hypot(_target_dr, _target_dc))
+                    _target_angle = float(np.degrees(np.arctan2(-_target_dc, -_target_dr)))
+                    _heading_err = _normalize_turn_error(_curr_pose[2] - _target_angle)
+                    _preview = cand_preview
+                    break
+
         if not _preview:
-            if target_idx < len(follow_path) - 1:
+            if target_idx < len(control_path) - 1:
                 preview_stall_count += 1
                 if preview_stall_count >= _STALL_STEPS:
                     print(f"  [nav] Preview produced no action for {preview_stall_count} steps "
                           f"at progress={progress_idx} target={target_idx} — aborting")
                     return False
-                progress_idx = min(progress_idx + 1, len(follow_path) - 1)
+                progress_floor_idx = min(max(progress_floor_idx, target_idx), len(control_path) - 1)
+                if i == 0 or i % 10 == 0:
+                    print(f"  [nav] No-op preview zone at progress={progress_idx}, target={target_idx} "
+                          f"— raising progress floor to {progress_floor_idx}")
                 continue
             if _goal_dist <= _GOAL_REACHED_TOL + _fwd_cells:
                 print(f"  [nav] Goal reached after lookahead convergence "
@@ -773,6 +857,7 @@ def execute_nav_replay(
             if not _preview:
                 return True
         preview_stall_count = 0
+        progress_floor_idx = min(progress_floor_idx, progress_idx)
 
         if preferred_idx != target_idx and (i == 0 or i % 20 == 0):
             print(f"  [nav] Lookahead clipped by local visibility: "
@@ -786,6 +871,7 @@ def execute_nav_replay(
             action in ("turn_left", "turn_right")
             and abs(_heading_err) <= _heading_tol
             and _target_dist >= max(1.0, 0.75 * _fwd_cells)
+            and _path_offset <= _OFFTRACK_DEADBAND_TH
             # Do NOT require _preview[1]=="move_forward": when heading error is
             # small, forward motion is always preferable regardless of how many
             # turns the controller would plan after the current one.
@@ -814,9 +900,11 @@ def execute_nav_replay(
             else:
                 low_motion_count = 0
 
-        show_obs(robot, f"[{i+1}/{_MAX_FOLLOW_STEPS}] -> {cat}")
-        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                 path_cells=dense_path, label=f"[{i+1}/{_MAX_FOLLOW_STEPS}] -> {cat}")
+        _step_label = f"[{i+1}] -> {cat}"
+        show_obs(robot, _step_label)
+        if i % _MAP_REFRESH_STRIDE == 0 or i == _MAX_FOLLOW_STEPS - 1:
+            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                     path_cells=dense_path, label=_step_label)
         cv2.waitKey(_NAV_STEP_DELAY_MS)
 
     print(f"  [nav] Path follower exceeded safety step budget "
@@ -858,9 +946,11 @@ def nav_recovery_and_replan(
                 continue
             robot.sim.step(action)
             robot._set_nav_curr_pose()
-            show_obs(robot, f"[recovery {i+1}/{n}] -> {cat}")
-            show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     label=f"[recovery {i+1}/{n}] -> {cat}")
+            _recovery_label = f"[recovery {i+1}] -> {cat}"
+            show_obs(robot, _recovery_label)
+            if i % _MAP_REFRESH_STRIDE == 0 or i == n - 1:
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                         label=_recovery_label)
             cv2.waitKey(_NAV_STEP_DELAY_MS)
         print("  [nav] Recovery complete.")
         return True
@@ -1344,19 +1434,29 @@ def find_reachable_room_goal(
     # Room depth is weighted so goals deep inside the room are preferred
     # over boundary cells, even if boundary cells have slightly higher clearance.
     _ROOM_DEPTH_WEIGHT = 0.5
+    _MIN_ROOM_DEPTH = 2.0
     combined = clearances + _ROOM_DEPTH_WEIGHT * room_depths
 
-    # Sort by combined score descending
     sorted_idx = np.argsort(-combined)
+    preferred_idx = [
+        int(i) for i in sorted_idx
+        if float(clearances[i]) >= float(min_clearance) and float(room_depths[i]) >= _MIN_ROOM_DEPTH
+    ]
+    if preferred_idx:
+        ordered_idx = preferred_idx
+    else:
+        # If the room rasterization is very thin and no cell reaches the target
+        # room-depth threshold, fall back to the deepest cells first instead of
+        # immediately picking the highest-clearance boundary cell.
+        fallback_score = room_depths * 10.0 + clearances
+        ordered_idx = list(np.argsort(-fallback_score))
+        print(f"  [room-goal] Warning: no room cells reach depth >= {_MIN_ROOM_DEPTH:.1f}; "
+              f"falling back to deepest available cells")
 
     candidates = []
-    for i in sorted_idx:
-        cl = float(clearances[i])
-        rd = float(room_depths[i])
+    for i in ordered_idx:
         r, c = int(rows[i]), int(cols[i])
-        # Always include at least one candidate even if clearance is low
-        if (cl >= min_clearance and rd >= 2.0) or not candidates:
-            candidates.append([r, c])
+        candidates.append([r, c])
         if len(candidates) >= top_k:
             break
 
@@ -1826,6 +1926,7 @@ def main(config: DictConfig) -> None:
                     robot, planned_actions, cat, rgb_map_2d, heatmap, path_polyline,
                     display_path_cells=path_cells,
                     dist_map=_dist_map_shield,
+                    goal_reached_tol_cells=1.0 if room_goal is not None else None,
                 )
                 if not completed:
                     print(f"  [nav] Path execution stopped early for '{cat}' "
