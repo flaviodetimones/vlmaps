@@ -20,6 +20,7 @@ Controls
 import cv2
 import hydra
 import numpy as np
+from collections import deque
 from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
@@ -1026,6 +1027,173 @@ def fine_visual_center(
     return detected_once
 
 
+def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20):
+    """Return the nearest free grid cell to *cell* inside *free_map*."""
+    if free_map is None:
+        return [int(cell[0]), int(cell[1])]
+
+    h, w = free_map.shape[:2]
+    r0 = int(np.clip(round(cell[0]), 0, h - 1))
+    c0 = int(np.clip(round(cell[1]), 0, w - 1))
+    if free_map[r0, c0]:
+        return [r0, c0]
+
+    for radius in range(1, max_radius + 1):
+        rmin = max(0, r0 - radius)
+        rmax = min(h - 1, r0 + radius)
+        cmin = max(0, c0 - radius)
+        cmax = min(w - 1, c0 + radius)
+        best = None
+        best_dist = float("inf")
+        for rr in range(rmin, rmax + 1):
+            for cc in range(cmin, cmax + 1):
+                if rr not in (rmin, rmax) and cc not in (cmin, cmax):
+                    continue
+                if not free_map[rr, cc]:
+                    continue
+                dist = float((rr - r0) ** 2 + (cc - c0) ** 2)
+                if dist < best_dist:
+                    best = [rr, cc]
+                    best_dist = dist
+        if best is not None:
+            return best
+
+    return [r0, c0]
+
+
+def _compute_bfs_cost_map(start_cell, free_map: np.ndarray) -> np.ndarray:
+    """Compute 4-neighbour BFS distances from *start_cell* over free cells."""
+    h, w = free_map.shape[:2]
+    dist = np.full((h, w), -1, dtype=np.int32)
+    sr, sc = _snap_to_nearest_free_cell(start_cell, free_map)
+    if not free_map[sr, sc]:
+        return dist
+
+    q = deque([(sr, sc)])
+    dist[sr, sc] = 0
+    while q:
+        r, c = q.popleft()
+        nd = dist[r, c] + 1
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            rr = r + dr
+            cc = c + dc
+            if rr < 0 or rr >= h or cc < 0 or cc >= w:
+                continue
+            if dist[rr, cc] != -1 or not free_map[rr, cc]:
+                continue
+            dist[rr, cc] = nd
+            q.append((rr, cc))
+    return dist
+
+
+def select_best_room(
+    search_state: SearchState,
+    robot_pos,
+    heatmap_evidence: dict,
+    obs_map: np.ndarray,
+    kept_components: list,
+    *,
+    current_room: str = None,
+    w_prior: float = 0.30,
+    w_evidence: float = 0.25,
+    w_unexplored: float = 0.20,
+    w_cost: float = 0.15,
+    w_penalty: float = 0.10,
+):
+    """Phase D — choose the next room to search before picking a candidate.
+
+    The current system does not yet maintain per-cell coverage within each room,
+    so the "unexplored" term is implemented as a practical proxy derived from
+    room visits and failed candidate inspections.
+    """
+    if search_state is None or not search_state.rooms:
+        return None, {}
+
+    if obs_map is None:
+        return None, {}
+
+    free_map = obs_map > 0
+    room_best_cells = {}
+    room_candidate_count = {}
+    for comp in kept_components or []:
+        room = comp.get("room")
+        if room is None:
+            continue
+        room_candidate_count[room] = room_candidate_count.get(room, 0) + 1
+        prev = room_best_cells.get(room)
+        if prev is None or float(comp.get("quality", 0.0)) > prev[1]:
+            room_best_cells[room] = (list(comp["centroid"]), float(comp.get("quality", 0.0)))
+
+    eligible_rooms = [name for name in search_state.rooms.keys() if room_candidate_count.get(name, 0) > 0]
+    if not eligible_rooms:
+        eligible_rooms = list(search_state.rooms.keys())
+
+    bfs_dist = _compute_bfs_cost_map(robot_pos, free_map)
+    finite_dists = bfs_dist[bfs_dist >= 0]
+    max_cost = float(finite_dists.max()) if finite_dists.size > 0 else 1.0
+    max_cost = max(max_cost, 1.0)
+
+    room_scores = {}
+    for room_name in eligible_rooms:
+        rs = search_state.rooms[room_name]
+        if room_name in room_best_cells:
+            rep_cell = room_best_cells[room_name][0]
+        else:
+            rep_cell = [rs.centroid[0], rs.centroid[1]]
+        rep_cell = _snap_to_nearest_free_cell(rep_cell, free_map)
+
+        cost_cells = float(bfs_dist[rep_cell[0], rep_cell[1]])
+        if cost_cells < 0:
+            cost_score = 1.0
+        else:
+            cost_score = min(1.0, cost_cells / max_cost)
+
+        failed_attempts = max(0, rs.candidates_tried - rs.candidates_confirmed)
+        penalty_score = min(1.0, failed_attempts / 3.0)
+
+        # Proxy for unexplored-ness until Fase F adds actual coverage tracking.
+        exploration_load = min(1.0, 0.35 * rs.times_visited + 0.20 * failed_attempts)
+        unexplored_score = 1.0 - exploration_load
+
+        prior_score = float(rs.target_relevance)
+        evidence_score = float(heatmap_evidence.get(room_name, 0.0))
+        total = (
+            w_prior * prior_score
+            + w_evidence * evidence_score
+            + w_unexplored * unexplored_score
+            - w_cost * cost_score
+            - w_penalty * penalty_score
+        )
+        if room_name == current_room:
+            total += 0.05
+
+        room_scores[room_name] = {
+            "score": total,
+            "prior": prior_score,
+            "evidence": evidence_score,
+            "unexplored": unexplored_score,
+            "cost": cost_score,
+            "penalty": penalty_score,
+            "candidates": room_candidate_count.get(room_name, 0),
+            "rep_cell": rep_cell,
+        }
+
+    if not room_scores:
+        return None, {}
+
+    ranked = sorted(room_scores.items(), key=lambda kv: kv[1]["score"], reverse=True)
+    print("  [room-select] Top rooms:")
+    for room_name, info in ranked[:5]:
+        print(
+            f"    {room_name}: score={info['score']:.3f} "
+            f"(prior={info['prior']:.2f}, ev={info['evidence']:.2f}, "
+            f"unexp={info['unexplored']:.2f}, cost={info['cost']:.2f}, "
+            f"pen={info['penalty']:.2f}, cand={info['candidates']})"
+        )
+
+    return ranked[0][0], room_scores
+
+
 def select_best_candidate(
     kept_components: list,
     current_room: str,
@@ -1689,6 +1857,8 @@ def main(config: DictConfig) -> None:
                 print(f"  Current room: {current_room or 'unknown'}")
                 print("  Computing semantic heatmap...")
                 heatmap, kept_components = compute_heatmap(robot, cat)
+                _heatmap_ev = {}
+                _selected_room = None
 
                 # Annotate each component with its room
                 if _room_provider and _room_provider.is_available():
@@ -1726,6 +1896,28 @@ def main(config: DictConfig) -> None:
                     _np_sorted = sorted(_new_priors.items(), key=lambda x: -x[1])
                     print(f"  Final room priors after evidence fusion: "
                           f"{ ', '.join(f'{r}={v:.2f}' for r, v in _np_sorted[:6] if v > 0.01) }")
+
+                # ── Phase D: choose the room first, then inspect candidates inside it ──
+                if _ss and kept_components and _ss.rooms:
+                    robot._set_nav_curr_pose()
+                    _robot_rc_room = [robot.curr_pos_on_map[0], robot.curr_pos_on_map[1]]
+                    _selected_room, _room_scores = select_best_room(
+                        _ss,
+                        _robot_rc_room,
+                        _heatmap_ev,
+                        robot.map.obstacles_map,
+                        kept_components,
+                        current_room=current_room,
+                    )
+                    if _selected_room is not None:
+                        _room_kept = [c for c in kept_components if c.get("room") == _selected_room]
+                        if _room_kept:
+                            print(f"  [room-select] Chosen room for '{cat}': {_selected_room} "
+                                  f"({len(_room_kept)}/{len(kept_components)} candidate(s))")
+                            kept_components = _room_kept
+                        else:
+                            print(f"  [room-select] Chosen room '{_selected_room}' has no direct "
+                                  f"candidates — falling back to global ranking")
 
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
                 cv2.waitKey(200)
