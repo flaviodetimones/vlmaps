@@ -78,6 +78,12 @@ class SearchState:
         self.current_room: Optional[str] = None
         self.found: bool = False
         self._tried_centroids: set = set()   # Phase D gate: (int_r, int_c) tried
+        # Phase F: ordered log of high-level actions emitted this episode.
+        # Each entry is a dict {"action": <str>, "outcome": <str|None>}; the
+        # heuristic and (later) LLM strategist append here so that the next
+        # decision and the post-hoc metrics can read recent activity.
+        self.action_log: List[Dict[str, Optional[str]]] = []
+        self.visited_cells: List[Tuple[int, int]] = []  # robot cells stepped on
 
         self._build_rooms(room_provider, obstacles_map)
 
@@ -139,6 +145,23 @@ class SearchState:
             if obj not in rs.objects_seen:
                 rs.objects_seen.append(obj)
 
+    # ------------------------------------------------------------------
+    # Phase F additions — high-level action log + visited cell trail.
+    def record_action(self, action_str: str, outcome: Optional[str] = None) -> None:
+        """Append a high-level Action (already stringified) to the episode log."""
+        self.action_log.append({"action": action_str, "outcome": outcome})
+
+    def record_visited_cell(self, row: int, col: int) -> None:
+        """Track that the robot occupied (row, col) — used by explore_room."""
+        self.visited_cells.append((int(row), int(col)))
+
+    def recent_actions(self, n: int = 5) -> List[Dict[str, Optional[str]]]:
+        """Return the last *n* action records (most recent last)."""
+        if n <= 0:
+            return []
+        return list(self.action_log[-n:])
+
+    # ------------------------------------------------------------------
     def mark_found(self, room_name: Optional[str]) -> None:
         """Mark the target as found in *room_name*."""
         self.found = True
