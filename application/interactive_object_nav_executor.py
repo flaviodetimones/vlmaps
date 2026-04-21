@@ -17,15 +17,28 @@ from __future__ import annotations
 import cv2
 import hydra
 import numpy as np
+import os
 from omegaconf import DictConfig
 
 from application import interactive_object_nav as base
-from vlmaps.policy import Action, ActionType, ExecutorContext, execute_action, close_executor_context, sync_pose_state
+from vlmaps.policy import (
+    Action,
+    ActionType,
+    ExecutorContext,
+    execute_action,
+    close_executor_context,
+    sync_pose_state,
+    choose_next_action,
+)
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
 from vlmaps.utils.llm_utils import parse_object_goal_instruction
 from vlmaps.utils.matterport3d_categories import get_categories
 from vlmaps.utils.room_map_utils import find_room_goal, load_room_map
 from vlmaps.utils.search_state import SearchState
+
+
+_POLICY_MODE = os.environ.get("VLMAPS_POLICY_MODE", "hybrid").strip().lower()
+_MAX_STRATEGIC_STEPS = 12
 
 
 def _build_present_categories(robot) -> list:
@@ -307,38 +320,66 @@ def main(config: DictConfig) -> None:
                     Action(type=ActionType.GO_TO_ROOM, room=target),
                     Action(type=ActionType.DONE, reason="room command handled"),
                 ]
+                print("  [executor-policy] Planned actions:")
+                for idx, action in enumerate(actions, start=1):
+                    print(f"    {idx}. {action.short()}")
+
+                for action in actions:
+                    result = execute_action(ctx, action)
+                    if result.found:
+                        execute_action(
+                            ctx,
+                            Action(type=ActionType.DONE, reason="target found"),
+                        )
+                        break
+                    if result.done:
+                        break
+                    if action.type is ActionType.GO_TO_ROOM and not result.success:
+                        print(f"  [executor] Room navigation failed for '{target}'.")
+                        break
             else:
-                actions = _plan_actions_for_object(ctx, categories, present_categories)
+                print(f"  [executor-policy] Strategic policy mode: {_POLICY_MODE}")
+                found = False
+                for step_idx in range(1, _MAX_STRATEGIC_STEPS + 1):
+                    action, snapshot = choose_next_action(
+                        ctx,
+                        categories,
+                        present_categories,
+                        policy_mode=_POLICY_MODE,
+                    )
+                    print(f"  [executor-policy] Step {step_idx}: {action.short()}")
+                    result = execute_action(ctx, action)
 
-            if not actions:
-                close_executor_context(ctx)
-                continue
-
-            print("  [executor-policy] Planned actions:")
-            for idx, action in enumerate(actions, start=1):
-                print(f"    {idx}. {action.short()}")
-
-            found = False
-            for action in actions:
-                result = execute_action(ctx, action)
-                if result.found:
-                    found = True
+                    if result.found:
+                        found = True
+                        execute_action(
+                            ctx,
+                            Action(type=ActionType.DONE, reason="target found"),
+                        )
+                        break
+                    if result.done or action.type is ActionType.DONE:
+                        break
+                    if action.type is ActionType.GO_TO_ROOM and not result.success:
+                        print(
+                            f"  [executor] Strategic go_to_room failed for '{target}' "
+                            f"— policy will re-evaluate from the current pose."
+                        )
+                        continue
+                else:
+                    print(
+                        f"  [executor-policy] Reached strategic step limit "
+                        f"({_MAX_STRATEGIC_STEPS}) for '{target}'"
+                    )
                     execute_action(
                         ctx,
-                        Action(type=ActionType.DONE, reason="target found"),
+                        Action(type=ActionType.DONE, reason="strategic step limit"),
                     )
-                    break
-                if result.done:
-                    break
-                if action.type is ActionType.GO_TO_ROOM and room_goal is not None and not result.success:
-                    print(f"  [executor] Room navigation failed for '{target}'.")
-                    break
 
-            if not found and room_goal is None and ctx.last_candidate_centroid is None:
-                execute_action(
-                    ctx,
-                    Action(type=ActionType.DONE, reason="no viable candidate"),
-                )
+                if not found and ctx.last_candidate_centroid is None:
+                    execute_action(
+                        ctx,
+                        Action(type=ActionType.DONE, reason="no viable candidate"),
+                    )
 
             from vlmaps.utils.habitat_utils import agent_state2tf
 

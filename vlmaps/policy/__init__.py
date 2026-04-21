@@ -27,6 +27,11 @@ from vlmaps.policy.executor import (
     sync_pose_state,
     close_executor_context,
 )
+from vlmaps.policy.strategic_policy import (
+    StrategySnapshot,
+    prepare_strategy_snapshot,
+    choose_next_action,
+)
 
 __all__ = [
     "ActionType",
@@ -40,4 +45,7 @@ __all__ = [
     "execute_action",
     "sync_pose_state",
     "close_executor_context",
+    "StrategySnapshot",
+    "prepare_strategy_snapshot",
+    "choose_next_action",
 ]
