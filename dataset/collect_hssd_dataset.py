@@ -35,6 +35,7 @@ import numpy as np
 
 
 SENSOR_HEIGHT = 1.5  # metres (same as interactive_object_nav.py)
+SENSOR_PITCH_DEG = -20.0  # tilt camera down so low objects (chairs, beds, floor clutter) stay in frame
 WIDTH  = 1080
 HEIGHT = 720
 
@@ -45,11 +46,14 @@ def make_cfg(scene_dataset_config: str, scene_id: str) -> habitat_sim.Configurat
     sim_cfg.scene_id = scene_id
     sim_cfg.enable_physics = False
 
+    pitch_rad = np.deg2rad(SENSOR_PITCH_DEG)
+
     color_spec = habitat_sim.CameraSensorSpec()
     color_spec.uuid = "color_sensor"
     color_spec.sensor_type = habitat_sim.SensorType.COLOR
     color_spec.resolution = [HEIGHT, WIDTH]
     color_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
+    color_spec.orientation = [pitch_rad, 0.0, 0.0]
     color_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     depth_spec = habitat_sim.CameraSensorSpec()
@@ -57,6 +61,7 @@ def make_cfg(scene_dataset_config: str, scene_id: str) -> habitat_sim.Configurat
     depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
     depth_spec.resolution = [HEIGHT, WIDTH]
     depth_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
+    depth_spec.orientation = [pitch_rad, 0.0, 0.0]
     depth_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     agent_cfg = habitat_sim.agent.AgentConfiguration()

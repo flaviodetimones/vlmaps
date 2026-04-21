@@ -192,11 +192,33 @@ class SearchState:
 
     # ------------------------------------------------------------------
     def summary(self) -> str:
-        """Multi-line summary of the entire search state."""
+        """Multi-line summary of the entire search state, with a room table."""
         lines = [f"Search target: '{self.target}'  found={self.found}"]
         lines.append(f"Visit history: {' → '.join(self.visit_history) or '(none)'}")
+
+        headers = ("room", "prior", "visited", "cand", "conf", "objects",
+                   "nav", "found")
+        rows = []
         for rs in self.rooms.values():
-            lines.append(f"  {rs.summary()}")
+            objs = ",".join(rs.objects_seen) if rs.objects_seen else "-"
+            rows.append((
+                rs.name,
+                f"{rs.target_relevance:.2f}",
+                str(rs.times_visited),
+                str(rs.candidates_tried),
+                str(rs.candidates_confirmed),
+                objs,
+                f"{rs.explored_ratio:.0%}",
+                "yes" if rs.target_found_here else "no",
+            ))
+
+        widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
+                  for i, h in enumerate(headers)]
+        fmt = "  " + "  ".join(f"{{:<{w}}}" for w in widths)
+        lines.append(fmt.format(*headers))
+        lines.append("  " + "  ".join("-" * w for w in widths))
+        for r in rows:
+            lines.append(fmt.format(*r))
         return "\n".join(lines)
 
     def room_summaries_for_llm(self) -> str:
