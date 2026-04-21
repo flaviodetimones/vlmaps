@@ -20,6 +20,13 @@ from vlmaps.policy.actions import (
     ACTION_SCHEMA_PROMPT,
 )
 from vlmaps.policy.frontier import find_frontier_in_room
+from vlmaps.policy.executor import (
+    ExecutorContext,
+    ActionResult,
+    execute_action,
+    sync_pose_state,
+    close_executor_context,
+)
 
 __all__ = [
     "ActionType",
@@ -28,4 +35,9 @@ __all__ = [
     "action_to_json",
     "ACTION_SCHEMA_PROMPT",
     "find_frontier_in_room",
+    "ExecutorContext",
+    "ActionResult",
+    "execute_action",
+    "sync_pose_state",
+    "close_executor_context",
 ]
