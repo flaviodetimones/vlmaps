@@ -37,6 +37,7 @@ from vlmaps.utils.llm_utils import parse_object_goal_instruction
 from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
 from vlmaps.utils.matterport3d_categories import mp3dcat, get_categories
 from vlmaps.utils.room_map_utils import find_room_goal, load_room_map
+from vlmaps.utils.room_provider import room_command_matches
 from vlmaps.utils.visualize_utils import pool_3d_label_to_2d, pool_3d_rgb_to_2d
 
 
@@ -1626,8 +1627,9 @@ def find_reachable_room_goal(
     if region_grid is None or not regions:
         return []
 
-    # Find matching region id (same word-boundary logic as get_room_centroid)
-    query   = target_room.lower().strip()
+    # Find matching region id, preferring the exact resolved room instance.
+    resolved_target = room_provider.resolve_room_name(target_room) or target_room
+    query   = resolved_target.lower().strip()
     pattern = _re_local.compile(r'\b' + _re_local.escape(query) + r'\b')
     target_rid = None
     for reg in regions:
@@ -1639,7 +1641,7 @@ def find_reachable_room_goal(
             target_rid = reg["id"]
 
     if target_rid is None:
-        print(f"  [room-goal] Room '{target_room}' not found in region grid")
+        print(f"  [room-goal] Room '{resolved_target}' not found in region grid")
         return []
 
     # Navigable cells inside the target room
@@ -1648,7 +1650,7 @@ def find_reachable_room_goal(
     navigable_room  = room_mask & free_mask
 
     if not navigable_room.any():
-        print(f"  [room-goal] No navigable cells in room '{target_room}'")
+        print(f"  [room-goal] No navigable cells in room '{resolved_target}'")
         return []
 
     dist_map = distance_transform_edt(obs_map)
@@ -1692,7 +1694,7 @@ def find_reachable_room_goal(
 
     best_cl = float(clearances[sorted_idx[0]]) if len(sorted_idx) > 0 else 0.0
     best_rd = float(room_depths[sorted_idx[0]]) if len(sorted_idx) > 0 else 0.0
-    print(f"  [room-goal] Found {len(candidates)} safe goal(s) in '{target_room}' "
+    print(f"  [room-goal] Found {len(candidates)} safe goal(s) in '{resolved_target}' "
           f"(best clearance: {best_cl:.1f} cells, room depth: {best_rd:.1f} cells)")
     return candidates
 
@@ -1752,19 +1754,44 @@ def navigate_to_room_stage(
 
 
 def _room_instance_matches(actual_room, target_room: str) -> bool:
-    """Return True if actual_room satisfies the target_room navigation command.
+    """Backward-compatible shim for exact/base room-command matching."""
+    return room_command_matches(actual_room, target_room)
 
-    Allows canonical-type match so 'kitchen.001' satisfies command 'kitchen'.
-    Rejects type mismatch so 'bathroom.001' does NOT satisfy 'dining room'.
+
+def _resolve_instruction_room_targets(instruction: str, categories: list, room_provider) -> list:
+    """Resolve room-instance aliases after LLM parsing.
+
+    This preserves explicit mentions such as "bedroom 1" even if the parser
+    collapses them to the base family "bedroom". For non-room targets, the
+    original category is preserved.
     """
-    from vlmaps.utils.room_priors import canonical_room_type
-    if actual_room is None:
-        return False
-    a = actual_room.lower().strip()
-    t = target_room.lower().strip()
-    if a == t:
-        return True
-    return canonical_room_type(a) == canonical_room_type(t)
+    if room_provider is None or not room_provider.is_available():
+        return categories
+
+    resolved = []
+    explicit_mentions = room_provider.find_room_mentions(instruction)
+    mention_cursor = 0
+
+    for cat in categories:
+        raw = cat.strip()
+        direct_room = room_provider.resolve_room_name(raw)
+        if direct_room is not None:
+            if direct_room != raw:
+                print(f"  [room-parse] Resolved room target '{raw}' -> '{direct_room}'")
+            resolved.append(direct_room)
+            continue
+
+        upgraded = raw
+        for i in range(mention_cursor, len(explicit_mentions)):
+            exact_room = explicit_mentions[i]
+            if room_command_matches(exact_room, raw):
+                upgraded = exact_room
+                mention_cursor = i + 1
+                if upgraded != raw:
+                    print(f"  [room-parse] Preserved explicit room instance '{raw}' -> '{upgraded}'")
+                break
+        resolved.append(upgraded)
+    return resolved
 
 
 def find_best_start_pose(robot):
@@ -1890,6 +1917,10 @@ def main(config: DictConfig) -> None:
         except Exception as e:
             print(f"LLM error: {e}")
             continue
+
+        categories = _resolve_instruction_room_targets(
+            instruction, categories, _room_provider
+        )
 
         print(f"Targets: {categories}")
 

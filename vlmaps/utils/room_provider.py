@@ -18,6 +18,84 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import re
+
+
+_NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _normalize_room_text(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s*\.\s*", ".", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _parse_room_instance(text: str) -> Tuple[str, Optional[int]]:
+    """Split a room query into canonical base name + optional explicit instance.
+
+    Examples:
+        "bathroom"      -> ("bathroom", None)
+        "bathroom.001"  -> ("bathroom", 1)
+        "bathroom 1"    -> ("bathroom", 1)
+        "bedroom one"   -> ("bedroom", 1)
+    """
+    q = _normalize_room_text(text)
+    m = re.fullmatch(r"(.+?)\.(\d+)$", q)
+    if m:
+        return m.group(1).strip(), int(m.group(2))
+    m = re.fullmatch(r"(.+?)\s+(\d+)$", q)
+    if m:
+        return m.group(1).strip(), int(m.group(2))
+    m = re.fullmatch(r"(.+?)\s+([a-z]+)$", q)
+    if m and m.group(2) in _NUMBER_WORDS:
+        return m.group(1).strip(), _NUMBER_WORDS[m.group(2)]
+    return q, None
+
+
+def _room_aliases(room_name: str) -> set:
+    aliases = {_normalize_room_text(room_name)}
+    base, idx = _parse_room_instance(room_name)
+    if idx is not None:
+        aliases.add(f"{base} {idx}")
+        aliases.add(f"{base}.{idx}")
+        aliases.add(f"{base}.{idx:03d}")
+        for word, value in _NUMBER_WORDS.items():
+            if value == idx:
+                aliases.add(f"{base} {word}")
+                break
+    return aliases
+
+
+def room_command_matches(actual_room: Optional[str], target_room: str) -> bool:
+    """Return True if actual_room satisfies a room navigation command.
+
+    Base commands like "bathroom" accept any bathroom instance.
+    Explicit-instance commands like "bathroom.001" or "bathroom 1" require
+    that exact instance.
+    """
+    if actual_room is None:
+        return False
+    a_base, a_idx = _parse_room_instance(actual_room)
+    t_base, t_idx = _parse_room_instance(target_room)
+    if a_base != t_base:
+        return False
+    if t_idx is not None:
+        return a_idx == t_idx
+    return True
 
 
 # ── Abstract base ────────────────────────────────────────────────────────────
@@ -38,6 +116,80 @@ class RoomProvider(ABC):
     @abstractmethod
     def is_available(self) -> bool:
         """Return True if room information could be loaded."""
+
+    def resolve_room_name(self, room_query: str) -> Optional[str]:
+        """Resolve a user/LLM room query to an exact room label if possible.
+
+        Supports exact instance labels and friendly aliases such as:
+        - "bathroom.001" -> "bathroom.001"
+        - "bathroom 1"   -> "bathroom.001"
+        - "bathroom one" -> "bathroom.001"
+        - "bathroom"     -> "bathroom" (preferred if a base room exists)
+        """
+        if not self.is_available():
+            return None
+        rooms = self.list_rooms()
+        if not rooms:
+            return None
+
+        query = _normalize_room_text(room_query)
+        q_base, q_idx = _parse_room_instance(query)
+
+        # First, exact alias match against every known room instance.
+        for room in rooms:
+            if query in _room_aliases(room):
+                return room
+
+        family = [room for room in rooms if _parse_room_instance(room)[0] == q_base]
+        if not family:
+            return None
+
+        # Explicit instance required: look for the corresponding numbered variant.
+        if q_idx is not None:
+            for room in family:
+                _base, _idx = _parse_room_instance(room)
+                if _idx == q_idx:
+                    return room
+            return None
+
+        # Base room preferred if it exists explicitly.
+        for room in family:
+            if _normalize_room_text(room) == q_base:
+                return room
+
+        # Fallback to the first family member if the scene only has numbered
+        # instances and the user asked for the base family.
+        def _family_sort_key(room: str):
+            _, idx = _parse_room_instance(room)
+            return (0 if idx is None else 1, idx if idx is not None else -1, _normalize_room_text(room))
+
+        return sorted(family, key=_family_sort_key)[0]
+
+    def find_room_mentions(self, text: str) -> List[str]:
+        """Return exact room labels explicitly mentioned in free text, in order."""
+        if not self.is_available():
+            return []
+        haystack = _normalize_room_text(text)
+        matches = []
+        for room in self.list_rooms():
+            for alias in sorted(_room_aliases(room), key=len, reverse=True):
+                pattern = re.compile(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])")
+                m = pattern.search(haystack)
+                if m:
+                    matches.append((m.start(), -len(alias), m.end(), room))
+                    break
+        matches.sort()
+        ordered = []
+        seen = set()
+        occupied = []
+        for start, _, end, room in matches:
+            if any(not (end <= occ_start or start >= occ_end) for occ_start, occ_end in occupied):
+                continue
+            if room not in seen:
+                ordered.append(room)
+                seen.add(room)
+                occupied.append((start, end))
+        return ordered
 
 
 # ── LabelMe provider ─────────────────────────────────────────────────────────
@@ -81,8 +233,9 @@ class LabelMeRoomProvider(RoomProvider):
         if not self._available:
             return None
         from vlmaps.utils.room_map_utils import find_room_goal
+        resolved = self.resolve_room_name(room_name) or room_name
         curr_pos = (0, 0)  # dummy — find_room_goal picks closest
-        result = find_room_goal(room_name, self._regions, curr_pos)
+        result = find_room_goal(resolved, self._regions, curr_pos)
         return result  # (row, col) or None
 
     def list_rooms(self) -> List[str]:
@@ -246,15 +399,14 @@ class SemanticSceneRoomProvider(RoomProvider):
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         if not self._available:
             return None
-        import re
-        query = room_name.lower().strip()
+        query = _normalize_room_text(self.resolve_room_name(room_name) or room_name)
         # Require query to match a whole word in the label/category to avoid
         # "bed" matching "bedroom", "bath" matching "bathroom", etc.
         pattern = re.compile(r'\b' + re.escape(query) + r'\b')
         best = None
         for reg in self._regions:
-            label = reg["label"].lower()
-            category = reg["category"].lower()
+            label = _normalize_room_text(reg["label"])
+            category = _normalize_room_text(reg["category"])
             # Exact match wins immediately
             if query == label or query == category:
                 best = reg

@@ -51,6 +51,8 @@ def parse_object_goal_instruction(language_instr):
         "Rules:\n"
         "1. Output ONLY a JSON array of strings, nothing else. No explanation, no punctuation outside the array.\n"
         "2. Each string must be a physical object or place a robot can navigate to (e.g. 'counter', 'sofa', 'kitchen').\n"
+        "2b. Preserve explicit room-instance identifiers when the user gives them "
+        "(e.g. 'bathroom 1', 'bedroom.001'). Do not collapse them to the base room name.\n"
         "3. IGNORE spatial/relational words that are NOT objects themselves:\n"
         "   area, zone, region, vicinity, neighborhood, side, part, spot,\n"
         "   near, nearby, next to, beside, between, around, in front of, behind,\n"
@@ -66,6 +68,10 @@ def parse_object_goal_instruction(language_instr):
         # basic multi-target
         ("go to the kitchen and then go to the toilet",
          '["kitchen", "toilet"]'),
+        ("go to bathroom 1",
+         '["bathroom 1"]'),
+        ("go to bedroom.001",
+         '["bedroom.001"]'),
         ("go to the chair and then go to another chair",
          '["chair", "chair"]'),
         ("navigate to the green sofa and turn right and find several chairs, finally go to the painting",

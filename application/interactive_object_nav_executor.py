@@ -252,6 +252,10 @@ def main(config: DictConfig) -> None:
             print(f"LLM error: {exc}")
             continue
 
+        categories = base._resolve_instruction_room_targets(
+            instruction, categories, room_provider
+        )
+
         print(f"Targets: {categories}")
 
         robot.set_agent_state(start_tf)
