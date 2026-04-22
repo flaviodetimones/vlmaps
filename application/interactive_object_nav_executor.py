@@ -163,7 +163,7 @@ def _plan_actions_for_object(
         )
 
     base.show_map(ctx.robot, ctx.rgb_map_2d, heatmap_2d=heatmap, label=f"Executor planning: {cat}")
-    cv2.waitKey(200)
+    base.ui_wait(200)
 
     if not kept_components:
         print(f"  [skip] No heatmap signal for '{cat}' in this scene.")
@@ -240,6 +240,7 @@ def main(config: DictConfig) -> None:
     room_provider = getattr(robot, "room_provider", None)
     if room_provider and room_provider.is_available():
         print(f"Room provider active. Rooms: {room_provider.list_rooms()}")
+    print(f"Heatmap mode: {base.get_runtime_heatmap_mode()}")
 
     present_categories = _build_present_categories(robot)
 
@@ -391,6 +392,13 @@ def main(config: DictConfig) -> None:
             if ss.rooms:
                 print(f"\n{ss.summary()}")
 
+        base.emit_instruction_eval_summary(
+            instruction,
+            categories,
+            search_states,
+            robot,
+            room_provider,
+        )
         print("\nInstruction complete.")
 
     cv2.destroyAllWindows()

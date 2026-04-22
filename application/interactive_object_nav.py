@@ -19,7 +19,9 @@ Controls
 
 import cv2
 import hydra
+import json
 import numpy as np
+import os
 from collections import deque
 from omegaconf import DictConfig
 from pathlib import Path
@@ -49,9 +51,27 @@ _shown_windows: set = set()   # windows that have been successfully shown at lea
 _frozen_detection_bgr = None  # frozen YOLOE frame shown until next search
 _frozen_target_cell = None    # last confirmed map target marker
 
+_HEATMAP_MODE_ENV = "VLMAPS_HEATMAP_MODE"
+_HEADLESS_EVAL_ENV = "VLMAPS_EVAL_HEADLESS"
+
+
+def is_eval_headless() -> bool:
+    return str(os.environ.get(_HEADLESS_EVAL_ENV, "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def ui_wait(delay_ms: int) -> int:
+    """UI wait that becomes a no-op during headless evaluation."""
+    if is_eval_headless():
+        return -1
+    return cv2.waitKey(delay_ms)
+
 
 def safe_imshow(name: str, img: np.ndarray) -> None:
     """Show img in a named window. If the user closed it, skip silently."""
+    if is_eval_headless():
+        return
     if name in _closed_windows:
         return
     try:
@@ -75,6 +95,8 @@ def build_rgb_map_2d(robot) -> np.ndarray:
 def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
     """Display the first-person camera view (with optional YOLOE overlay)."""
     global _frozen_detection_bgr
+    if is_eval_headless():
+        return
     if yoloe_frame_bgr is not None:
         frame = yoloe_frame_bgr.copy()
     elif _frozen_detection_bgr is not None:
@@ -84,14 +106,14 @@ def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
         if "color_sensor" in obs:
             frame = cv2.cvtColor(obs["color_sensor"][:, :, :3], cv2.COLOR_RGB2BGR)
         else:
-            cv2.waitKey(1)
+            ui_wait(1)
             return
 
     if label:
         cv2.putText(frame, label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
     safe_imshow("1st person", frame)
-    cv2.waitKey(1)
+    ui_wait(1)
 
 
 def postprocess_heatmap(
@@ -205,6 +227,111 @@ def postprocess_heatmap(
     return cleaned_heatmap, final_mask, kept
 
 
+def get_runtime_heatmap_mode() -> str:
+    """Return the heatmap mode requested for runtime evaluation."""
+    mode = str(os.environ.get(_HEATMAP_MODE_ENV, "postprocessed")).strip().lower()
+    if mode not in {"baseline", "postprocessed"}:
+        print(f"  [heatmap] Unknown mode '{mode}' — falling back to 'postprocessed'")
+        return "postprocessed"
+    return mode
+
+
+def compute_raw_heatmap(robot, category: str, score_thresh: float = 0.3) -> np.ndarray:
+    """Compute the baseline/raw 2D heatmap before postprocessing."""
+    from vlmaps.utils.index_utils import find_similar_category_id
+
+    cat_id = find_similar_category_id(category, robot.map.categories)
+    scores = robot.map.scores_mat[:, cat_id]
+    max_ids = np.argmax(robot.map.scores_mat, axis=1)
+
+    valid = (max_ids == cat_id) & (scores > score_thresh)
+    scores_filtered = np.where(valid, scores, 0.0)
+
+    gs = robot.map.gs
+    heat_2d = np.zeros((gs, gs), dtype=np.float32)
+    for i, pos in enumerate(robot.map.grid_pos):
+        row, col, _ = pos
+        if scores_filtered[i] > heat_2d[row, col]:
+            heat_2d[row, col] = scores_filtered[i]
+
+    mask = heat_2d > 0
+    if mask.any():
+        dist = distance_transform_edt(~mask)
+        heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.3, 0, 1).astype(np.float32))
+        heat_2d[heat_2d < 0.15] = 0
+
+    return heat_2d
+
+
+def _extract_heatmap_components(
+    heatmap: np.ndarray,
+    blur_ksize: int = 5,
+    blur_sigma: float = 1.0,
+    rel_thresh: float = 0.5,
+    min_area: int = 3,
+) -> list:
+    """Extract connected components from a heatmap without filtering them away."""
+    if heatmap.max() < 1e-6:
+        return []
+
+    h = heatmap.astype(np.float32)
+    if blur_ksize > 0:
+        ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+        h_smooth = cv2.GaussianBlur(h, (ksize, ksize), blur_sigma)
+    else:
+        h_smooth = h.copy()
+
+    thr = rel_thresh * h_smooth.max()
+    binary = (h_smooth >= thr).astype(np.uint8)
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    components = []
+    for lbl in range(1, n_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        mask_lbl = labels == lbl
+        vals = heatmap[mask_lbl]
+        if vals.size == 0:
+            continue
+        max_val = float(vals.max())
+        mean_val = float(vals.mean())
+        sum_val = float(vals.sum())
+        bbox = (
+            int(stats[lbl, cv2.CC_STAT_LEFT]),
+            int(stats[lbl, cv2.CC_STAT_TOP]),
+            int(stats[lbl, cv2.CC_STAT_WIDTH]),
+            int(stats[lbl, cv2.CC_STAT_HEIGHT]),
+        )
+        centroid = (float(centroids[lbl, 1]), float(centroids[lbl, 0]))
+        components.append(
+            dict(
+                label=lbl,
+                area=area,
+                max_val=max_val,
+                mean_val=mean_val,
+                sum_val=sum_val,
+                bbox=bbox,
+                centroid=centroid,
+                score=mean_val * np.log1p(area),
+            )
+        )
+
+    if not components:
+        return []
+
+    max_area = max(c["area"] for c in components)
+    max_sum = max(c["sum_val"] for c in components)
+    for c in components:
+        norm_area = c["area"] / max_area if max_area > 0 else 0.0
+        mean_score = c["mean_val"]
+        norm_sum = c["sum_val"] / max_sum if max_sum > 1e-6 else 0.0
+        c["quality"] = 0.20 * norm_area + 0.35 * mean_score + 0.45 * norm_sum
+
+    components.sort(key=lambda c: c["quality"], reverse=True)
+    return components
+
+
 def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
     """Compute the 2D heatmap using continuous CLIP scores instead of binary argmax.
 
@@ -219,39 +346,104 @@ def compute_heatmap(robot, category: str, score_thresh: float = 0.3):
         heat_2d:         float32 (gs, gs) — cleaned heatmap.
         kept_components: list of dicts from postprocess_heatmap (score-sorted).
     """
-    from vlmaps.utils.index_utils import find_similar_category_id
+    mode = get_runtime_heatmap_mode()
+    heat_2d = compute_raw_heatmap(robot, category, score_thresh=score_thresh)
 
-    cat_id = find_similar_category_id(category, robot.map.categories)
-    scores = robot.map.scores_mat[:, cat_id]               # (N,) raw CLIP score
-    max_ids = np.argmax(robot.map.scores_mat, axis=1)       # (N,) winning category
+    if mode == "baseline":
+        kept_components = _extract_heatmap_components(heat_2d)
+        if kept_components:
+            print(f"  Heatmap mode: baseline/raw — {len(kept_components)} component(s) "
+                  f"(areas: {[c['area'] for c in kept_components[:8]]}, "
+                  f"quality: {[round(c['quality'], 3) for c in kept_components[:8]]})")
+        else:
+            print("  Heatmap mode: baseline/raw — no components retained")
+        return heat_2d, kept_components
 
-    # Only keep voxels where this category wins AND score is strong enough
-    valid = (max_ids == cat_id) & (scores > score_thresh)
-    scores_filtered = np.where(valid, scores, 0.0)
-
-    # Project to 2D: max score per (row, col) column
-    gs = robot.map.gs
-    heat_2d = np.zeros((gs, gs), dtype=np.float32)
-    for i, pos in enumerate(robot.map.grid_pos):
-        row, col, _ = pos
-        if scores_filtered[i] > heat_2d[row, col]:
-            heat_2d[row, col] = scores_filtered[i]
-
-    # Tight distance decay — only a ~3-cell (15 cm) fringe around real detections
-    mask = heat_2d > 0
-    if mask.any():
-        dist = distance_transform_edt(~mask)
-        heat_2d = np.where(mask, heat_2d, np.clip(1.0 - dist * 0.3, 0, 1).astype(np.float32))
-        heat_2d[heat_2d < 0.15] = 0
-
-    # Postprocess: remove spurious small activations
     heat_2d, _, kept_components = postprocess_heatmap(heat_2d)
     if kept_components:
-        print(f"  Heatmap postprocess: kept {len(kept_components)} component(s) "
+        print(f"  Heatmap mode: postprocessed — kept {len(kept_components)} component(s) "
               f"(areas: {[c['area'] for c in kept_components]}, "
               f"quality: {[round(c['quality'], 3) for c in kept_components]})")
+    else:
+        print("  Heatmap mode: postprocessed — no components retained")
 
     return heat_2d, kept_components
+
+
+def _room_state_eval_payload(rs) -> dict:
+    return {
+        "name": rs.name,
+        "times_visited": int(rs.times_visited),
+        "candidates_tried": int(rs.candidates_tried),
+        "candidates_confirmed": int(rs.candidates_confirmed),
+        "target_relevance": float(rs.target_relevance),
+        "target_found_here": bool(rs.target_found_here),
+        "navigable_ratio": float(rs.explored_ratio),
+    }
+
+
+def _search_state_eval_payload(ss: SearchState) -> dict:
+    total_tried = int(sum(rs.candidates_tried for rs in ss.rooms.values()))
+    total_confirmed = int(sum(rs.candidates_confirmed for rs in ss.rooms.values()))
+    return {
+        "target": ss.target,
+        "found": bool(ss.found),
+        "current_room": ss.current_room,
+        "visit_history": list(ss.visit_history),
+        "room_transitions": int(max(len(ss.visit_history) - 1, 0)),
+        "total_candidates_tried": total_tried,
+        "total_candidates_confirmed": total_confirmed,
+        "wrong_visits": int(max(total_tried - total_confirmed, 0)),
+        "action_log": list(ss.action_log),
+        "visited_cells_count": int(len(ss.visited_cells)),
+        "rooms": {
+            name: _room_state_eval_payload(rs)
+            for name, rs in ss.rooms.items()
+        },
+    }
+
+
+def build_instruction_eval_summary(
+    instruction: str,
+    categories: list,
+    search_states: dict,
+    robot,
+    room_provider,
+) -> dict:
+    robot._set_nav_curr_pose()
+    final_room = None
+    if room_provider and room_provider.is_available():
+        final_room = room_provider.get_room_at_cell(
+            int(robot.curr_pos_on_map[0]),
+            int(robot.curr_pos_on_map[1]),
+        )
+    return {
+        "instruction": instruction,
+        "targets": [str(c) for c in categories],
+        "final_room": final_room,
+        "heatmap_mode": get_runtime_heatmap_mode(),
+        "target_summaries": {
+            target: _search_state_eval_payload(ss)
+            for target, ss in search_states.items()
+        },
+    }
+
+
+def emit_instruction_eval_summary(
+    instruction: str,
+    categories: list,
+    search_states: dict,
+    robot,
+    room_provider,
+) -> None:
+    payload = build_instruction_eval_summary(
+        instruction,
+        categories,
+        search_states,
+        robot,
+        room_provider,
+    )
+    print(f"[eval-summary] {json.dumps(payload, sort_keys=True)}")
 
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
@@ -266,6 +458,8 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
                      to output_px for readability. Use 0 to show the full map.
         output_px:   Target display size in pixels (square).
     """
+    if is_eval_headless():
+        return
     gs = robot.map.gs
     row = int(robot.curr_pos_on_map[0])
     col = int(robot.curr_pos_on_map[1])
@@ -338,7 +532,7 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
                                  interpolation=cv2.INTER_LINEAR)
 
     safe_imshow("Semantic Map", canvas_bgr)
-    cv2.waitKey(1)
+    ui_wait(1)
 
 
 # ── Navigation helpers ────────────────────────────────────────────────────────
@@ -508,7 +702,7 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     for _ in range(n_turns):
         robot.sim.step(action)
         show_obs(robot, "Facing…")
-        cv2.waitKey(_NAV_STEP_DELAY_MS)
+        ui_wait(_NAV_STEP_DELAY_MS)
     robot._set_nav_curr_pose()
 
 
@@ -576,7 +770,7 @@ def scan_360_and_verify(
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells,
                      label=f"Scan {angle_done}°: {cat}")
-            cv2.waitKey(_NAV_STEP_DELAY_MS)
+            ui_wait(_NAV_STEP_DELAY_MS)
 
             if found:
                 print(f"  YOLOE scan: FOUND '{cat}' at {angle_done}°!")
@@ -922,7 +1116,7 @@ def execute_nav_replay(
         if i % _MAP_REFRESH_STRIDE == 0 or i == _MAX_FOLLOW_STEPS - 1:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=dense_path, label=_step_label)
-        cv2.waitKey(_NAV_STEP_DELAY_MS)
+        ui_wait(_NAV_STEP_DELAY_MS)
 
     print(f"  [nav] Path follower exceeded safety step budget "
           f"({_MAX_FOLLOW_STEPS}) before reaching goal")
@@ -968,7 +1162,7 @@ def nav_recovery_and_replan(
             if i % _MAP_REFRESH_STRIDE == 0 or i == n - 1:
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                          label=_recovery_label)
-            cv2.waitKey(_NAV_STEP_DELAY_MS)
+            ui_wait(_NAV_STEP_DELAY_MS)
         print("  [nav] Recovery complete.")
         return True
     except Exception as e:
@@ -1035,7 +1229,7 @@ def fine_visual_center(
         action = "turn_right" if err_x > 0 else "turn_left"
         print(f"  [center] Step {step_i+1}: err_x={err_x:+.1f}px → {action}")
         robot.sim.step(action)
-        cv2.waitKey(_NAV_STEP_DELAY_MS)
+        ui_wait(_NAV_STEP_DELAY_MS)
 
     robot._set_nav_curr_pose()
     if not detected_once:
@@ -1728,7 +1922,7 @@ def navigate_to_room_stage(
           f"preview={stage_steps} actions)")
     show_map(robot, rgb_map_2d, path_cells=stage_cells,
              label=f"{label_prefix}: {room_name}")
-    cv2.waitKey(300)
+    ui_wait(300)
 
     if stage_steps == 0:
         stage_ok = True
@@ -1869,6 +2063,7 @@ def main(config: DictConfig) -> None:
     _room_provider = getattr(robot, "room_provider", None)
     if _room_provider and _room_provider.is_available():
         print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
+    print(f"Heatmap mode: {get_runtime_heatmap_mode()}")
 
     # Determine which categories actually have signal in the current scene using
     # the same filter as compute_heatmap: voxel must win argmax AND score > 0.3.
@@ -2092,7 +2287,7 @@ def main(config: DictConfig) -> None:
                               f"did not complete cleanly; continuing with candidate approach.")
 
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
-                cv2.waitKey(200)
+                ui_wait(200)
 
                 if not kept_components:
                     print(f"  [skip] No heatmap signal for '{cat}' in this scene.")
@@ -2282,7 +2477,7 @@ def main(config: DictConfig) -> None:
             # Show heatmap + planned path BEFORE executing so the user can see the route
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=f"Path planned: {cat}")
-            cv2.waitKey(800)
+            ui_wait(800)
 
             # Precompute dist_map for the collision shield from the RAW (undilated)
             # obstacle map so doorways are not falsely flagged as low-clearance.
@@ -2511,6 +2706,13 @@ def main(config: DictConfig) -> None:
             if _ss.rooms:
                 print(f"\n{_ss.summary()}")
 
+        emit_instruction_eval_summary(
+            instruction,
+            categories,
+            _search_states,
+            robot,
+            _room_provider,
+        )
         print("\nInstruction complete.")
 
     from vlmaps.utils.yoloe_utils import shutdown_session
