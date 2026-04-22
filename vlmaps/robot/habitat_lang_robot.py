@@ -71,7 +71,12 @@ class HabitatLanguageRobot(LangRobot):
         self.scene_id = scene_id
         vlmaps_data_dir = self.vlmaps_data_save_dirs[scene_id]
         print(vlmaps_data_dir)
-        self.scene_name = vlmaps_data_dir.name.split("_")[0]
+        # Dataset folders are named like:
+        #   mp3d: 00800-TEEsavR23oF_1
+        #   hssd: 108736884_177263634_0
+        # Strip only the trailing collection index, preserving HSSD ids that
+        # themselves contain underscores.
+        self.scene_name = vlmaps_data_dir.name.rsplit("_", 1)[0]
 
         self._setup_sim(self.scene_name)
 

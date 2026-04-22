@@ -35,7 +35,7 @@ import numpy as np
 
 
 SENSOR_HEIGHT = 1.5  # metres (same as interactive_object_nav.py)
-SENSOR_PITCH_DEG = -20.0  # tilt camera down so low objects (chairs, beds, floor clutter) stay in frame
+PREVIEW_SENSOR_PITCH_DEG = -20.0  # only for operator preview while collecting
 WIDTH  = 1080
 HEIGHT = 720
 
@@ -46,26 +46,37 @@ def make_cfg(scene_dataset_config: str, scene_id: str) -> habitat_sim.Configurat
     sim_cfg.scene_id = scene_id
     sim_cfg.enable_physics = False
 
-    pitch_rad = np.deg2rad(SENSOR_PITCH_DEG)
+    preview_pitch_rad = np.deg2rad(PREVIEW_SENSOR_PITCH_DEG)
 
-    color_spec = habitat_sim.CameraSensorSpec()
-    color_spec.uuid = "color_sensor"
-    color_spec.sensor_type = habitat_sim.SensorType.COLOR
-    color_spec.resolution = [HEIGHT, WIDTH]
-    color_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
-    color_spec.orientation = [pitch_rad, 0.0, 0.0]
-    color_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+    # Operator preview: pitched down so collection is easier for a human.
+    preview_color_spec = habitat_sim.CameraSensorSpec()
+    preview_color_spec.uuid = "preview_color_sensor"
+    preview_color_spec.sensor_type = habitat_sim.SensorType.COLOR
+    preview_color_spec.resolution = [HEIGHT, WIDTH]
+    preview_color_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
+    preview_color_spec.orientation = [preview_pitch_rad, 0.0, 0.0]
+    preview_color_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
-    depth_spec = habitat_sim.CameraSensorSpec()
-    depth_spec.uuid = "depth_sensor"
-    depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
-    depth_spec.resolution = [HEIGHT, WIDTH]
-    depth_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
-    depth_spec.orientation = [pitch_rad, 0.0, 0.0]
-    depth_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+    # Saved map sensors: horizontal, matching the legacy setup that produced
+    # well-behaved VLMaps in the earlier scenes.
+    map_color_spec = habitat_sim.CameraSensorSpec()
+    map_color_spec.uuid = "color_sensor"
+    map_color_spec.sensor_type = habitat_sim.SensorType.COLOR
+    map_color_spec.resolution = [HEIGHT, WIDTH]
+    map_color_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
+    map_color_spec.orientation = [0.0, 0.0, 0.0]
+    map_color_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
+
+    map_depth_spec = habitat_sim.CameraSensorSpec()
+    map_depth_spec.uuid = "depth_sensor"
+    map_depth_spec.sensor_type = habitat_sim.SensorType.DEPTH
+    map_depth_spec.resolution = [HEIGHT, WIDTH]
+    map_depth_spec.position = [0.0, SENSOR_HEIGHT, 0.0]
+    map_depth_spec.orientation = [0.0, 0.0, 0.0]
+    map_depth_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     agent_cfg = habitat_sim.agent.AgentConfiguration()
-    agent_cfg.sensor_specifications = [color_spec, depth_spec]
+    agent_cfg.sensor_specifications = [preview_color_spec, map_color_spec, map_depth_spec]
     agent_cfg.action_space = {
         "move_forward": habitat_sim.agent.ActionSpec(
             "move_forward", habitat_sim.agent.ActuationSpec(amount=0.1)
@@ -134,6 +145,7 @@ def main():
     print("  a — turn left     (auto-saved)")
     print("  d — turn right    (auto-saved)")
     print("  q — quit and save poses.txt")
+    print(f"  preview pitch = {PREVIEW_SENSOR_PITCH_DEG:.0f}° ; saved map sensors stay horizontal")
     print()
 
     cfg = make_cfg(args.scene_dataset_config, args.scene_id)
@@ -164,7 +176,7 @@ def main():
 
     while True:
         obs = sim.get_sensor_observations()
-        rgb = obs["color_sensor"][:, :, :3]
+        rgb = obs["preview_color_sensor"][:, :, :3]
         display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
         # HUD
@@ -178,18 +190,19 @@ def main():
 
         moved = False
         if key == ord("w"):
-            obs = sim.step("move_forward")
+            agent.act("move_forward")
             moved = True
         elif key == ord("a"):
-            obs = sim.step("turn_left")
+            agent.act("turn_left")
             moved = True
         elif key == ord("d"):
-            obs = sim.step("turn_right")
+            agent.act("turn_right")
             moved = True
         elif key == ord("q"):
             break
 
         if moved:
+            obs = sim.get_sensor_observations()
             save_frame(obs, agent.get_state(), rgb_dir, depth_dir, frame_id, poses_list)
             frame_id += 1
 
