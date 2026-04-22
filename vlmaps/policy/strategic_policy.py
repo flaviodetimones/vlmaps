@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from vlmaps.policy.actions import ACTION_SCHEMA_PROMPT, Action, ActionType, parse_action_json
 from vlmaps.policy.frontier import find_frontier_in_room
+from vlmaps.utils.object_priors import has_surrogates, pick_surrogate
 
 
 def _base_nav():
@@ -45,6 +46,32 @@ class StrategySnapshot:
     candidate_pool: List[Dict[str, Any]]
     frontier_rooms: Dict[str, Tuple[int, int]]
     query_priors: Dict[str, float]
+    # Phase G — level-3 object support. When the requested target is not in
+    # the VLMap furniture vocabulary, the snapshot is built around a surrogate
+    # furniture category (``effective_target``) but the original object label
+    # is preserved for the YOLOE verification step at arrival.
+    original_target: Optional[str] = None
+    effective_target: Optional[str] = None
+    surrogates_considered: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LlmStats:
+    """Counters accumulated across a target search for [eval-summary]."""
+    calls: int = 0
+    invalid: int = 0
+    retries: int = 0
+    retries_succeeded: int = 0
+    fallbacks: int = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "llm_calls": self.calls,
+            "llm_invalid": self.invalid,
+            "llm_retries": self.retries,
+            "llm_retries_succeeded": self.retries_succeeded,
+            "llm_fallbacks": self.fallbacks,
+        }
 
 
 def _annotate_candidate_rooms(room_provider, kept_components: list) -> None:
@@ -135,9 +162,67 @@ def _frontier_suggestions(ctx, selected_room: Optional[str], room_scores: dict) 
     return suggestions
 
 
+def _select_search_proxies(ctx, categories: list, present_categories: list) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Pick the heatmap-side label for ``ctx.target``.
+
+    For furniture targets (already in the VLMap vocabulary) the original
+    target is used unchanged. For level-3 small objects (bottle, cup,
+    laptop, ...) that the VLMap does not represent, swap the heatmap
+    target for the first available *surrogate furniture* category — the
+    YOLOE verification at arrival keeps using the original object label,
+    so the policy still earns the level-3 detection.
+
+    Returns ``(original, effective, considered)``:
+      - ``original``: original ctx.target (preserved for YOLOE).
+      - ``effective``: surrogate to use for the heatmap, or original if no
+        substitution applies. ``None`` only if ctx.target itself is empty.
+      - ``considered``: surrogate list looked up (empty if not applicable).
+    """
+    target = (ctx.target or "").strip()
+    if not target:
+        return None, None, []
+
+    map_categories = []
+    try:
+        map_categories = list(getattr(ctx.robot.map, "categories", []) or [])
+    except Exception:
+        map_categories = []
+    available = set(c.strip().lower() for c in (map_categories + list(present_categories)) if c)
+
+    target_lower = target.lower()
+    if target_lower in available:
+        return target, target, []
+
+    if not has_surrogates(target):
+        return target, target, []
+
+    chosen, considered = pick_surrogate(target, list(available))
+    if not chosen:
+        print(
+            f"  [strategy] Target '{target}' not in VLMap and no surrogate from "
+            f"{considered} is available — falling back to raw heatmap query"
+        )
+        return target, target, considered
+
+    print(
+        f"  [strategy] Target '{target}' not in VLMap categories; using "
+        f"surrogate furniture '{chosen}' for heatmap (considered={considered})"
+    )
+    return target, chosen, considered
+
+
 def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -> StrategySnapshot:
     base = _base_nav()
-    cat = ctx.target
+    original_target, effective_target, surrogates_considered = _select_search_proxies(
+        ctx, categories, present_categories
+    )
+    cat = effective_target or ctx.target
+    # Use the surrogate (if any) only for the heatmap-side reasoning; the
+    # original target stays in ctx.target so downstream YOLOE keeps verifying
+    # the actual object the user asked for.
+    surrogate_swap_active = bool(
+        original_target and effective_target and original_target != effective_target
+    )
     search_state = ctx.search_state
     room_provider = ctx.room_provider
 
@@ -147,7 +232,15 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
     ctx.heatmap = heatmap
     ctx.kept_components = kept_components
 
-    direct_query_mode = len(categories) == 1 and cat.lower() in {c.lower() for c in present_categories}
+    # Direct furniture query is decided over the *original* target; if we
+    # surrogate-swapped (level-3 object), this is by definition not a direct
+    # furniture nearest-first lookup.
+    _direct_check_label = (original_target or cat).lower()
+    direct_query_mode = (
+        not surrogate_swap_active
+        and len(categories) == 1
+        and _direct_check_label in {c.lower() for c in present_categories}
+    )
     if direct_query_mode:
         print("  Query type: direct furniture — nearest-first policy remains preferred")
     else:
@@ -224,6 +317,9 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
         candidate_pool=candidate_pool,
         frontier_rooms=frontier_rooms,
         query_priors=query_priors,
+        original_target=original_target or ctx.target,
+        effective_target=cat,
+        surrogates_considered=surrogates_considered,
     )
 
 
@@ -313,17 +409,37 @@ def _build_llm_messages(ctx, snapshot: StrategySnapshot, heuristic_action: Actio
     ]
 
 
-def _query_llm_action_text(ctx, snapshot: StrategySnapshot, heuristic_action: Action, model: str = "gpt-4o-mini") -> Optional[str]:
+def _query_llm_action_text(
+    ctx,
+    snapshot: StrategySnapshot,
+    heuristic_action: Action,
+    model: str = "gpt-4o-mini",
+    feedback: Optional[str] = None,
+) -> Optional[str]:
     openai_key = os.environ.get("OPENAI_KEY")
     if not openai_key:
         return None
 
     import openai
 
+    messages = _build_llm_messages(ctx, snapshot, heuristic_action)
+    if feedback:
+        # Phase G — retry path. Append the previous attempt's parser/validator
+        # error so the LLM gets concrete feedback rather than a blind retry.
+        messages.append({
+            "role": "user",
+            "content": (
+                "Your previous action was rejected.\n"
+                f"Reason: {feedback}\n"
+                "Emit ONE corrected action JSON object now, using only the "
+                "allowed rooms and centroids listed above. Do not repeat the "
+                "previous mistake. Respond with the JSON only."
+            ),
+        })
     client = openai.OpenAI(api_key=openai_key)
     response = client.chat.completions.create(
         model=model,
-        messages=_build_llm_messages(ctx, snapshot, heuristic_action),
+        messages=messages,
         max_tokens=200,
         temperature=0.0,
     )
@@ -390,6 +506,47 @@ def _heuristic_next_action(ctx, snapshot: StrategySnapshot) -> Action:
     return Action(type=ActionType.DONE, reason="no viable candidate")
 
 
+def _try_llm_once(
+    ctx,
+    snapshot: StrategySnapshot,
+    heuristic_action: Action,
+    *,
+    llm_model: str,
+    feedback: Optional[str],
+    stats: Optional[LlmStats],
+) -> Tuple[Optional[Action], Optional[str]]:
+    """Run one LLM attempt. Returns (validated_action, error_text).
+
+    On success: ``(action, None)``. On unavailable / parse / validation
+    failure: ``(None, reason)`` so the caller can decide whether to retry.
+    """
+    try:
+        payload = _query_llm_action_text(
+            ctx, snapshot, heuristic_action, model=llm_model, feedback=feedback
+        )
+    except Exception as exc:
+        return None, f"llm_error: {exc}"
+
+    if not payload:
+        return None, "llm_unavailable"
+
+    if stats is not None:
+        stats.calls += 1
+    try:
+        llm_action = parse_action_json(payload)
+    except Exception as exc:
+        if stats is not None:
+            stats.invalid += 1
+        return None, f"parse_error: {exc}"
+
+    if not _validate_llm_action(llm_action, snapshot, ctx):
+        if stats is not None:
+            stats.invalid += 1
+        return None, f"validator_rejected: {llm_action.short()}"
+
+    return llm_action, None
+
+
 def choose_next_action(
     ctx,
     categories: list,
@@ -397,6 +554,8 @@ def choose_next_action(
     *,
     policy_mode: str = "hybrid",
     llm_model: str = "gpt-4o-mini",
+    stats: Optional[LlmStats] = None,
+    max_retries: int = 1,
 ) -> Tuple[Action, Optional[StrategySnapshot]]:
     """Choose the next high-level Action for the executor.
 
@@ -404,6 +563,11 @@ def choose_next_action(
       - "heuristic": deterministic fallback only
       - "llm": require the LLM, fall back only on malformed output/errors
       - "hybrid": prefer LLM, deterministic fallback if unavailable/invalid
+
+    When ``stats`` is provided, LLM call counters (calls, invalid, retries,
+    fallbacks) are accumulated for emission in the per-query [eval-summary].
+    ``max_retries`` bounds the number of feedback-driven LLM retries (1 by
+    default — first try plus one corrective retry).
     """
     policy_mode = (policy_mode or "hybrid").strip().lower()
 
@@ -425,18 +589,35 @@ def choose_next_action(
         print(f"  [strategy] Heuristic action: {heuristic_action.short()}")
         return heuristic_action, snapshot
 
-    try:
-        payload = _query_llm_action_text(ctx, snapshot, heuristic_action, model=llm_model)
-        if payload:
-            llm_action = parse_action_json(payload)
-            if _validate_llm_action(llm_action, snapshot, ctx):
-                print(f"  [strategy] LLM action: {llm_action.short()}")
-                return llm_action, snapshot
-            print(f"  [strategy] LLM action rejected by validator — falling back")
-        else:
-            print("  [strategy] LLM unavailable — falling back to heuristic")
-    except Exception as exc:
-        print(f"  [strategy] LLM policy error: {exc} — falling back")
+    feedback: Optional[str] = None
+    last_reason: Optional[str] = None
+    for attempt in range(max_retries + 1):
+        action, reason = _try_llm_once(
+            ctx, snapshot, heuristic_action,
+            llm_model=llm_model, feedback=feedback, stats=stats,
+        )
+        if action is not None:
+            if attempt > 0 and stats is not None:
+                stats.retries_succeeded += 1
+            tag = "LLM action" if attempt == 0 else f"LLM action (retry {attempt})"
+            print(f"  [strategy] {tag}: {action.short()}")
+            return action, snapshot
 
+        last_reason = reason
+        if reason == "llm_unavailable":
+            print("  [strategy] LLM unavailable — falling back to heuristic")
+            break
+        if attempt >= max_retries:
+            print(f"  [strategy] LLM attempt {attempt} rejected ({reason}) — exhausted retries")
+            break
+        if stats is not None:
+            stats.retries += 1
+        feedback = reason
+        print(f"  [strategy] LLM attempt {attempt} rejected ({reason}) — retrying with feedback")
+
+    if stats is not None:
+        stats.fallbacks += 1
+    if last_reason and last_reason != "llm_unavailable":
+        print(f"  [strategy] LLM final reason: {last_reason}")
     print(f"  [strategy] Heuristic fallback: {heuristic_action.short()}")
     return heuristic_action, snapshot
