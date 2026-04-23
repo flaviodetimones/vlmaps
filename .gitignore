@@ -21,3 +21,6 @@ outputs
 yoloe-11l-seg.pt
 mobileclip_blt.ts
 yoloe-11l-seg.pt
+DepthCamera_*.json
+RenderOption_*.json
+generate_report.py

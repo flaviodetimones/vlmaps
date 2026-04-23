@@ -34,6 +34,10 @@ def _base_nav():
     return base_nav
 
 
+def _room_aware_enabled() -> bool:
+    return str(os.environ.get("VLMAPS_ROOM_AWARE", "on")).strip().lower() in {"1", "true", "on", "yes"}
+
+
 @dataclass
 class StrategySnapshot:
     target: str
@@ -213,6 +217,7 @@ def _select_search_proxies(ctx, categories: list, present_categories: list) -> T
 
 def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -> StrategySnapshot:
     base = _base_nav()
+    room_aware = _room_aware_enabled()
     original_target, effective_target, surrogates_considered = _select_search_proxies(
         ctx, categories, present_categories
     )
@@ -255,7 +260,7 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
     if search_state and kept_components:
         heatmap_ev = _fuse_heatmap_evidence(cat, search_state, kept_components)
 
-    if search_state and kept_components and search_state.rooms and not direct_query_mode:
+    if search_state and kept_components and search_state.rooms and not direct_query_mode and room_aware:
         robot_rc = [ctx.robot.curr_pos_on_map[0], ctx.robot.curr_pos_on_map[1]]
         selected_room, room_scores = base.select_best_room(
             search_state,
@@ -283,6 +288,8 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
             f"  [strategy] Direct furniture query for '{cat}' "
             f"— room selector disabled"
         )
+    elif not room_aware:
+        print("  [strategy] Room-aware disabled — using global candidate pool")
 
     base.show_map(
         ctx.robot,
@@ -301,7 +308,7 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
         query_priors,
         tried,
         robot_pos=robot_rc_sel,
-        enable_room_gate=not direct_query_mode,
+        enable_room_gate=room_aware and not direct_query_mode,
         prefer_nearest_only=direct_query_mode,
     ) if candidate_pool else None
 

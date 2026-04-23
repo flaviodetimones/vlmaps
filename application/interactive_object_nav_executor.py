@@ -38,6 +38,7 @@ from vlmaps.utils.search_state import SearchState
 
 
 _POLICY_MODE = os.environ.get("VLMAPS_POLICY_MODE", "hybrid").strip().lower()
+_ROOM_AWARE = str(os.environ.get("VLMAPS_ROOM_AWARE", "on")).strip().lower() in {"1", "true", "on", "yes"}
 _MAX_STRATEGIC_STEPS = 12
 
 
@@ -132,7 +133,7 @@ def _plan_actions_for_object(
     if search_state and kept_components:
         heatmap_ev = _fuse_heatmap_evidence(cat, search_state, kept_components)
 
-    if search_state and kept_components and search_state.rooms and not direct_query_mode:
+    if search_state and kept_components and search_state.rooms and not direct_query_mode and _ROOM_AWARE:
         robot_rc = [ctx.robot.curr_pos_on_map[0], ctx.robot.curr_pos_on_map[1]]
         selected_room, _room_scores = base.select_best_room(
             search_state,
@@ -178,7 +179,7 @@ def _plan_actions_for_object(
         query_priors,
         tried,
         robot_pos=robot_rc_sel,
-        enable_room_gate=not direct_query_mode,
+        enable_room_gate=_ROOM_AWARE and not direct_query_mode,
         prefer_nearest_only=direct_query_mode,
     )
     if best_comp is None:
@@ -241,6 +242,8 @@ def main(config: DictConfig) -> None:
     if room_provider and room_provider.is_available():
         print(f"Room provider active. Rooms: {room_provider.list_rooms()}")
     print(f"Heatmap mode: {base.get_runtime_heatmap_mode()}")
+    print(f"Policy mode: {_POLICY_MODE}")
+    print(f"Room-aware: {'on' if _ROOM_AWARE else 'off'}")
 
     present_categories = _build_present_categories(robot)
 
