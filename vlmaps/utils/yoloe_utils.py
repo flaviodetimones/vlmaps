@@ -9,6 +9,7 @@ Two modes:
 """
 
 import queue
+import os
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,16 @@ _WEIGHTS_CANDIDATES = [
 
 _WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_worker.py"
 _PERSISTENT_WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_persistent_worker.py"
+
+
+def runtime_conf_thresh(default: float = 0.30) -> float:
+    raw = os.environ.get("VLMAPS_YOLOE_CONF_THRESH")
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
 
 
 def _find_weights() -> str:

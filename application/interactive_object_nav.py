@@ -723,9 +723,9 @@ def scan_360_and_verify(
     Returns True if YOLOE detects the object during the scan.
     """
     global _frozen_detection_bgr
-    from vlmaps.utils.yoloe_utils import get_session
+    from vlmaps.utils.yoloe_utils import get_session, runtime_conf_thresh
 
-    session = get_session(cat, conf_thresh=0.3)
+    session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
     if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
@@ -2293,8 +2293,8 @@ def main(config: DictConfig) -> None:
                     print(f"  [skip] No heatmap signal for '{cat}' in this scene.")
                     continue
 
-                from vlmaps.utils.yoloe_utils import get_session, shutdown_session
-                _yoloe_session = get_session(cat, conf_thresh=0.3)
+                from vlmaps.utils.yoloe_utils import get_session, shutdown_session, runtime_conf_thresh
+                _yoloe_session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
 
             if room_goal is not None:
                 # goal_pos already set to safe interior goal above (Bug 1 fix)
