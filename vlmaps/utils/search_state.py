@@ -85,7 +85,41 @@ class SearchState:
         self.action_log: List[Dict[str, Optional[str]]] = []
         self.visited_cells: List[Tuple[int, int]] = []  # robot cells stepped on
 
+        # Verification-stage telemetry (per-episode). Records at which stage
+        # YOLOE confirmed the target, if any. Five boolean flags + one string
+        # source. Additive — legacy consumers ignore unseen keys.
+        self.found_on_arrival: bool = False
+        self.found_after_turn_to_face: bool = False
+        self.found_after_centering: bool = False
+        self.found_after_local_scan: bool = False
+        self.found_after_alternative_route: bool = False
+        self.final_confirmation_source: Optional[str] = None
+
         self._build_rooms(room_provider, obstacles_map)
+
+    # ------------------------------------------------------------------
+    def mark_confirmation(self, source: str) -> None:
+        """Mark that YOLOE confirmed the target at stage *source*.
+
+        Valid values: arrival, turn_to_face, centering, local_scan,
+        alternative_route. Only the first confirmation sets the final source;
+        further calls are ignored so the *final_confirmation_source* is the
+        stage where the episode actually succeeded.
+        """
+        if source == "arrival":
+            self.found_on_arrival = True
+        elif source == "turn_to_face":
+            self.found_after_turn_to_face = True
+        elif source == "centering":
+            self.found_after_centering = True
+        elif source == "local_scan":
+            self.found_after_local_scan = True
+        elif source == "alternative_route":
+            self.found_after_alternative_route = True
+        else:
+            return
+        if self.final_confirmation_source is None:
+            self.final_confirmation_source = source
 
     # ------------------------------------------------------------------
     def _build_rooms(self, room_provider, obstacles_map: np.ndarray) -> None:

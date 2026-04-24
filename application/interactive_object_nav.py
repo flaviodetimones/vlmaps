@@ -396,6 +396,12 @@ def _search_state_eval_payload(ss: SearchState) -> dict:
         "wrong_visits": int(max(total_tried - total_confirmed, 0)),
         "action_log": list(ss.action_log),
         "visited_cells_count": int(len(ss.visited_cells)),
+        "found_on_arrival": bool(getattr(ss, "found_on_arrival", False)),
+        "found_after_turn_to_face": bool(getattr(ss, "found_after_turn_to_face", False)),
+        "found_after_centering": bool(getattr(ss, "found_after_centering", False)),
+        "found_after_local_scan": bool(getattr(ss, "found_after_local_scan", False)),
+        "found_after_alternative_route": bool(getattr(ss, "found_after_alternative_route", False)),
+        "final_confirmation_source": getattr(ss, "final_confirmation_source", None),
         "rooms": {
             name: _room_state_eval_payload(rs)
             for name, rs in ss.rooms.items()
@@ -799,6 +805,99 @@ def scan_360_and_verify(
 
     if not found:
         print(f"  YOLOE scan: '{cat}' not found after full 360°.")
+    return found
+
+
+def scan_local_and_verify(
+    robot,
+    cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+    path_cells: list,
+    sweep_deg: float = 25.0,
+) -> bool:
+    """Bounded local angular verification — replaces the old 360° scan.
+
+    Only probes the current orientation and two symmetric side views at
+    ±*sweep_deg* (default ±25°). Returns True on the first YOLOE confirmation.
+    The robot is returned to the original heading whether or not a detection
+    is made, so the downstream pose state remains consistent.
+
+    The aim is to avoid long-range false positives that a full 360° rotation
+    would pick up from far-away instances of the same category.
+    """
+    from vlmaps.utils.yoloe_utils import get_session, runtime_conf_thresh
+
+    session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
+    if session is None:
+        print("  (YOLOE not available — skipping local scan)")
+        return False
+
+    step_deg = float(robot.turn_angle)  # native 5° actions
+    if step_deg <= 0:
+        print("  (invalid turn_angle — skipping local scan)")
+        return False
+
+    n_side_steps = int(round(sweep_deg / step_deg))
+    sweep_effective = n_side_steps * step_deg
+    print(
+        f"  Starting local scan (±{sweep_effective:.0f}°, "
+        f"{n_side_steps} steps per side × {step_deg:.0f}°) — NOT a 360° sweep"
+    )
+
+    def _check_now(label: str) -> bool:
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            return False
+        frame = obs["color_sensor"][:, :, :3]
+        det, ann_rgb, _bbox = session.check(frame)
+        if ann_rgb is not None:
+            ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+            show_obs(robot, label, yoloe_frame_bgr=ann_bgr)
+        else:
+            show_obs(robot, label)
+        show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
+                 path_cells=path_cells, label=label)
+        ui_wait(_NAV_STEP_DELAY_MS)
+        return bool(det)
+
+    def _rotate(action: str, steps: int) -> None:
+        for _ in range(max(steps, 0)):
+            robot.sim.step(action)
+            obs = robot.sim.get_sensor_observations(0)
+            if "color_sensor" in obs:
+                show_obs(robot, f"Local scan turn: {cat}")
+            ui_wait(_NAV_STEP_DELAY_MS)
+
+    found = False
+    try:
+        # 0° (current orientation)
+        if _check_now(f"Local scan 0°: {cat}"):
+            print(f"  YOLOE local scan: FOUND '{cat}' at 0°")
+            return True
+
+        # −sweep_deg
+        _rotate("turn_left", n_side_steps)
+        if _check_now(f"Local scan -{sweep_effective:.0f}°: {cat}"):
+            print(f"  YOLOE local scan: FOUND '{cat}' at -{sweep_effective:.0f}°")
+            found = True
+        else:
+            # Back to 0°
+            _rotate("turn_right", n_side_steps)
+
+        if not found:
+            # +sweep_deg
+            _rotate("turn_right", n_side_steps)
+            if _check_now(f"Local scan +{sweep_effective:.0f}°: {cat}"):
+                print(f"  YOLOE local scan: FOUND '{cat}' at +{sweep_effective:.0f}°")
+                found = True
+            # Always return to 0°
+            _rotate("turn_left", n_side_steps)
+    finally:
+        robot._set_nav_curr_pose()
+
+    if not found:
+        print(f"  YOLOE local scan: '{cat}' not found in ±{sweep_effective:.0f}°.")
     return found
 
 
@@ -2535,6 +2634,7 @@ def main(config: DictConfig) -> None:
 
             # Stage 0: YOLOE check at raw arrival (before any rotation)
             _yoloe_confirmed = False
+            _confirmation_source = None
             if _yoloe_session is not None:
                 try:
                     obs_data = robot.sim.get_sensor_observations(0)
@@ -2546,6 +2646,8 @@ def main(config: DictConfig) -> None:
                             show_obs(robot, f"YOLOE arrival: {cat}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
                             print(f"  YOLOE stage 0: ✓ Found '{cat}' at arrival (no rotation needed)!")
+                            print(f"  [verify] source=arrival")
+                            _confirmation_source = "arrival"
                             freeze_found_target(cat, _ann_frame, obj_centroid)
                             # Fix 4: room-entry gate — reject if robot hasn't crossed doorway
                             _s0_comp_room = best_comp.get("room") if best_comp is not None else None
@@ -2567,6 +2669,7 @@ def main(config: DictConfig) -> None:
                                               f"dist={_s0_dist:.1f} cells) "
                                               f"\u2192 tentative only")
                                         _yoloe_confirmed = False
+                                        _confirmation_source = None
                                     else:
                                         print(f"  [room-gate] Room entry confirmed "
                                               f"(dist={_s0_dist:.1f} \u2264 20 cells) "
@@ -2604,6 +2707,8 @@ def main(config: DictConfig) -> None:
                                 show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
+                                print(f"  [verify] source=turn_to_face")
+                                _confirmation_source = "turn_to_face"
                                 freeze_found_target(cat, _ann_frame, obj_centroid)
                                 # Fix 4: room-entry gate for Stage 1
                                 _s1_comp_room = best_comp.get("room") if best_comp is not None else None
@@ -2625,6 +2730,7 @@ def main(config: DictConfig) -> None:
                                                   f"dist={_s1_dist:.1f} cells) "
                                                   f"\u2192 tentative only")
                                             _yoloe_confirmed = False
+                                            _confirmation_source = None
                                         else:
                                             print(f"  [room-gate] Room entry confirmed "
                                                   f"(dist={_s1_dist:.1f} \u2264 20) \u2014 accepting")
@@ -2637,18 +2743,21 @@ def main(config: DictConfig) -> None:
                 else:
                     print("  (YOLOE not available — skipping visual verification)")
 
-            # Stage 2: 360° real-time scan if not confirmed at arrival
+            # Stage 2: local bounded scan (±25°) if not confirmed at arrival
             if not _yoloe_confirmed:
-                print(f"  Starting 360° real-time scan for '{cat}'…")
-                _yoloe_confirmed = scan_360_and_verify(
+                print(f"  Starting local ±25° scan for '{cat}'…")
+                _yoloe_confirmed = scan_local_and_verify(
                     robot, cat, rgb_map_2d, heatmap, path_cells
                 )
-                if _yoloe_confirmed and _yoloe_session is not None:
-                    fine_visual_center(robot, _yoloe_session, cat)
+                if _yoloe_confirmed:
+                    print(f"  [verify] source=local_scan")
+                    _confirmation_source = "local_scan"
+                    if _yoloe_session is not None:
+                        fine_visual_center(robot, _yoloe_session, cat)
 
-            # Stage 3: Alternative route if 360° scan also failed
+            # Stage 3: Alternative route if local scan also failed
             if not _yoloe_confirmed:
-                print(f"  360° scan failed — searching alternative route…")
+                print(f"  Local scan failed — searching alternative route…")
                 robot._set_nav_curr_pose()
                 _navigated_alt = navigate_to_alternative(
                     robot, cat, kept_components,
@@ -2665,6 +2774,8 @@ def main(config: DictConfig) -> None:
                                 show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
                                 print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
+                                print(f"  [verify] source=alternative_route")
+                                _confirmation_source = "alternative_route"
                                 freeze_found_target(cat, _ann_frame, obj_centroid)
                                 fine_visual_center(robot, _yoloe_session, cat)
                             else:
@@ -2688,6 +2799,8 @@ def main(config: DictConfig) -> None:
                 if _yoloe_confirmed:
                     _ss.record_object_seen(_end_room, cat)
                     _ss.mark_found(_end_room)
+                    if _confirmation_source:
+                        _ss.mark_confirmation(_confirmation_source)
 
             if _yoloe_confirmed:
                 show_obs(robot, f"FOUND: {cat}")

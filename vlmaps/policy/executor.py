@@ -188,7 +188,11 @@ def _check_current_view(
         return False
 
 
-def _mark_candidate_result(ctx: ExecutorContext, confirmed: bool) -> Optional[str]:
+def _mark_candidate_result(
+    ctx: ExecutorContext,
+    confirmed: bool,
+    source: Optional[str] = None,
+) -> Optional[str]:
     end_room = sync_pose_state(ctx)
     if ctx.search_state is not None and ctx.last_candidate_centroid is not None:
         ctx.search_state.record_candidate(
@@ -199,6 +203,8 @@ def _mark_candidate_result(ctx: ExecutorContext, confirmed: bool) -> Optional[st
         if confirmed:
             ctx.search_state.record_object_seen(end_room, ctx.target)
             ctx.search_state.mark_found(end_room)
+            if source and hasattr(ctx.search_state, "mark_confirmation"):
+                ctx.search_state.mark_confirmation(source)
     return end_room
 
 
@@ -352,13 +358,17 @@ def _execute_inspect_candidate(ctx: ExecutorContext, action: Action) -> ActionRe
         label=arrival_label,
     )
 
+    found_source: Optional[str] = None
     found = _check_current_view(
         ctx,
         component,
         tuple(ctx.last_candidate_centroid),
         label=f"YOLOE arrival: {ctx.target}",
     )
-    if not found:
+    if found:
+        print(f"  [verify] source=arrival")
+        found_source = "arrival"
+    else:
         print(f"  [executor] Turning to face '{ctx.target}'…")
         base.face_toward_pos(ctx.robot, obj_centroid[0], obj_centroid[1])
         base.show_obs(ctx.robot, f"Executor facing: {ctx.target}")
@@ -375,10 +385,13 @@ def _execute_inspect_candidate(ctx: ExecutorContext, action: Action) -> ActionRe
             tuple(ctx.last_candidate_centroid),
             label=f"YOLOE facing: {ctx.target}",
         )
+        if found:
+            print(f"  [verify] source=turn_to_face")
+            found_source = "turn_to_face"
 
     if found and _ensure_yoloe_session(ctx) is not None:
         base.fine_visual_center(ctx.robot, ctx.yoloe_session, ctx.target)
-        end_room = _mark_candidate_result(ctx, True)
+        end_room = _mark_candidate_result(ctx, True, source=found_source)
         base.show_obs(ctx.robot, f"FOUND: {ctx.target}")
         base.show_map(
             ctx.robot,
@@ -402,18 +415,23 @@ def _execute_verify_target(ctx: ExecutorContext, action: Action) -> ActionResult
         _record_action(ctx, action, "no_candidate")
         return ActionResult(False, message="no_candidate")
 
-    confirmed = base.scan_360_and_verify(
+    print(f"  [executor] Starting local ±25° scan for '{ctx.target}'…")
+    confirmed = base.scan_local_and_verify(
         ctx.robot,
         ctx.target,
         ctx.rgb_map_2d,
         ctx.heatmap,
         ctx.last_path_cells,
     )
-    if confirmed and _ensure_yoloe_session(ctx) is not None:
-        base.fine_visual_center(ctx.robot, ctx.yoloe_session, ctx.target)
-        base.freeze_found_target(ctx.target, None, ctx.last_candidate_centroid)
+    if confirmed:
+        print(f"  [verify] source=local_scan")
+        if _ensure_yoloe_session(ctx) is not None:
+            base.fine_visual_center(ctx.robot, ctx.yoloe_session, ctx.target)
+            base.freeze_found_target(ctx.target, None, ctx.last_candidate_centroid)
 
-    end_room = _mark_candidate_result(ctx, confirmed)
+    end_room = _mark_candidate_result(
+        ctx, confirmed, source=("local_scan" if confirmed else None)
+    )
     outcome = "found" if confirmed else "not_found"
     _record_action(ctx, action, outcome)
 
