@@ -71,10 +71,25 @@ class SearchState:
         target: str,
         room_provider,
         obstacles_map: np.ndarray,
+        *,
+        original_target: Optional[str] = None,
+        effective_target: Optional[str] = None,
+        surrogate_categories: Optional[List[str]] = None,
+        likely_rooms: Optional[List[str]] = None,
+        resolution_source: str = "fallback",
     ):
         self.target: str = target
+        self.original_target: str = original_target or target
+        self.canonical_target: str = target
+        self.effective_target: str = effective_target or target
+        self.surrogate_categories: List[str] = list(surrogate_categories or [])
+        self.likely_rooms: List[str] = list(likely_rooms or [])
+        self.resolution_source: str = resolution_source
         self.rooms: Dict[str, RoomState] = {}
         self.visit_history: List[str] = []   # ordered list of room visits
+        self.rooms_attempted: List[str] = []
+        self.furniture_per_room: Dict[str, int] = {}
+        self.found_in_room: Optional[str] = None
         self.current_room: Optional[str] = None
         self.found: bool = False
         self._tried_centroids: set = set()   # Phase D gate: (int_r, int_c) tried
@@ -92,6 +107,7 @@ class SearchState:
         self.found_after_turn_to_face: bool = False
         self.found_after_centering: bool = False
         self.found_after_local_scan: bool = False
+        self.found_after_pitch_scan: bool = False
         self.found_after_alternative_route: bool = False
         self.final_confirmation_source: Optional[str] = None
 
@@ -102,9 +118,10 @@ class SearchState:
         """Mark that YOLOE confirmed the target at stage *source*.
 
         Valid values: arrival, turn_to_face, centering, local_scan,
-        alternative_route. Only the first confirmation sets the final source;
-        further calls are ignored so the *final_confirmation_source* is the
-        stage where the episode actually succeeded.
+        pitch_scan, alternative_route. Only the first confirmation sets the
+        final source; further calls are ignored so the
+        *final_confirmation_source* is the stage where the episode actually
+        succeeded.
         """
         if source == "arrival":
             self.found_on_arrival = True
@@ -114,6 +131,8 @@ class SearchState:
             self.found_after_centering = True
         elif source == "local_scan":
             self.found_after_local_scan = True
+        elif source == "pitch_scan":
+            self.found_after_pitch_scan = True
         elif source == "alternative_route":
             self.found_after_alternative_route = True
         else:
@@ -167,10 +186,19 @@ class SearchState:
         if room_name and room_name in self.rooms:
             rs = self.rooms[room_name]
             rs.candidates_tried += 1
+            self.mark_room_attempt(room_name, rs.candidates_tried)
             if confirmed:
                 rs.candidates_confirmed += 1
         if centroid is not None:
             self._tried_centroids.add((int(centroid[0]), int(centroid[1])))
+
+    def mark_room_attempt(self, room_name: Optional[str], n_instances_tried: int) -> None:
+        """Track strict room-priority attempts for eval telemetry."""
+        if not room_name:
+            return
+        if room_name not in self.rooms_attempted:
+            self.rooms_attempted.append(room_name)
+        self.furniture_per_room[room_name] = int(n_instances_tried)
 
     def record_object_seen(self, room_name: Optional[str], obj: str) -> None:
         """Record that *obj* was visually confirmed in *room_name*."""
@@ -199,6 +227,7 @@ class SearchState:
     def mark_found(self, room_name: Optional[str]) -> None:
         """Mark the target as found in *room_name*."""
         self.found = True
+        self.found_in_room = room_name
         if room_name and room_name in self.rooms:
             self.rooms[room_name].target_found_here = True
 

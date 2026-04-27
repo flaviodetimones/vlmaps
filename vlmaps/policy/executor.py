@@ -40,6 +40,11 @@ class ExecutorContext:
     robot: Any
     rgb_map_2d: np.ndarray
     target: str
+    original_target: Optional[str] = None
+    effective_target: Optional[str] = None
+    surrogate_categories: List[str] = field(default_factory=list)
+    likely_rooms: List[str] = field(default_factory=list)
+    resolution_source: str = "fallback"
     room_provider: Any = None
     search_state: Any = None
     heatmap: Optional[np.ndarray] = None
@@ -416,21 +421,25 @@ def _execute_verify_target(ctx: ExecutorContext, action: Action) -> ActionResult
         return ActionResult(False, message="no_candidate")
 
     print(f"  [executor] Starting local ±25° scan for '{ctx.target}'…")
+    surrogate_cat = ctx.effective_target if ctx.effective_target != ctx.target else ""
     confirmed = base.scan_local_and_verify(
         ctx.robot,
         ctx.target,
         ctx.rgb_map_2d,
         ctx.heatmap,
         ctx.last_path_cells,
+        surrogate_cat=surrogate_cat or "",
     )
     if confirmed:
-        print(f"  [verify] source=local_scan")
+        verify_source = getattr(ctx.robot, "_last_verify_source", None) or "local_scan"
+        if verify_source != "pitch_scan":
+            print(f"  [verify] source=local_scan")
         if _ensure_yoloe_session(ctx) is not None:
             base.fine_visual_center(ctx.robot, ctx.yoloe_session, ctx.target)
             base.freeze_found_target(ctx.target, None, ctx.last_candidate_centroid)
 
     end_room = _mark_candidate_result(
-        ctx, confirmed, source=("local_scan" if confirmed else None)
+        ctx, confirmed, source=(verify_source if confirmed else None)
     )
     outcome = "found" if confirmed else "not_found"
     _record_action(ctx, action, outcome)

@@ -22,11 +22,12 @@ import hydra
 import json
 import numpy as np
 import os
+from dataclasses import dataclass
 from collections import deque
 from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from vlmaps.utils.search_state import SearchState
 
 # Milliseconds to wait after each discrete sim step for demo playback.
@@ -35,7 +36,11 @@ _NAV_STEP_DELAY_MS: int = 1
 _MAP_REFRESH_STRIDE: int = 2
 
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
-from vlmaps.utils.llm_utils import parse_object_goal_instruction
+from vlmaps.utils.llm_utils import (
+    OpenVocabTargetResolution,
+    parse_object_goal_instruction,
+    resolve_open_vocab_target,
+)
 from vlmaps.utils.mapping_utils import cvt_pose_vec2tf
 from vlmaps.utils.matterport3d_categories import mp3dcat, get_categories
 from vlmaps.utils.room_map_utils import find_room_goal, load_room_map
@@ -53,6 +58,17 @@ _frozen_target_cell = None    # last confirmed map target marker
 
 _HEATMAP_MODE_ENV = "VLMAPS_HEATMAP_MODE"
 _HEADLESS_EVAL_ENV = "VLMAPS_EVAL_HEADLESS"
+
+_SURROGATE_PITCH_DEG = {
+    "counter": [-30.0, -20.0],
+    "table": [-25.0, -15.0],
+    "desk": [-25.0, -15.0],
+    "shelf": [-20.0, -10.0],
+    "sofa": [-10.0, 0.0],
+    "bed": [-20.0, -10.0],
+    "floor": [-35.0, -20.0],
+}
+_DEFAULT_PITCH_DEG = [0.0]
 
 
 def is_eval_headless() -> bool:
@@ -386,10 +402,19 @@ def _search_state_eval_payload(ss: SearchState) -> dict:
     total_tried = int(sum(rs.candidates_tried for rs in ss.rooms.values()))
     total_confirmed = int(sum(rs.candidates_confirmed for rs in ss.rooms.values()))
     return {
+        "original_target": getattr(ss, "original_target", ss.target),
+        "canonical_target": getattr(ss, "canonical_target", ss.target),
+        "effective_target": getattr(ss, "effective_target", ss.target),
+        "surrogate_categories": list(getattr(ss, "surrogate_categories", [])),
+        "likely_rooms": list(getattr(ss, "likely_rooms", [])),
+        "resolution_source": getattr(ss, "resolution_source", "fallback"),
         "target": ss.target,
         "found": bool(ss.found),
         "current_room": ss.current_room,
         "visit_history": list(ss.visit_history),
+        "rooms_attempted": list(getattr(ss, "rooms_attempted", [])),
+        "furniture_per_room": dict(getattr(ss, "furniture_per_room", {})),
+        "found_in_room": getattr(ss, "found_in_room", None),
         "room_transitions": int(max(len(ss.visit_history) - 1, 0)),
         "total_candidates_tried": total_tried,
         "total_candidates_confirmed": total_confirmed,
@@ -400,6 +425,7 @@ def _search_state_eval_payload(ss: SearchState) -> dict:
         "found_after_turn_to_face": bool(getattr(ss, "found_after_turn_to_face", False)),
         "found_after_centering": bool(getattr(ss, "found_after_centering", False)),
         "found_after_local_scan": bool(getattr(ss, "found_after_local_scan", False)),
+        "found_after_pitch_scan": bool(getattr(ss, "found_after_pitch_scan", False)),
         "found_after_alternative_route": bool(getattr(ss, "found_after_alternative_route", False)),
         "final_confirmation_source": getattr(ss, "final_confirmation_source", None),
         "rooms": {
@@ -808,6 +834,50 @@ def scan_360_and_verify(
     return found
 
 
+def _get_color_sensor_rotation(robot):
+    """Return the current color sensor rotation, or None if unavailable."""
+    try:
+        agent_state = robot.sim.get_agent(0).get_state()
+        sensor_state = getattr(agent_state, "sensor_states", {}).get("color_sensor")
+        return getattr(sensor_state, "rotation", None)
+    except Exception:
+        return None
+
+
+def _set_color_sensor_rotation(robot, rotation) -> bool:
+    """Set the color sensor world rotation while preserving the agent pose."""
+    try:
+        agent = robot.sim.get_agent(0)
+        agent_state = agent.get_state()
+        sensor_state = getattr(agent_state, "sensor_states", {}).get("color_sensor")
+        if sensor_state is None:
+            return False
+        sensor_state.rotation = rotation
+        agent_state.sensor_states["color_sensor"] = sensor_state
+        try:
+            agent.set_state(agent_state, infer_sensor_states=False)
+        except TypeError:
+            agent.set_state(agent_state)
+        return True
+    except Exception as exc:
+        print(f"  [verify] pitch_scan unavailable: {exc}")
+        return False
+
+
+def _set_color_sensor_pitch(robot, base_rotation, pitch_deg: float) -> bool:
+    """Apply a camera-local pitch offset relative to *base_rotation*."""
+    try:
+        import quaternion
+
+        pitch_delta = quaternion.from_rotation_vector(
+            [np.deg2rad(float(pitch_deg)), 0.0, 0.0]
+        )
+        return _set_color_sensor_rotation(robot, base_rotation * pitch_delta)
+    except Exception as exc:
+        print(f"  [verify] pitch_scan unavailable: {exc}")
+        return False
+
+
 def scan_local_and_verify(
     robot,
     cat: str,
@@ -815,6 +885,7 @@ def scan_local_and_verify(
     heatmap: np.ndarray,
     path_cells: list,
     sweep_deg: float = 25.0,
+    surrogate_cat: str = "",
 ) -> bool:
     """Bounded local angular verification — replaces the old 360° scan.
 
@@ -832,6 +903,7 @@ def scan_local_and_verify(
     if session is None:
         print("  (YOLOE not available — skipping local scan)")
         return False
+    setattr(robot, "_last_verify_source", None)
 
     step_deg = float(robot.turn_angle)  # native 5° actions
     if step_deg <= 0:
@@ -874,12 +946,14 @@ def scan_local_and_verify(
         # 0° (current orientation)
         if _check_now(f"Local scan 0°: {cat}"):
             print(f"  YOLOE local scan: FOUND '{cat}' at 0°")
+            setattr(robot, "_last_verify_source", "local_scan")
             return True
 
         # −sweep_deg
         _rotate("turn_left", n_side_steps)
         if _check_now(f"Local scan -{sweep_effective:.0f}°: {cat}"):
             print(f"  YOLOE local scan: FOUND '{cat}' at -{sweep_effective:.0f}°")
+            setattr(robot, "_last_verify_source", "local_scan")
             found = True
         else:
             # Back to 0°
@@ -890,6 +964,7 @@ def scan_local_and_verify(
             _rotate("turn_right", n_side_steps)
             if _check_now(f"Local scan +{sweep_effective:.0f}°: {cat}"):
                 print(f"  YOLOE local scan: FOUND '{cat}' at +{sweep_effective:.0f}°")
+                setattr(robot, "_last_verify_source", "local_scan")
                 found = True
             # Always return to 0°
             _rotate("turn_left", n_side_steps)
@@ -897,7 +972,32 @@ def scan_local_and_verify(
         robot._set_nav_curr_pose()
 
     if not found:
-        print(f"  YOLOE local scan: '{cat}' not found in ±{sweep_effective:.0f}°.")
+        surrogate_key = (surrogate_cat or "").strip().lower()
+        pitch_values = _SURROGATE_PITCH_DEG.get(surrogate_key, _DEFAULT_PITCH_DEG)
+        base_sensor_rotation = _get_color_sensor_rotation(robot)
+        if base_sensor_rotation is not None:
+            print(
+                f"  Starting pitch scan for '{cat}' "
+                f"(surrogate={surrogate_key or 'none'}, pitches={pitch_values})"
+            )
+            try:
+                for pitch_deg in pitch_values:
+                    if not _set_color_sensor_pitch(robot, base_sensor_rotation, pitch_deg):
+                        continue
+                    if _check_now(f"Pitch scan {pitch_deg:.0f}°: {cat}"):
+                        print(f"  [verify] source=pitch_scan pitch={pitch_deg:.1f}")
+                        print(f"  YOLOE pitch scan: FOUND '{cat}' at pitch={pitch_deg:.1f}°")
+                        setattr(robot, "_last_verify_source", "pitch_scan")
+                        found = True
+                        break
+            finally:
+                _set_color_sensor_rotation(robot, base_sensor_rotation)
+                robot._set_nav_curr_pose()
+        else:
+            print("  [verify] pitch_scan skipped: color sensor rotation unavailable")
+
+    if not found:
+        print(f"  YOLOE local scan: '{cat}' not found in ±{sweep_effective:.0f}° plus pitch scan.")
     return found
 
 
@@ -2087,6 +2187,101 @@ def _resolve_instruction_room_targets(instruction: str, categories: list, room_p
     return resolved
 
 
+@dataclass(frozen=True)
+class ResolvedTargetPlan:
+    original_target: str
+    canonical_target: str
+    effective_target: str
+    surrogate_categories: List[str]
+    likely_rooms: List[str]
+    resolution_source: str
+    room_goal: Optional[list] = None
+
+
+def build_resolved_target_plans(
+    categories: list,
+    *,
+    room_provider,
+    room_regions,
+    available_categories: list,
+    present_categories: list,
+) -> List[ResolvedTargetPlan]:
+    """Resolve parsed targets into room goals or open-vocabulary object plans."""
+    known_rooms = room_provider.list_rooms() if room_provider and room_provider.is_available() else []
+    plans: List[ResolvedTargetPlan] = []
+    for cat in categories:
+        raw = str(cat or "").strip()
+        if not raw:
+            continue
+
+        room_goal = None
+        if room_provider and room_provider.is_available():
+            room_goal = room_provider.get_room_centroid(raw)
+        if room_goal is None and room_regions:
+            room_goal = find_room_goal(raw, room_regions)
+
+        if room_goal is not None:
+            plans.append(
+                ResolvedTargetPlan(
+                    original_target=raw,
+                    canonical_target=raw,
+                    effective_target=raw,
+                    surrogate_categories=[],
+                    likely_rooms=[raw],
+                    resolution_source="room_command",
+                    room_goal=list(room_goal),
+                )
+            )
+            continue
+
+        resolution: OpenVocabTargetResolution = resolve_open_vocab_target(
+            raw,
+            available_categories,
+            known_rooms=known_rooms,
+            present_categories=present_categories,
+        )
+        plans.append(
+            ResolvedTargetPlan(
+                original_target=resolution.original_target,
+                canonical_target=resolution.canonical_target,
+                effective_target=resolution.effective_target,
+                surrogate_categories=list(resolution.surrogate_categories),
+                likely_rooms=list(resolution.likely_rooms),
+                resolution_source=resolution.source,
+                room_goal=None,
+            )
+        )
+    return plans
+
+
+def log_resolved_target_plans(plans: List[ResolvedTargetPlan]) -> None:
+    """Print the resolved navigation targets in a compact, audit-friendly format."""
+    pretty = []
+    for plan in plans:
+        if plan.room_goal is not None:
+            pretty.append(f"{plan.original_target} [room]")
+            continue
+        if (
+            plan.original_target == plan.canonical_target
+            and plan.effective_target == plan.canonical_target
+            and not plan.surrogate_categories
+        ):
+            pretty.append(plan.canonical_target)
+            continue
+        desc = (
+            f"{plan.original_target} -> canonical={plan.canonical_target}, "
+            f"heatmap={plan.effective_target}, source={plan.resolution_source}"
+        )
+        if plan.surrogate_categories:
+            desc += f", surrogates={plan.surrogate_categories}"
+        if plan.likely_rooms:
+            desc += f", likely_rooms={plan.likely_rooms}"
+        pretty.append(desc)
+    print("Targets:")
+    for line in pretty:
+        print(f"  - {line}")
+
+
 def find_best_start_pose(robot):
     """
     Scan ~30 evenly-spaced trajectory poses and return the one whose 2-D map
@@ -2216,7 +2411,14 @@ def main(config: DictConfig) -> None:
             instruction, categories, _room_provider
         )
 
-        print(f"Targets: {categories}")
+        target_plans = build_resolved_target_plans(
+            categories,
+            room_provider=_room_provider,
+            room_regions=_room_regions,
+            available_categories=_scene_categories,
+            present_categories=_present_categories,
+        )
+        log_resolved_target_plans(target_plans)
 
         robot.set_agent_state(start_tf)
         robot._set_nav_curr_pose()
@@ -2225,34 +2427,54 @@ def main(config: DictConfig) -> None:
         show_map(robot, rgb_map_2d, label="Start")
 
         # ── Phase B+C: build per-room search state and compute object→room priors ──
-        _search_states: dict = {}  # cat → SearchState
-        for cat in categories:
-            _c = cat.strip()
-            _ss = SearchState(_c, _room_provider, robot.map.obstacles_map)
+        _search_states: dict = {}  # original_target → SearchState
+        for _plan in target_plans:
+            _ss = SearchState(
+                _plan.canonical_target,
+                _room_provider,
+                robot.map.obstacles_map,
+                original_target=_plan.original_target,
+                effective_target=_plan.effective_target,
+                surrogate_categories=_plan.surrogate_categories,
+                likely_rooms=_plan.likely_rooms,
+                resolution_source=_plan.resolution_source,
+            )
             if _ss.rooms:
                 # Phase C: compute priors (LLM + manual table + scene evidence)
                 _priors = _ss.compute_priors()
                 if _priors:
                     _sorted = sorted(_priors.items(), key=lambda x: x[1], reverse=True)
                     _prior_str = ", ".join(f"{r}={v:.2f}" for r, v in _sorted if v > 0.01)
-                    print(f"  Room priors for '{_c}': {_prior_str}")
-            _search_states[_c] = _ss
+                    print(f"  Room priors for '{_plan.canonical_target}': {_prior_str}")
+            _search_states[_plan.original_target] = _ss
 
-        for cat in categories:
-            cat = cat.strip()
-            if not cat:
+        for _plan in target_plans:
+            _raw_cat = _plan.original_target.strip()
+            if not _raw_cat:
                 continue
             _frozen_detection_bgr = None  # clear previous detection freeze
             _frozen_target_cell = None
-            _ss = _search_states.get(cat)
-            print(f"\nPlanning path to: {cat}")
+            _ss = _search_states.get(_plan.original_target)
+            _yoloe_target = _plan.canonical_target
+            _heatmap_target = _plan.effective_target
+            print(f"\nPlanning path to: {_raw_cat}")
+            if _plan.room_goal is None and (
+                _plan.original_target != _plan.canonical_target
+                or _plan.effective_target != _plan.canonical_target
+                or _plan.surrogate_categories
+            ):
+                print(
+                    f"  [open-vocab] original='{_plan.original_target}' "
+                    f"canonical='{_plan.canonical_target}' heatmap='{_plan.effective_target}' "
+                    f"source={_plan.resolution_source}"
+                )
+                if _plan.surrogate_categories:
+                    print(f"  [open-vocab] validated surrogates: {_plan.surrogate_categories}")
+                if _plan.likely_rooms:
+                    print(f"  [open-vocab] likely rooms: {_plan.likely_rooms}")
 
             # ── Check if target is a room name (room-level navigation) ────────
-            room_goal = None
-            if _room_provider and _room_provider.is_available():
-                room_goal = _room_provider.get_room_centroid(cat)
-            if room_goal is None and _room_regions:
-                room_goal = find_room_goal(cat, _room_regions)
+            room_goal = list(_plan.room_goal) if _plan.room_goal is not None else None
 
             # Track current room in SearchState
             robot._set_nav_curr_pose()
@@ -2268,7 +2490,7 @@ def main(config: DictConfig) -> None:
 
             if room_goal is not None:
                 # Bug 1: replace raw centroid with safe reachable room goals
-                print(f"  Requested room command: {cat}")
+                print(f"  Requested room command: {_raw_cat}")
                 print(f"  Current room: {current_room or 'unknown'}")
                 raw_centroid = list(room_goal)
                 print(f"  Raw centroid: {raw_centroid}")
@@ -2283,7 +2505,7 @@ def main(config: DictConfig) -> None:
                 # so room goals are guaranteed navigable by the planner.
                 _safe_map_for_rooms = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
                 _room_safe_goals = find_reachable_room_goal(
-                    cat, _room_provider, _safe_map_for_rooms
+                    _raw_cat, _room_provider, _safe_map_for_rooms
                 )
                 if _room_safe_goals:
                     goal_pos = _room_safe_goals[0]
@@ -2299,12 +2521,13 @@ def main(config: DictConfig) -> None:
                 # Object-level: compute heatmap and prepare YOLOE
                 print(f"  Current room: {current_room or 'unknown'}")
                 print("  Computing semantic heatmap...")
-                heatmap, kept_components = compute_heatmap(robot, cat)
+                heatmap, kept_components = compute_heatmap(robot, _heatmap_target)
                 _heatmap_ev = {}
                 _selected_room = None
                 _present_set = {c.lower() for c in _present_categories}
                 _direct_query_mode = (
-                    len(categories) == 1 and cat.lower() in _present_set
+                    len(target_plans) == 1 and _heatmap_target.lower() in _present_set
+                    and _heatmap_target.lower() == _yoloe_target.lower()
                 )
 
                 # Annotate each component with its room
@@ -2334,7 +2557,7 @@ def main(config: DictConfig) -> None:
                     _known_rooms_list = list(_ss.rooms.keys())
                     _seen_objs = {n: rs.objects_seen for n, rs in _ss.rooms.items()}
                     _new_priors = _crp(
-                        cat, _known_rooms_list, _seen_objs,
+                        _yoloe_target, _known_rooms_list, _seen_objs,
                         heatmap_evidence=_heatmap_ev, query_type="direct",
                     )
                     for _rn, _rv in _new_priors.items():
@@ -2359,14 +2582,14 @@ def main(config: DictConfig) -> None:
                     if _selected_room is not None:
                         _room_kept = [c for c in kept_components if c.get("room") == _selected_room]
                         if _room_kept:
-                            print(f"  [room-select] Chosen room for '{cat}': {_selected_room} "
+                            print(f"  [room-select] Chosen room for '{_yoloe_target}': {_selected_room} "
                                   f"({len(_room_kept)}/{len(kept_components)} candidate(s))")
                             kept_components = _room_kept
                         else:
                             print(f"  [room-select] Chosen room '{_selected_room}' has no direct "
                                   f"candidates — falling back to global ranking")
                 elif _direct_query_mode:
-                    print(f"  [room-select] Direct furniture query for '{cat}' "
+                    print(f"  [room-select] Direct furniture query for '{_yoloe_target}' "
                           f"— room selector disabled, nearest candidate policy active")
 
                 if _selected_room and current_room != _selected_room:
@@ -2385,15 +2608,15 @@ def main(config: DictConfig) -> None:
                         print(f"  [room-stage] Warning: staging move toward '{_selected_room}' "
                               f"did not complete cleanly; continuing with candidate approach.")
 
-                show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {cat}")
+                show_map(robot, rgb_map_2d, heatmap_2d=heatmap, label=f"Planning: {_yoloe_target}")
                 ui_wait(200)
 
                 if not kept_components:
-                    print(f"  [skip] No heatmap signal for '{cat}' in this scene.")
+                    print(f"  [skip] No heatmap signal for '{_heatmap_target}' in this scene.")
                     continue
 
                 from vlmaps.utils.yoloe_utils import get_session, shutdown_session, runtime_conf_thresh
-                _yoloe_session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
+                _yoloe_session = get_session(_yoloe_target, conf_thresh=runtime_conf_thresh(0.3))
 
             if room_goal is not None:
                 # goal_pos already set to safe interior goal above (Bug 1 fix)
@@ -2417,7 +2640,7 @@ def main(config: DictConfig) -> None:
                     prefer_nearest_only=_direct_query_mode,
                 )
                 if best_comp is None:
-                    print(f"  [skip] No viable candidate for '{cat}'.")
+                    print(f"  [skip] No viable candidate for '{_yoloe_target}'.")
                     continue
 
                 _hc_r, _hc_c = best_comp["centroid"]
@@ -2563,7 +2786,7 @@ def main(config: DictConfig) -> None:
                                 _ss._tried_centroids = _tried_set_now
 
                     if not _safe_alt_found:
-                        print(f"  [safety] No safe candidate found for '{cat}' — skipping.")
+                        print(f"  [safety] No safe candidate found for '{_yoloe_target}' — skipping.")
                         if _yoloe_session is not None:
                             from vlmaps.utils.yoloe_utils import shutdown_session
                             shutdown_session()
@@ -2575,7 +2798,7 @@ def main(config: DictConfig) -> None:
 
             # Show heatmap + planned path BEFORE executing so the user can see the route
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=path_cells, label=f"Path planned: {cat}")
+                     path_cells=path_cells, label=f"Path planned: {_yoloe_target}")
             ui_wait(800)
 
             # Precompute dist_map for the collision shield from the RAW (undilated)
@@ -2584,20 +2807,20 @@ def main(config: DictConfig) -> None:
             _dist_map_shield = distance_transform_edt(robot.map.obstacles_map)
 
             if already_at_goal:
-                print(f"  Already at goal for '{cat}' — proceeding with verification.")
+                print(f"  Already at goal for '{_yoloe_target}' — proceeding with verification.")
                 completed = True
             else:
                 print(f"  Executing path follower over {len(path_polyline)} polyline waypoint(s) "
                       f"/ {len(path_cells)} dense cell(s)…")
                 # One-shot execution: no recovery or replanning on failure.
                 completed = execute_nav_replay(
-                    robot, planned_actions, cat, rgb_map_2d, heatmap, path_polyline,
+                    robot, planned_actions, _yoloe_target, rgb_map_2d, heatmap, path_polyline,
                     display_path_cells=path_cells,
                     dist_map=_dist_map_shield,
                     goal_reached_tol_cells=1.0 if room_goal is not None else None,
                 )
                 if not completed:
-                    print(f"  [nav] Path execution stopped early for '{cat}' "
+                    print(f"  [nav] Path execution stopped early for '{_yoloe_target}' "
                           f"(stuck or shield). Continuing from current position.")
 
             # ── Room-level navigation: one-shot arrival check (no retry) ────
@@ -2609,15 +2832,15 @@ def main(config: DictConfig) -> None:
                         int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
                     )
                 print(f"  Actual room after path: {_arrived_room or 'unknown'}")
-                _room_ok = _room_instance_matches(_arrived_room, cat)
-                _room_status = f"Arrived: {cat}" if _room_ok else f"Not reached: {cat}"
+                _room_ok = _room_instance_matches(_arrived_room, _raw_cat)
+                _room_status = f"Arrived: {_raw_cat}" if _room_ok else f"Not reached: {_raw_cat}"
                 show_obs(robot, _room_status)
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                          path_cells=path_cells, label=_room_status)
                 if _room_ok:
-                    print(f"  Arrived at room '{cat}' (actual: {_arrived_room}). Done.")
+                    print(f"  Arrived at room '{_raw_cat}' (actual: {_arrived_room}). Done.")
                 else:
-                    print(f"  Room navigation FAILED: requested '{cat}', "
+                    print(f"  Room navigation FAILED: requested '{_raw_cat}', "
                           f"ended in '{_arrived_room or 'unknown'}'.")
 
                 if _ss:
@@ -2627,7 +2850,7 @@ def main(config: DictConfig) -> None:
                 start_tf = agent_state2tf(agent_state)
                 continue
 
-            _arrival_label = f"Arrived: {cat}" if completed else f"Stopped before goal: {cat}"
+            _arrival_label = f"Arrived: {_yoloe_target}" if completed else f"Stopped before goal: {_yoloe_target}"
             show_obs(robot, _arrival_label)
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                      path_cells=path_cells, label=_arrival_label)
@@ -2643,12 +2866,12 @@ def main(config: DictConfig) -> None:
                         _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                         if _ann_frame is not None:
                             ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                            show_obs(robot, f"YOLOE arrival: {cat}", yoloe_frame_bgr=ann_bgr)
+                            show_obs(robot, f"YOLOE arrival: {_yoloe_target}", yoloe_frame_bgr=ann_bgr)
                         if _yoloe_confirmed:
-                            print(f"  YOLOE stage 0: ✓ Found '{cat}' at arrival (no rotation needed)!")
+                            print(f"  YOLOE stage 0: ✓ Found '{_yoloe_target}' at arrival (no rotation needed)!")
                             print(f"  [verify] source=arrival")
                             _confirmation_source = "arrival"
-                            freeze_found_target(cat, _ann_frame, obj_centroid)
+                            freeze_found_target(_yoloe_target, _ann_frame, obj_centroid)
                             # Fix 4: room-entry gate — reject if robot hasn't crossed doorway
                             _s0_comp_room = best_comp.get("room") if best_comp is not None else None
                             if (_s0_comp_room and _room_provider
@@ -2681,18 +2904,18 @@ def main(config: DictConfig) -> None:
 
             # ── Face the object (skip if already confirmed) ───────────────────
             if not _yoloe_confirmed:
-                print(f"  Turning to face '{cat}'…")
+                print(f"  Turning to face '{_yoloe_target}'…")
                 if room_goal is None:
                     face_toward_pos(robot, obj_centroid[0], obj_centroid[1])
                 else:
                     try:
-                        robot.face(cat)
+                        robot.face(_raw_cat)
                         robot._set_nav_curr_pose()
                     except Exception:
                         pass
-                show_obs(robot, f"Facing: {cat}")
+                show_obs(robot, f"Facing: {_yoloe_target}")
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                         path_cells=path_cells, label=f"Facing: {cat}")
+                         path_cells=path_cells, label=f"Facing: {_yoloe_target}")
 
             # Stage 1: YOLOE check after facing (skip if already confirmed)
             if not _yoloe_confirmed:
@@ -2704,12 +2927,12 @@ def main(config: DictConfig) -> None:
                             _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                             if _ann_frame is not None:
                                 ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                                show_obs(robot, f"YOLOE: {cat}", yoloe_frame_bgr=ann_bgr)
+                                show_obs(robot, f"YOLOE: {_yoloe_target}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
-                                print(f"  YOLOE: ✓ Found '{cat}'! (bbox center: {_bbox})")
+                                print(f"  YOLOE: ✓ Found '{_yoloe_target}'! (bbox center: {_bbox})")
                                 print(f"  [verify] source=turn_to_face")
                                 _confirmation_source = "turn_to_face"
-                                freeze_found_target(cat, _ann_frame, obj_centroid)
+                                freeze_found_target(_yoloe_target, _ann_frame, obj_centroid)
                                 # Fix 4: room-entry gate for Stage 1
                                 _s1_comp_room = best_comp.get("room") if best_comp is not None else None
                                 if (_s1_comp_room and _room_provider
@@ -2735,9 +2958,9 @@ def main(config: DictConfig) -> None:
                                             print(f"  [room-gate] Room entry confirmed "
                                                   f"(dist={_s1_dist:.1f} \u2264 20) \u2014 accepting")
                                 if _yoloe_confirmed:
-                                    fine_visual_center(robot, _yoloe_session, cat)
+                                    fine_visual_center(robot, _yoloe_session, _yoloe_target)
                             else:
-                                print(f"  YOLOE: ✗ '{cat}' not detected.")
+                                print(f"  YOLOE: ✗ '{_yoloe_target}' not detected.")
                     except Exception as e:
                         print(f"  YOLOE error: {e}")
                 else:
@@ -2745,22 +2968,30 @@ def main(config: DictConfig) -> None:
 
             # Stage 2: local bounded scan (±25°) if not confirmed at arrival
             if not _yoloe_confirmed:
-                print(f"  Starting local ±25° scan for '{cat}'…")
+                print(f"  Starting local ±25° scan for '{_yoloe_target}'…")
+                _pitch_surrogate = _heatmap_target if _heatmap_target != _yoloe_target else ""
                 _yoloe_confirmed = scan_local_and_verify(
-                    robot, cat, rgb_map_2d, heatmap, path_cells
+                    robot,
+                    _yoloe_target,
+                    rgb_map_2d,
+                    heatmap,
+                    path_cells,
+                    surrogate_cat=_pitch_surrogate,
                 )
                 if _yoloe_confirmed:
-                    print(f"  [verify] source=local_scan")
-                    _confirmation_source = "local_scan"
+                    _scan_source = getattr(robot, "_last_verify_source", None) or "local_scan"
+                    if _scan_source != "pitch_scan":
+                        print(f"  [verify] source=local_scan")
+                    _confirmation_source = _scan_source
                     if _yoloe_session is not None:
-                        fine_visual_center(robot, _yoloe_session, cat)
+                        fine_visual_center(robot, _yoloe_session, _yoloe_target)
 
             # Stage 3: Alternative route if local scan also failed
             if not _yoloe_confirmed:
                 print(f"  Local scan failed — searching alternative route…")
                 robot._set_nav_curr_pose()
                 _navigated_alt = navigate_to_alternative(
-                    robot, cat, kept_components,
+                    robot, _yoloe_target, kept_components,
                     robot.curr_pos_on_map, rgb_map_2d, heatmap
                 )
                 if _navigated_alt and _yoloe_session is not None:
@@ -2771,19 +3002,19 @@ def main(config: DictConfig) -> None:
                             _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                             if _ann_frame is not None:
                                 ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
-                                show_obs(robot, f"YOLOE alt: {cat}", yoloe_frame_bgr=ann_bgr)
+                                show_obs(robot, f"YOLOE alt: {_yoloe_target}", yoloe_frame_bgr=ann_bgr)
                             if _yoloe_confirmed:
-                                print(f"  YOLOE (alternative): ✓ Found '{cat}'!")
+                                print(f"  YOLOE (alternative): ✓ Found '{_yoloe_target}'!")
                                 print(f"  [verify] source=alternative_route")
                                 _confirmation_source = "alternative_route"
-                                freeze_found_target(cat, _ann_frame, obj_centroid)
-                                fine_visual_center(robot, _yoloe_session, cat)
+                                freeze_found_target(_yoloe_target, _ann_frame, obj_centroid)
+                                fine_visual_center(robot, _yoloe_session, _yoloe_target)
                             else:
-                                print(f"  YOLOE (alternative): ✗ '{cat}' not found. Giving up.")
+                                print(f"  YOLOE (alternative): ✗ '{_yoloe_target}' not found. Giving up.")
                     except Exception as e:
                         print(f"  YOLOE error at alternative: {e}")
                 elif not _navigated_alt:
-                    print(f"  No viable alternative route for '{cat}'.")
+                    print(f"  No viable alternative route for '{_yoloe_target}'.")
 
             # ── Update SearchState with result ────────────────────────────
             robot._set_nav_curr_pose()
@@ -2797,15 +3028,15 @@ def main(config: DictConfig) -> None:
                 _ss.record_candidate(_end_room, _yoloe_confirmed,
                                      centroid=obj_centroid if 'obj_centroid' in dir() else None)
                 if _yoloe_confirmed:
-                    _ss.record_object_seen(_end_room, cat)
+                    _ss.record_object_seen(_end_room, _yoloe_target)
                     _ss.mark_found(_end_room)
                     if _confirmation_source:
                         _ss.mark_confirmation(_confirmation_source)
 
             if _yoloe_confirmed:
-                show_obs(robot, f"FOUND: {cat}")
+                show_obs(robot, f"FOUND: {_yoloe_target}")
                 show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                         path_cells=path_cells, label=f"FOUND: {cat}",
+                         path_cells=path_cells, label=f"FOUND: {_yoloe_target}",
                          target_cell=_frozen_target_cell)
 
             print(f"  Done. YOLOE confirmed: {_yoloe_confirmed}")
@@ -2821,7 +3052,7 @@ def main(config: DictConfig) -> None:
 
         emit_instruction_eval_summary(
             instruction,
-            categories,
+            [plan.original_target for plan in target_plans],
             _search_states,
             robot,
             _room_provider,
