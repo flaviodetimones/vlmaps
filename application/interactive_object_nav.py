@@ -71,6 +71,16 @@ _SURROGATE_PITCH_DEG = {
 _DEFAULT_PITCH_DEG = [0.0]
 
 
+def _pitch_candidates(values):
+    """Return pitch candidates plus mirrored signs to avoid Habitat axis ambiguity."""
+    candidates = []
+    for value in values:
+        for candidate in (float(value), -float(value)):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
 def is_eval_headless() -> bool:
     return str(os.environ.get(_HEADLESS_EVAL_ENV, "")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -973,25 +983,49 @@ def scan_local_and_verify(
 
     if not found:
         surrogate_key = (surrogate_cat or "").strip().lower()
-        pitch_values = _SURROGATE_PITCH_DEG.get(surrogate_key, _DEFAULT_PITCH_DEG)
+        pitch_values = _pitch_candidates(_SURROGATE_PITCH_DEG.get(surrogate_key, _DEFAULT_PITCH_DEG))
         base_sensor_rotation = _get_color_sensor_rotation(robot)
+        original_sensor_rotation = base_sensor_rotation
         if base_sensor_rotation is not None:
             print(
-                f"  Starting pitch scan for '{cat}' "
-                f"(surrogate={surrogate_key or 'none'}, pitches={pitch_values})"
+                f"  Starting pitch grid scan for '{cat}' "
+                f"(yaw=-{sweep_effective:.0f}/0/+{sweep_effective:.0f}, "
+                f"surrogate={surrogate_key or 'none'}, pitches={pitch_values})"
             )
             try:
-                for pitch_deg in pitch_values:
-                    if not _set_color_sensor_pitch(robot, base_sensor_rotation, pitch_deg):
-                        continue
-                    if _check_now(f"Pitch scan {pitch_deg:.0f}°: {cat}"):
-                        print(f"  [verify] source=pitch_scan pitch={pitch_deg:.1f}")
-                        print(f"  YOLOE pitch scan: FOUND '{cat}' at pitch={pitch_deg:.1f}°")
-                        setattr(robot, "_last_verify_source", "pitch_scan")
-                        found = True
+                yaw_steps = [
+                    ("0", None, None),
+                    (f"-{sweep_effective:.0f}", "turn_left", "turn_right"),
+                    (f"+{sweep_effective:.0f}", "turn_right", "turn_left"),
+                ]
+                for yaw_label, yaw_action, undo_action in yaw_steps:
+                    if yaw_action:
+                        _rotate(yaw_action, n_side_steps)
+                    try:
+                        base_sensor_rotation = _get_color_sensor_rotation(robot)
+                        for pitch_deg in pitch_values:
+                            if not _set_color_sensor_pitch(robot, base_sensor_rotation, pitch_deg):
+                                continue
+                            if _check_now(f"Pitch grid yaw={yaw_label}° pitch={pitch_deg:.0f}°: {cat}"):
+                                print(
+                                    f"  [verify] source=pitch_scan "
+                                    f"yaw={yaw_label} pitch={pitch_deg:.1f}"
+                                )
+                                print(
+                                    f"  YOLOE pitch scan: FOUND '{cat}' "
+                                    f"at yaw={yaw_label}° pitch={pitch_deg:.1f}°"
+                                )
+                                setattr(robot, "_last_verify_source", "pitch_scan")
+                                found = True
+                                break
+                    finally:
+                        _set_color_sensor_rotation(robot, base_sensor_rotation)
+                        if undo_action:
+                            _rotate(undo_action, n_side_steps)
+                    if found:
                         break
             finally:
-                _set_color_sensor_rotation(robot, base_sensor_rotation)
+                _set_color_sensor_rotation(robot, original_sensor_rotation)
                 robot._set_nav_curr_pose()
         else:
             print("  [verify] pitch_scan skipped: color sensor rotation unavailable")
@@ -3010,7 +3044,26 @@ def main(config: DictConfig) -> None:
                                 freeze_found_target(_yoloe_target, _ann_frame, obj_centroid)
                                 fine_visual_center(robot, _yoloe_session, _yoloe_target)
                             else:
-                                print(f"  YOLOE (alternative): ✗ '{_yoloe_target}' not found. Giving up.")
+                                print(
+                                    f"  YOLOE (alternative): ✗ '{_yoloe_target}' not found; "
+                                    "running bounded local scan from alternative pose."
+                                )
+                                _yoloe_confirmed = scan_local_and_verify(
+                                    robot,
+                                    _yoloe_target,
+                                    rgb_map_2d,
+                                    heatmap,
+                                    path_cells,
+                                    surrogate_cat=_pitch_surrogate,
+                                )
+                                if _yoloe_confirmed:
+                                    _scan_source = getattr(robot, "_last_verify_source", None) or "local_scan"
+                                    if _scan_source != "pitch_scan":
+                                        print(f"  [verify] source=local_scan")
+                                    _confirmation_source = _scan_source
+                                    fine_visual_center(robot, _yoloe_session, _yoloe_target)
+                                else:
+                                    print(f"  YOLOE (alternative scan): ✗ '{_yoloe_target}' not found. Giving up.")
                     except Exception as e:
                         print(f"  YOLOE error at alternative: {e}")
                 elif not _navigated_alt:
