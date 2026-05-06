@@ -85,6 +85,11 @@ class SearchState:
         self.surrogate_categories: List[str] = list(surrogate_categories or [])
         self.likely_rooms: List[str] = list(likely_rooms or [])
         self.resolution_source: str = resolution_source
+        # Set by the instruction parser when the user explicitly pinned a
+        # room ("X in the Y"). When set, the search must stay strictly
+        # within this room: no alternative-route fallbacks to other rooms,
+        # no global retries. Defaults to None for unhinted ambiguous queries.
+        self.pinned_room: Optional[str] = None
         self.rooms: Dict[str, RoomState] = {}
         self.visit_history: List[str] = []   # ordered list of room visits
         self.rooms_attempted: List[str] = []
@@ -109,7 +114,24 @@ class SearchState:
         self.found_after_local_scan: bool = False
         self.found_after_pitch_scan: bool = False
         self.found_after_alternative_route: bool = False
+        self.found_after_zone_exploration: bool = False
         self.final_confirmation_source: Optional[str] = None
+
+        # Zone exploration telemetry. These counters are intentionally flat:
+        # evaluation scripts can consume them without understanding the full
+        # state machine internals.
+        self.entered_zone_exploration: bool = False
+        self.n_exploration_points_planned: int = 0
+        self.n_exploration_points_visited: int = 0
+        self.n_unique_scan_zones: int = 0
+        self.n_low_conf_detections: int = 0
+        self.n_approach_attempts: int = 0
+        self.n_false_positive_zones: int = 0
+        self.continuous_yoloe_triggered: bool = False
+        self.final_success_source: Optional[str] = None
+        self.unique_scan_zones: List[Tuple[int, int]] = []
+        self.exploration_points: List[Tuple[int, int]] = []
+        self.false_positive_zones: List[Tuple[int, int]] = []
 
         self._build_rooms(room_provider, obstacles_map)
 
@@ -118,11 +140,12 @@ class SearchState:
         """Mark that YOLOE confirmed the target at stage *source*.
 
         Valid values: arrival, turn_to_face, centering, local_scan,
-        pitch_scan, alternative_route. Only the first confirmation sets the
+        pitch_scan, alternative_route, zone_explore. Only the first confirmation sets the
         final source; further calls are ignored so the
         *final_confirmation_source* is the stage where the episode actually
         succeeded.
         """
+        source_key = str(source or "").strip()
         if source == "arrival":
             self.found_on_arrival = True
         elif source == "turn_to_face":
@@ -133,12 +156,60 @@ class SearchState:
             self.found_after_local_scan = True
         elif source == "pitch_scan":
             self.found_after_pitch_scan = True
-        elif source == "alternative_route":
+        elif source == "alternative_route" or source_key.startswith("pin_sweep"):
             self.found_after_alternative_route = True
+        elif source == "zone_explore" or source_key.startswith("zone_explore"):
+            self.found_after_zone_exploration = True
         else:
-            return
+            # Keep custom sources in final telemetry even if they do not map
+            # to one of the legacy boolean buckets.
+            pass
         if self.final_confirmation_source is None:
             self.final_confirmation_source = source
+        if self.final_success_source is None:
+            self.final_success_source = source
+
+    # ------------------------------------------------------------------
+    def record_scan_zone(self, row: int, col: int, radius_cells: float = 0.0) -> bool:
+        """Record a physical scan zone, deduplicating nearby cells.
+
+        Returns True when this is a new zone and False when a previous scan was
+        already close enough to cover it.
+        """
+        cell = (int(row), int(col))
+        radius = max(0.0, float(radius_cells))
+        for er, ec in self.unique_scan_zones:
+            if float((er - cell[0]) ** 2 + (ec - cell[1]) ** 2) <= radius * radius:
+                return False
+        self.unique_scan_zones.append(cell)
+        self.n_unique_scan_zones = len(self.unique_scan_zones)
+        return True
+
+    def record_zone_exploration(self, planned_points: List[Tuple[int, int]]) -> None:
+        """Record that zone exploration was entered for this instruction."""
+        self.entered_zone_exploration = True
+        self.exploration_points = [(int(r), int(c)) for r, c in planned_points]
+        self.n_exploration_points_planned = len(self.exploration_points)
+
+    def record_exploration_visit(self, row: int, col: int) -> None:
+        """Record that an exploration point was reached or attempted."""
+        self.n_exploration_points_visited += 1
+        self.record_visited_cell(row, col)
+
+    def record_low_conf_detection(self) -> None:
+        """Record a low-threshold YOLOE trigger during room exploration."""
+        self.n_low_conf_detections += 1
+        self.continuous_yoloe_triggered = True
+
+    def record_approach_attempt(self) -> None:
+        """Record one approach/confirmation attempt after a visual trigger."""
+        self.n_approach_attempts += 1
+
+    def record_false_positive_zone(self, row: int, col: int) -> None:
+        """Record a visual trigger that failed high-threshold confirmation."""
+        cell = (int(row), int(col))
+        self.false_positive_zones.append(cell)
+        self.n_false_positive_zones = len(self.false_positive_zones)
 
     # ------------------------------------------------------------------
     def _build_rooms(self, room_provider, obstacles_map: np.ndarray) -> None:

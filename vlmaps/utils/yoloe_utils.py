@@ -29,7 +29,17 @@ _WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_worker.py"
 _PERSISTENT_WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_persistent_worker.py"
 
 
-def runtime_conf_thresh(default: float = 0.30) -> float:
+def runtime_conf_thresh(default: float = 0.65) -> float:
+    """Confidence threshold applied to every YOLOE session.
+
+    Default raised to 0.65 (was 0.30) per the user's request: this is a
+    very restrictive threshold that mostly eliminates false positives
+    (mirror reflections, distant objects mis-classified, etc.). Pair this
+    with placements that put the target on the FRONT EDGE of the host
+    furniture so the robot gets a large, in-focus bbox. Override with
+    ``VLMAPS_YOLOE_CONF_THRESH`` if a specific run needs a softer bar
+    (e.g. ablation testing).
+    """
     raw = os.environ.get("VLMAPS_YOLOE_CONF_THRESH")
     if raw is None:
         return float(default)
@@ -162,14 +172,20 @@ class YoloeSession:
             self._proc.stdin.flush()
             line = self._proc.stdout.readline().strip()
 
-        # Parse response: "0" or "1|cx|cy"
+        # Parse response: "0" or "1|cx|cy" or "1|cx|cy|conf"
         parts = line.split("|")
         found = (parts[0] == "1")
         bbox_center: Optional[Tuple[float, float]] = None
-        if found and len(parts) == 3:
+        if found and len(parts) >= 3:
             try:
                 bbox_center = (float(parts[1]), float(parts[2]))
             except ValueError:
+                pass
+        if found and len(parts) >= 4:
+            try:
+                _conf_val = float(parts[3])
+                print(f"  [YOLOE-CONF] target={self.target} conf={_conf_val:.3f} bbox=({bbox_center[0]:.0f},{bbox_center[1]:.0f})", flush=True)
+            except (ValueError, TypeError):
                 pass
 
         ann_rgb = frame_rgb.copy()
@@ -270,10 +286,14 @@ def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession
     """
     global _session
 
-    if _session is not None and _session.target == target:
+    if (
+        _session is not None
+        and _session.target == target
+        and abs(float(getattr(_session, "conf_thresh", conf_thresh)) - float(conf_thresh)) < 1e-9
+    ):
         return _session
 
-    # Stop previous session if target changed
+    # Stop previous session if target or confidence threshold changed.
     if _session is not None:
         _session.stop()
         _session = None

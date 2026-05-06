@@ -22,17 +22,24 @@ import hydra
 import json
 import numpy as np
 import os
+import re
+import time
 from dataclasses import dataclass
 from collections import deque
 from omegaconf import DictConfig
 from pathlib import Path
 from scipy.ndimage import distance_transform_edt
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from vlmaps.utils.search_state import SearchState
 
 # Milliseconds to wait after each discrete sim step for demo playback.
 # Keep this low and throttle heavy redraws separately so the UI stays fluid.
 _NAV_STEP_DELAY_MS: int = 1
+# Slower per-step delay during local angular scans so the camera motion
+# looks fluid to a human observer instead of teleporting between angles.
+# YOLOE false positives drop too because frames are no longer captured
+# mid-flight between two discrete poses.
+_SCAN_STEP_DELAY_MS: int = 60
 _MAP_REFRESH_STRIDE: int = 2
 
 from vlmaps.robot.habitat_lang_robot import HabitatLanguageRobot
@@ -59,16 +66,102 @@ _frozen_target_cell = None    # last confirmed map target marker
 _HEATMAP_MODE_ENV = "VLMAPS_HEATMAP_MODE"
 _HEADLESS_EVAL_ENV = "VLMAPS_EVAL_HEADLESS"
 
-_SURROGATE_PITCH_DEG = {
-    "counter": [-30.0, -20.0],
-    "table": [-25.0, -15.0],
-    "desk": [-25.0, -15.0],
-    "shelf": [-20.0, -10.0],
-    "sofa": [-10.0, 0.0],
-    "bed": [-20.0, -10.0],
-    "floor": [-35.0, -20.0],
+_SURROGATE_PITCH_DEG = {}
+_DEFAULT_PITCH_DEG = [-15.0]
+
+_ROOM_EXPLORATION_ENV = "VLMAPS_ROOM_EXPLORATION"
+_ROOM_EXPLORE_MAX_POINTS_ENV = "VLMAPS_EXPLORE_MAX_POINTS"
+_ROOM_EXPLORE_TIMEOUT_ENV = "VLMAPS_EXPLORE_TIMEOUT_S"
+_ROOM_SCAN_DEDUP_RADIUS_ENV = "VLMAPS_SCAN_DEDUP_RADIUS_M"
+_ROOM_YOLOE_LOW_THRESH_ENV = "VLMAPS_YOLOE_ROOM_LOW_THRESH"
+_ROOM_YOLOE_CONFIRM_THRESH_ENV = "VLMAPS_YOLOE_CONFIRM_THRESH"
+_ROOM_MAX_APPROACH_ATTEMPTS_ENV = "VLMAPS_MAX_APPROACH_ATTEMPTS"
+
+_DEFAULT_ROOM_EXPLORE_MAX_POINTS = 8
+_DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
+_DEFAULT_SCAN_DEDUP_RADIUS_M = 1.5
+_DEFAULT_YOLOE_LOW_THRESH = 0.40
+_DEFAULT_YOLOE_CONFIRM_THRESH = 0.65
+_DEFAULT_MAX_APPROACH_ATTEMPTS = 3
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, default: int, min_value: Optional[int] = None) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    if min_value is not None:
+        value = max(int(min_value), value)
+    return value
+
+
+def _env_float(name: str, default: float, min_value: Optional[float] = None) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    if min_value is not None:
+        value = max(float(min_value), value)
+    return value
+
+
+def _room_exploration_enabled() -> bool:
+    return _env_flag(_ROOM_EXPLORATION_ENV, False)
+
+
+def _confirm_conf_thresh() -> float:
+    from vlmaps.utils.yoloe_utils import runtime_conf_thresh
+
+    return runtime_conf_thresh(
+        _env_float(_ROOM_YOLOE_CONFIRM_THRESH_ENV, _DEFAULT_YOLOE_CONFIRM_THRESH, 0.01)
+    )
+
+
+def _scan_dedup_radius_cells(robot) -> float:
+    radius_m = _env_float(
+        _ROOM_SCAN_DEDUP_RADIUS_ENV,
+        _DEFAULT_SCAN_DEDUP_RADIUS_M,
+        0.0,
+    )
+    cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
+    return radius_m / cell_size
+
+_YOLOE_VERIFY_ALIASES = {
+    "coffee maker": ["coffee machine", "espresso machine", "coffee pot"],
+    "coffee machine": ["coffee maker", "espresso machine", "coffee pot"],
+    "kettle": ["tea kettle", "electric kettle", "teapot"],
+    "mug": ["cup", "coffee mug"],
+    "trash bin": ["trash can", "waste bin", "garbage can"],
+    "trash can": ["trash bin", "waste bin", "garbage can"],
+    "laptop": ["notebook computer", "computer", "macbook", "open laptop"],
+    "book": ["hardcover book", "paperback book", "novel", "book on table"],
+    "bottle": ["water bottle", "plastic bottle"],
+    "teapot": ["tea pot", "ceramic teapot"],
+    "toaster": ["bread toaster", "pop-up toaster"],
 }
-_DEFAULT_PITCH_DEG = [0.0]
+
+_STRICT_LIKELY_ROOM_TARGETS = {
+    "coffee maker",
+    "coffee machine",
+    "kettle",
+    "laptop",
+    "toaster",
+    "trash bin",
+    "trash can",
+    "waste bin",
+    "book",
+    "mug",
+    "cup",
+    "teapot",
+    "bottle",
+}
 
 
 def _pitch_candidates(values):
@@ -79,6 +172,28 @@ def _pitch_candidates(values):
             if candidate not in candidates:
                 candidates.append(candidate)
     return candidates
+
+
+def _verification_labels(cat: str) -> List[str]:
+    """Return the YOLOE labels to try for an open-vocabulary target.
+
+    By default ONLY the primary label is returned: if the user asks for
+    'mug', YOLOE looks for 'mug' and nothing else (no fallback to 'cup',
+    'coffee mug', etc.). Set ``VLMAPS_YOLOE_USE_ALIASES=1`` to re-enable
+    the alias retry chain — useful for ablation runs but disabled by
+    default per user spec ("si le paso mug, vaya a por mug y a por nada
+    más").
+    """
+    primary = str(cat or "").strip()
+    if not primary:
+        return []
+    if os.environ.get("VLMAPS_YOLOE_USE_ALIASES") not in ("1", "true", "yes"):
+        return [primary]
+    labels = [primary]
+    for alias in _YOLOE_VERIFY_ALIASES.get(primary.lower(), []):
+        if alias and alias not in labels:
+            labels.append(alias)
+    return labels
 
 
 def is_eval_headless() -> bool:
@@ -437,7 +552,20 @@ def _search_state_eval_payload(ss: SearchState) -> dict:
         "found_after_local_scan": bool(getattr(ss, "found_after_local_scan", False)),
         "found_after_pitch_scan": bool(getattr(ss, "found_after_pitch_scan", False)),
         "found_after_alternative_route": bool(getattr(ss, "found_after_alternative_route", False)),
+        "found_after_zone_exploration": bool(getattr(ss, "found_after_zone_exploration", False)),
         "final_confirmation_source": getattr(ss, "final_confirmation_source", None),
+        "entered_zone_exploration": bool(getattr(ss, "entered_zone_exploration", False)),
+        "n_exploration_points_planned": int(getattr(ss, "n_exploration_points_planned", 0)),
+        "n_exploration_points_visited": int(getattr(ss, "n_exploration_points_visited", 0)),
+        "n_unique_scan_zones": int(getattr(ss, "n_unique_scan_zones", 0)),
+        "n_low_conf_detections": int(getattr(ss, "n_low_conf_detections", 0)),
+        "n_approach_attempts": int(getattr(ss, "n_approach_attempts", 0)),
+        "n_false_positive_zones": int(getattr(ss, "n_false_positive_zones", 0)),
+        "continuous_yoloe_triggered": bool(getattr(ss, "continuous_yoloe_triggered", False)),
+        "final_success_source": getattr(ss, "final_success_source", None),
+        "unique_scan_zones": [list(p) for p in getattr(ss, "unique_scan_zones", [])],
+        "exploration_points": [list(p) for p in getattr(ss, "exploration_points", [])],
+        "false_positive_zones": [list(p) for p in getattr(ss, "false_positive_zones", [])],
         "rooms": {
             name: _room_state_eval_payload(rs)
             for name, rs in ss.rooms.items()
@@ -725,7 +853,8 @@ def _visible_lookahead_index(
     return min(len(dense_path) - 1, start_idx + 1)
 
 
-def face_toward_pos(robot, target_row: float, target_col: float) -> None:
+def face_toward_pos(robot, target_row: float, target_col: float,
+                    smooth: bool = False, label: str = "Facing…") -> None:
     """Turn robot to face directly toward a specific map (row, col) position.
 
     Coordinate math (base frame: x=north=-row, y=west=-col, CCW-positive):
@@ -733,6 +862,10 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     Turn sign: robot.turn(+) = turn_right (CW) = decreasing base angle,
       matching convert_goal_to_actions convention (turn_right_angle = curr - target).
     Each step is shown individually for smooth demo visualisation.
+
+    If *smooth* is True, the per-step UI wait uses ``_SCAN_STEP_DELAY_MS``
+    (60 ms) instead of the default 1 ms so the camera glides toward the
+    target instead of teleporting. Use this before a verification scan.
     """
     robot._set_nav_curr_pose()
     dx = target_row - robot.curr_pos_on_map[0]   # positive = south = -x_base
@@ -741,10 +874,11 @@ def face_toward_pos(robot, target_row: float, target_col: float) -> None:
     turn = (robot.curr_ang_deg_on_map - angle + 180) % 360 - 180  # +→CW→turn_right
     n_turns = int(abs(turn) / robot.turn_angle)
     action = "turn_right" if turn > 0 else "turn_left"
+    delay = _SCAN_STEP_DELAY_MS if smooth else _NAV_STEP_DELAY_MS
     for _ in range(n_turns):
         robot.sim.step(action)
-        show_obs(robot, "Facing…")
-        ui_wait(_NAV_STEP_DELAY_MS)
+        show_obs(robot, label)
+        ui_wait(delay)
     robot._set_nav_curr_pose()
 
 
@@ -765,9 +899,9 @@ def scan_360_and_verify(
     Returns True if YOLOE detects the object during the scan.
     """
     global _frozen_detection_bgr
-    from vlmaps.utils.yoloe_utils import get_session, runtime_conf_thresh
+    from vlmaps.utils.yoloe_utils import get_session
 
-    session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
+    session = get_session(cat, conf_thresh=_confirm_conf_thresh())
     if session is None:
         print("  (YOLOE not available — skipping 360° scan)")
         return False
@@ -888,14 +1022,43 @@ def _set_color_sensor_pitch(robot, base_rotation, pitch_deg: float) -> bool:
         return False
 
 
+def _smooth_pitch_glide(robot, base_rotation, from_deg: float, to_deg: float,
+                        n_steps: int = 6, label: str = "") -> bool:
+    """Interpolate camera pitch from from_deg to to_deg in n_steps frames.
+
+    Renders an intermediate observation each step so the operator (or the
+    eval log) sees a continuous tilt instead of a snap. Returns True if
+    the final pitch was applied successfully.
+    """
+    if abs(to_deg - from_deg) < 0.5:
+        return _set_color_sensor_pitch(robot, base_rotation, to_deg)
+    n = max(int(n_steps), 1)
+    delta = (to_deg - from_deg) / float(n)
+    ok = True
+    for s in range(1, n + 1):
+        interp = from_deg + delta * s
+        ok = _set_color_sensor_pitch(robot, base_rotation, interp)
+        if not ok:
+            break
+        try:
+            obs = robot.sim.get_sensor_observations(0)
+            if "color_sensor" in obs and label:
+                show_obs(robot, label)
+        except Exception:
+            pass
+        ui_wait(max(_SCAN_STEP_DELAY_MS // n, 30))
+    return ok
+
+
 def scan_local_and_verify(
     robot,
     cat: str,
     rgb_map_2d: np.ndarray,
     heatmap: np.ndarray,
     path_cells: list,
-    sweep_deg: float = 25.0,
+    sweep_deg: float = 45.0,
     surrogate_cat: str = "",
+    target_cell: Optional[Tuple[int, int]] = None,
 ) -> bool:
     """Bounded local angular verification — replaces the old 360° scan.
 
@@ -904,12 +1067,19 @@ def scan_local_and_verify(
     The robot is returned to the original heading whether or not a detection
     is made, so the downstream pose state remains consistent.
 
+    If *target_cell* is provided (e.g. the surrogate's heatmap centroid),
+    the robot first orients smoothly toward that cell so the centre of the
+    sweep (and the pitch grid that follows) faces the actual furniture
+    rather than wherever the navigator happened to leave the heading. The
+    pitch sub-scan is then performed ONLY at the centre yaw — looking
+    up/down at the heatmap centroid — instead of at every yaw angle.
+
     The aim is to avoid long-range false positives that a full 360° rotation
     would pick up from far-away instances of the same category.
     """
-    from vlmaps.utils.yoloe_utils import get_session, runtime_conf_thresh
+    from vlmaps.utils.yoloe_utils import get_session
 
-    session = get_session(cat, conf_thresh=runtime_conf_thresh(0.3))
+    session = get_session(cat, conf_thresh=_confirm_conf_thresh())
     if session is None:
         print("  (YOLOE not available — skipping local scan)")
         return False
@@ -922,10 +1092,50 @@ def scan_local_and_verify(
 
     n_side_steps = int(round(sweep_deg / step_deg))
     sweep_effective = n_side_steps * step_deg
+    if target_cell is not None:
+        print(
+            f"  Facing surrogate centroid at cell {tuple(int(v) for v in target_cell)} "
+            f"before scan (smooth)"
+        )
+        try:
+            face_toward_pos(robot, float(target_cell[0]), float(target_cell[1]),
+                            smooth=True, label=f"Facing centroid: {cat}")
+        except Exception as _e:
+            print(f"  (face_toward_pos failed: {_e})")
     print(
         f"  Starting local scan (±{sweep_effective:.0f}°, "
         f"{n_side_steps} steps per side × {step_deg:.0f}°) — NOT a 360° sweep"
     )
+
+    # Sticky last-positive overlay: once we see the target on any frame we
+    # keep showing the annotated frame on subsequent (idle) frames so the
+    # bbox does not visually flicker off as the camera glides past it.
+    last_positive_bgr: list = [None]
+    last_positive_rgb: list = [None]   # kept around so callers can freeze
+    freeze_cell = (
+        (int(target_cell[0]), int(target_cell[1]))
+        if target_cell is not None else None
+    )
+
+    def _persist_detection(ann_rgb_frame, ann_bgr_frame) -> None:
+        """Once YOLOE confirms, freeze the bbox on screen and stash it on
+        the robot so downstream stages (close approach, post-summary)
+        do not lose the marker. Per user spec: a detection stays visible
+        until the next request clears it."""
+        if ann_rgb_frame is None and ann_bgr_frame is None:
+            return
+        if ann_rgb_frame is not None:
+            last_positive_rgb[0] = ann_rgb_frame
+        if ann_bgr_frame is not None:
+            last_positive_bgr[0] = ann_bgr_frame
+        # Freeze in the global slot used by show_obs/show_map between calls.
+        try:
+            freeze_found_target(cat, last_positive_rgb[0], freeze_cell)
+        except Exception:
+            pass
+        # Also stash on robot so close_approach can use the bbox even if
+        # its own first frame happens to miss the detection.
+        setattr(robot, "_last_yoloe_positive_bgr", last_positive_bgr[0])
 
     def _check_now(label: str) -> bool:
         obs = robot.sim.get_sensor_observations(0)
@@ -935,21 +1145,50 @@ def scan_local_and_verify(
         det, ann_rgb, _bbox = session.check(frame)
         if ann_rgb is not None:
             ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+            if det:
+                _persist_detection(ann_rgb, ann_bgr)
             show_obs(robot, label, yoloe_frame_bgr=ann_bgr)
+        elif last_positive_bgr[0] is not None:
+            # Keep the last positive visible so the operator does not lose
+            # sight of the detection between intermediate negative frames.
+            show_obs(robot, label, yoloe_frame_bgr=last_positive_bgr[0])
         else:
             show_obs(robot, label)
         show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
                  path_cells=path_cells, label=label)
-        ui_wait(_NAV_STEP_DELAY_MS)
+        ui_wait(_SCAN_STEP_DELAY_MS)
         return bool(det)
 
-    def _rotate(action: str, steps: int) -> None:
+    def _rotate(action: str, steps: int, check_each_step: bool = True) -> bool:
+        """Rotate *steps* discrete actions, redrawing each frame for smooth
+        motion. When *check_each_step* is True, run YOLOE on every
+        intermediate frame and return early if the target is detected —
+        avoids missing the object as it sweeps through the field of view.
+        Returns True if a positive detection happened mid-rotation.
+        """
         for _ in range(max(steps, 0)):
             robot.sim.step(action)
             obs = robot.sim.get_sensor_observations(0)
+            ann_bgr = None
+            mid_hit = False
+            if "color_sensor" in obs and check_each_step:
+                frame = obs["color_sensor"][:, :, :3]
+                det, ann_rgb, _b = session.check(frame)
+                if ann_rgb is not None:
+                    ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+                if det:
+                    mid_hit = True
+                    _persist_detection(ann_rgb, ann_bgr)
             if "color_sensor" in obs:
-                show_obs(robot, f"Local scan turn: {cat}")
-            ui_wait(_NAV_STEP_DELAY_MS)
+                # Keep the last positive overlay sticky if this intermediate
+                # frame had no detection — bbox does not flicker off.
+                show_bgr = ann_bgr if ann_bgr is not None else last_positive_bgr[0]
+                show_obs(robot, f"Local scan turn: {cat}", yoloe_frame_bgr=show_bgr)
+            ui_wait(_SCAN_STEP_DELAY_MS)
+            if mid_hit:
+                setattr(robot, "_last_verify_source", "local_scan")
+                return True
+        return False
 
     found = False
     try:
@@ -959,25 +1198,29 @@ def scan_local_and_verify(
             setattr(robot, "_last_verify_source", "local_scan")
             return True
 
-        # −sweep_deg
-        _rotate("turn_left", n_side_steps)
+        # −sweep_deg (smooth, with YOLOE checks every step)
+        if _rotate("turn_left", n_side_steps):
+            print(f"  YOLOE local scan: FOUND '{cat}' mid-sweep (turning left)")
+            return True
         if _check_now(f"Local scan -{sweep_effective:.0f}°: {cat}"):
             print(f"  YOLOE local scan: FOUND '{cat}' at -{sweep_effective:.0f}°")
             setattr(robot, "_last_verify_source", "local_scan")
             found = True
         else:
-            # Back to 0°
-            _rotate("turn_right", n_side_steps)
+            # Back to 0° (no need to check during return — just glide back)
+            _rotate("turn_right", n_side_steps, check_each_step=False)
 
         if not found:
-            # +sweep_deg
-            _rotate("turn_right", n_side_steps)
+            # +sweep_deg (smooth, with YOLOE checks every step)
+            if _rotate("turn_right", n_side_steps):
+                print(f"  YOLOE local scan: FOUND '{cat}' mid-sweep (turning right)")
+                return True
             if _check_now(f"Local scan +{sweep_effective:.0f}°: {cat}"):
                 print(f"  YOLOE local scan: FOUND '{cat}' at +{sweep_effective:.0f}°")
                 setattr(robot, "_last_verify_source", "local_scan")
                 found = True
             # Always return to 0°
-            _rotate("turn_left", n_side_steps)
+            _rotate("turn_left", n_side_steps, check_each_step=False)
     finally:
         robot._set_nav_curr_pose()
 
@@ -987,43 +1230,45 @@ def scan_local_and_verify(
         base_sensor_rotation = _get_color_sensor_rotation(robot)
         original_sensor_rotation = base_sensor_rotation
         if base_sensor_rotation is not None:
+            # Pitch scan is performed ONLY at the centre yaw (looking
+            # straight at the surrogate centroid). Tilting up/down at the
+            # ±25° yaw extremes would point the camera at adjacent walls
+            # or empty space, which is what the user complained about.
             print(
-                f"  Starting pitch grid scan for '{cat}' "
-                f"(yaw=-{sweep_effective:.0f}/0/+{sweep_effective:.0f}, "
+                f"  Starting pitch scan for '{cat}' (yaw=0° / centroid, "
                 f"surrogate={surrogate_key or 'none'}, pitches={pitch_values})"
             )
             try:
-                yaw_steps = [
-                    ("0", None, None),
-                    (f"-{sweep_effective:.0f}", "turn_left", "turn_right"),
-                    (f"+{sweep_effective:.0f}", "turn_right", "turn_left"),
-                ]
-                for yaw_label, yaw_action, undo_action in yaw_steps:
-                    if yaw_action:
-                        _rotate(yaw_action, n_side_steps)
-                    try:
-                        base_sensor_rotation = _get_color_sensor_rotation(robot)
-                        for pitch_deg in pitch_values:
-                            if not _set_color_sensor_pitch(robot, base_sensor_rotation, pitch_deg):
-                                continue
-                            if _check_now(f"Pitch grid yaw={yaw_label}° pitch={pitch_deg:.0f}°: {cat}"):
-                                print(
-                                    f"  [verify] source=pitch_scan "
-                                    f"yaw={yaw_label} pitch={pitch_deg:.1f}"
-                                )
-                                print(
-                                    f"  YOLOE pitch scan: FOUND '{cat}' "
-                                    f"at yaw={yaw_label}° pitch={pitch_deg:.1f}°"
-                                )
-                                setattr(robot, "_last_verify_source", "pitch_scan")
-                                found = True
-                                break
-                    finally:
-                        _set_color_sensor_rotation(robot, base_sensor_rotation)
-                        if undo_action:
-                            _rotate(undo_action, n_side_steps)
-                    if found:
+                base_sensor_rotation = _get_color_sensor_rotation(robot)
+                prev_pitch = 0.0
+                for pitch_deg in pitch_values:
+                    # Glide smoothly from previous pitch to the new one
+                    # (instead of snapping) so the tilt motion is visible.
+                    if not _smooth_pitch_glide(
+                        robot, base_sensor_rotation, prev_pitch, pitch_deg,
+                        label=f"Pitch glide → {pitch_deg:.0f}°: {cat}",
+                    ):
+                        continue
+                    prev_pitch = pitch_deg
+                    if _check_now(f"Pitch scan yaw=0° pitch={pitch_deg:.0f}°: {cat}"):
+                        print(
+                            f"  [verify] source=pitch_scan "
+                            f"yaw=0 pitch={pitch_deg:.1f}"
+                        )
+                        print(
+                            f"  YOLOE pitch scan: FOUND '{cat}' "
+                            f"at yaw=0° pitch={pitch_deg:.1f}°"
+                        )
+                        setattr(robot, "_last_verify_source", "pitch_scan")
+                        found = True
                         break
+                # Glide smoothly back to neutral pitch before handing the
+                # camera rotation back, so there is no visible snap on exit.
+                if base_sensor_rotation is not None and abs(prev_pitch) > 0.5:
+                    _smooth_pitch_glide(
+                        robot, base_sensor_rotation, prev_pitch, 0.0,
+                        label=f"Pitch glide → 0°: {cat}",
+                    )
             finally:
                 _set_color_sensor_rotation(robot, original_sensor_rotation)
                 robot._set_nav_curr_pose()
@@ -1033,6 +1278,39 @@ def scan_local_and_verify(
     if not found:
         print(f"  YOLOE local scan: '{cat}' not found in ±{sweep_effective:.0f}° plus pitch scan.")
     return found
+
+
+def scan_local_and_verify_with_aliases(
+    robot,
+    cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: np.ndarray,
+    path_cells: list,
+    sweep_deg: float = 45.0,
+    surrogate_cat: str = "",
+    target_cell: Optional[Tuple[int, int]] = None,
+) -> bool:
+    """Run bounded local verification for the target plus visual aliases."""
+    setattr(robot, "_last_verify_label", cat)
+    for label in _verification_labels(cat):
+        if label != cat:
+            print(f"  [verify] retrying YOLOE visual alias '{label}' for target '{cat}'")
+        if scan_local_and_verify(
+            robot,
+            label,
+            rgb_map_2d,
+            heatmap,
+            path_cells,
+            sweep_deg=sweep_deg,
+            surrogate_cat=surrogate_cat,
+            target_cell=target_cell,
+        ):
+            setattr(robot, "_last_verify_label", label)
+            if label != cat:
+                print(f"  [verify] alias_match target='{cat}' visual_label='{label}'")
+            return True
+    setattr(robot, "_last_verify_label", cat)
+    return False
 
 
 def navigate_to_alternative(
@@ -1056,14 +1334,20 @@ def navigate_to_alternative(
 
     curr_row, curr_col = float(current_pos[0]), float(current_pos[1])
     MIN_DIST_CELLS = 20  # ~1 m (cell_size=0.05 m)
+    tried_alts = getattr(robot, "_alternative_tried_centroids", set())
 
     # Components are score-sorted descending; pick first that is far enough away
     alt = None
     for c in kept_components:
+        cen_key = (int(c["centroid"][0]), int(c["centroid"][1]))
+        if cen_key in tried_alts:
+            continue
         dr = c["centroid"][0] - curr_row
         dc = c["centroid"][1] - curr_col
         if np.sqrt(dr * dr + dc * dc) >= MIN_DIST_CELLS:
             alt = c
+            tried_alts.add(cen_key)
+            setattr(robot, "_alternative_tried_centroids", tried_alts)
             break
 
     if alt is None:
@@ -1071,17 +1355,48 @@ def navigate_to_alternative(
         return False
 
     alt_centroid = [int(alt["centroid"][0]), int(alt["centroid"][1])]
+    # Stash the chosen centroid so the downstream verification scan can
+    # face it before sweeping ±25° (instead of using the heading the
+    # navigator happened to leave us with).
+    setattr(robot, "_last_nav_target_cell", tuple(alt_centroid))
     print(f"  Alternative: component score={alt['score']:.3f} "
           f"area={alt['area']} centroid={alt_centroid}")
 
     try:
         robot._set_nav_curr_pose()
-        standoff_alt, boundary_alt = robot.map.get_standoff_pos(
-            robot.curr_pos_on_map, cat, standoff_m=1.0)
-        # Override standoff with the alternative centroid direction if needed
-        # (get_standoff_pos picks the nearest VLMap region regardless of centroid)
-        print(f"  Alternative standoff: {standoff_alt}  boundary: {boundary_alt}")
-        robot.move_to(standoff_alt)
+        robot_pos = getattr(robot, "_nav_curr_pos", None)
+        safe_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+        approach_goals = find_safe_candidate_approach_goals(
+            alt_centroid,
+            safe_map,
+            robot_pos=robot_pos,
+            room_provider=getattr(robot, "room_provider", None),
+            required_room=alt.get("room"),
+            min_dist=8.0,
+            max_dist=25.0,
+            min_clearance=3.0,
+        )
+        if approach_goals:
+            standoff_alt = approach_goals[0]
+            boundary_alt = alt_centroid
+            print(f"  Alternative approach goal: {standoff_alt}  boundary: {boundary_alt}")
+            _, planned_actions = robot.plan_path_only(standoff_alt)
+            path_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+            path_cells = densify_path_cells(path_polyline)
+            execute_nav_replay(
+                robot,
+                planned_actions,
+                cat,
+                rgb_map_2d,
+                heatmap,
+                path_polyline,
+                display_path_cells=path_cells,
+            )
+        else:
+            standoff_alt, boundary_alt = robot.map.get_standoff_pos(
+                robot.curr_pos_on_map, cat, standoff_m=1.0)
+            print(f"  Alternative standoff: {standoff_alt}  boundary: {boundary_alt}")
+            robot.move_to(standoff_alt)
         robot._set_nav_curr_pose()
         face_toward_pos(robot, boundary_alt[0], boundary_alt[1])
         show_obs(robot, f"Alternative arrival: {cat}")
@@ -1112,6 +1427,9 @@ def execute_nav_replay(
     stuck_threshold: int = 3,
     dist_map: np.ndarray = None,
     goal_reached_tol_cells: float = None,
+    monitor_fn=None,
+    monitor_stride: int = 4,
+    stop_on_monitor: bool = False,
 ) -> bool:
     """Follow the planned route using the dense rasterized path as control reference.
 
@@ -1333,6 +1651,16 @@ def execute_nav_replay(
         robot.sim.step(action)
         robot._set_nav_curr_pose()
 
+        if monitor_fn is not None and (i % max(1, int(monitor_stride)) == 0):
+            try:
+                if bool(monitor_fn(i, action)):
+                    setattr(robot, "_nav_monitor_triggered", True)
+                    if stop_on_monitor:
+                        print(f"  [nav-monitor] Visual trigger at follower step {i + 1}; pausing route")
+                        return True
+            except Exception as exc:
+                print(f"  [nav-monitor] monitor error: {exc}")
+
         if is_fwd:
             disp = float(np.linalg.norm(_agent_xyz(robot) - pre_xyz))
             if disp < motion_thresh * expected_fwd:
@@ -1470,6 +1798,236 @@ def fine_visual_center(
     return detected_once
 
 
+def _planned_approach_to_surrogate(
+    robot,
+    surrogate_cat: Optional[str],
+    rgb_map_2d: Optional[np.ndarray] = None,
+    heatmap: Optional[np.ndarray] = None,
+    path_cells: Optional[list] = None,
+    standoff_m: float = 0.5,
+) -> bool:
+    """Replan a clearance-aware A* path from the current pose to a closer
+    standoff in front of the same surrogate furniture, then drive it.
+
+    Returns True if a navigation step was actually executed (path planned
+    and a non-trivial distance covered). False if no surrogate context, no
+    valid plan, or the standoff is already where we are.
+
+    This is the obstacle-aware alternative to the legacy "step forward"
+    approach — needed because the small-object pipeline used to walk in a
+    straight line that often hit the host furniture or a wall corner.
+    """
+    if not surrogate_cat:
+        print("  [planned-approach] skipped: no surrogate_cat in scope")
+        return False
+    try:
+        robot._set_nav_curr_pose()
+        new_standoff, boundary_pos = robot.map.get_standoff_pos(
+            list(robot.curr_pos_on_map[:2]),
+            surrogate_cat,
+            standoff_m=float(standoff_m),
+        )
+    except Exception as exc:
+        print(f"  [planned-approach] standoff lookup failed: {exc}")
+        return False
+
+    try:
+        cur_r, cur_c = float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1])
+        new_r, new_c = float(new_standoff[0]), float(new_standoff[1])
+    except Exception:
+        return False
+    delta = float(np.hypot(new_r - cur_r, new_c - cur_c))
+    print(
+        f"  [planned-approach] surrogate={surrogate_cat} curr=({int(cur_r)},{int(cur_c)}) "
+        f"new_standoff=({int(new_r)},{int(new_c)}) delta={delta:.2f} cells "
+        f"standoff_m={standoff_m:.2f}"
+    )
+    if delta < 0.8:
+        # Already on top of the new standoff — skip replan.
+        print("  [planned-approach] skipped: already at the new standoff")
+        return False
+    print(
+        f"  [planned-approach] Replanning A* to closer standoff "
+        f"(surrogate={surrogate_cat}, standoff={standoff_m:.2f} m, "
+        f"new_cell=({int(new_r)},{int(new_c)}), distance={delta:.1f} cells)"
+    )
+    try:
+        _, planned_actions = robot.plan_path_only(new_standoff)
+    except Exception as exc:
+        print(f"  [planned-approach] plan_path_only failed: {exc}")
+        return False
+    if not planned_actions:
+        print("  [planned-approach] empty plan — skipping")
+        return False
+    try:
+        ok = execute_nav_replay(
+            robot,
+            planned_actions,
+            f"approach:{surrogate_cat}",
+            rgb_map_2d if rgb_map_2d is not None else np.zeros((1, 1, 3), dtype=np.uint8),
+            heatmap if heatmap is not None else np.zeros((1, 1), dtype=np.float32),
+            path_cells if path_cells is not None else [],
+            display_path_cells=path_cells if path_cells is not None else [],
+        )
+    except Exception as exc:
+        print(f"  [planned-approach] navigation failed: {exc}")
+        return False
+    if ok:
+        try:
+            face_toward_pos(robot, float(boundary_pos[0]), float(boundary_pos[1]),
+                            smooth=True, label="planned-approach: facing boundary")
+        except Exception:
+            pass
+    return bool(ok)
+
+
+def close_approach_after_detection(
+    robot,
+    session,
+    cat: str,
+    *,
+    img_w: int = 640,
+    img_h: int = 480,
+    img_fov_h: float = 90.0,
+    target_bbox_frac: float = 0.18,
+    max_steps: int = 16,
+    min_clearance_cells: float = 1.5,
+    surrogate_cat: Optional[str] = None,
+    rgb_map_2d: Optional[np.ndarray] = None,
+    heatmap: Optional[np.ndarray] = None,
+    path_cells: Optional[list] = None,
+) -> bool:
+    # Env-opt-in: walk closer to maximise YOLOE confidence (small objects).
+    # Switched on with VLMAPS_YOLOE_DEEP_APPROACH=1 — bumps the target bbox
+    # fraction and the max forward steps so the robot does not bail early
+    # when the bbox is still small (typical for mug/teapot/toaster).
+    deep = os.environ.get("VLMAPS_YOLOE_DEEP_APPROACH") == "1"
+    if deep:
+        target_bbox_frac = max(target_bbox_frac, 0.30)
+        max_steps = max(max_steps, 24)
+        min_clearance_cells = min(min_clearance_cells, 1.0)
+        # Path-planned approach (clearance-aware) to a closer standoff
+        # before the legacy forward-step fine-tune. Avoids straight-line
+        # collisions with the host furniture.
+        try:
+            _planned_approach_to_surrogate(
+                robot, surrogate_cat,
+                rgb_map_2d=rgb_map_2d, heatmap=heatmap, path_cells=path_cells,
+                standoff_m=0.5,
+            )
+        except Exception as exc:
+            print(f"  [planned-approach] aborted: {exc}")
+    """After a positive YOLOE detection, walk forward to bring the
+    detected object as close as physically safe so the operator can
+    visually confirm the verification.
+
+    Stops when ANY of these is true:
+      * the bounding box covers >= ``target_bbox_frac`` of the frame
+        (object filling roughly a fifth of the view),
+      * detection is lost (we'd be moving blindly),
+      * the navmesh in front of the robot drops below
+        ``min_clearance_cells`` cells of clearance,
+      * ``max_steps`` discrete forward actions have been issued.
+
+    Re-centres after each step so the robot stays pointed at the target.
+    Returns True if the robot got at least one step closer.
+    """
+    advanced = 0
+    # Seed the sticky overlay with the bbox stashed by the most recent
+    # successful scan stage. This avoids the "Lost detection at step 1
+    # (no prior)" failure when fine_visual_center nudged the camera and
+    # the first close-approach frame happens to miss the object.
+    last_positive_bgr = getattr(robot, "_last_yoloe_positive_bgr", None)
+    last_bbox_center = None
+    miss_streak = 0              # consecutive frames without detection
+    MAX_MISS_STREAK = 5          # tolerate brief detection losses (motion blur, centering jitter)
+    WARMUP_FRAMES = 3            # do not bail if the first frames miss — re-check
+    for step_i in range(max_steps):
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            break
+        frame = obs["color_sensor"][:, :, :3]
+        det, ann_rgb, bbox_center = session.check(frame)
+        if det:
+            miss_streak = 0
+            if ann_rgb is not None:
+                last_positive_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+            last_bbox_center = bbox_center
+        else:
+            miss_streak += 1
+            if miss_streak >= MAX_MISS_STREAK:
+                print(
+                    f"  [close-approach] Detection lost for {miss_streak} consecutive "
+                    f"frames at step {step_i + 1} — stopping."
+                )
+                break
+            if last_bbox_center is None:
+                # No bbox yet — give YOLOE a few warm-up frames before
+                # bailing. The scan stage flagged a positive but the very
+                # first frame after centering may have missed it.
+                if step_i < WARMUP_FRAMES:
+                    if last_positive_bgr is not None:
+                        show_obs(robot, f"Approach {step_i+1}/{max_steps}: {cat}",
+                                 yoloe_frame_bgr=last_positive_bgr)
+                    ui_wait(_SCAN_STEP_DELAY_MS)
+                    continue
+                print(
+                    f"  [close-approach] No detection within {WARMUP_FRAMES} warm-up "
+                    f"frames after centering — stopping at step {step_i + 1}."
+                )
+                break
+            # Use last known bbox to keep approaching; show sticky overlay.
+            bbox_center = last_bbox_center
+
+        if ann_rgb is not None:
+            show_obs(robot, f"Approach {step_i+1}/{max_steps}: {cat}",
+                     yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
+        elif last_positive_bgr is not None:
+            # Keep the most recent positive frame visible so the operator
+            # always sees the bbox marker — meets "que no deje de detectarlo".
+            show_obs(robot, f"Approach {step_i+1}/{max_steps}: {cat}",
+                     yoloe_frame_bgr=last_positive_bgr)
+
+        # Recentre horizontally before each forward step so the path is straight.
+        cx, _cy = bbox_center
+        err_x = float(cx) - img_w / 2.0
+        px_per_step = img_w * (robot.turn_angle / img_fov_h)
+        if abs(err_x) > px_per_step:
+            action = "turn_right" if err_x > 0 else "turn_left"
+            robot.sim.step(action)
+            ui_wait(_SCAN_STEP_DELAY_MS)
+            continue
+
+        # Clearance check: peek at the navmesh in the cell just ahead.
+        try:
+            robot._set_nav_curr_pose()
+            from scipy.ndimage import distance_transform_edt
+            obs_map = robot.map.obstacles_map
+            dist_map = distance_transform_edt(obs_map > 0)
+            r, c = robot.curr_pos_on_map[:2]
+            ang = float(robot.curr_ang_deg_on_map)
+            dr = -int(round(np.cos(np.deg2rad(ang))))
+            dc = int(round(np.sin(np.deg2rad(ang))))
+            r2, c2 = int(r + dr), int(c + dc)
+            if 0 <= r2 < dist_map.shape[0] and 0 <= c2 < dist_map.shape[1]:
+                if float(dist_map[r2, c2]) < min_clearance_cells:
+                    print(
+                        f"  [close-approach] Clearance ahead "
+                        f"{float(dist_map[r2, c2]):.1f} cells < "
+                        f"{min_clearance_cells} — stopping at step {step_i + 1}."
+                    )
+                    break
+        except Exception:
+            pass
+
+        robot.sim.step("move_forward")
+        advanced += 1
+        ui_wait(_SCAN_STEP_DELAY_MS)
+
+    robot._set_nav_curr_pose()
+    return advanced > 0
+
+
 def freeze_found_target(cat: str, ann_frame_rgb, target_cell) -> None:
     """Persist the last positive YOLOE result in both the RGB and map views."""
     global _frozen_detection_bgr, _frozen_target_cell
@@ -1479,15 +2037,33 @@ def freeze_found_target(cat: str, ann_frame_rgb, target_cell) -> None:
         _frozen_target_cell = [int(target_cell[0]), int(target_cell[1])]
 
 
-def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20):
-    """Return the nearest free grid cell to *cell* inside *free_map*."""
+def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20,
+                                room_mask: Optional[np.ndarray] = None):
+    """Return the nearest free grid cell to *cell* inside *free_map*.
+
+    If *room_mask* is provided, the snap is restricted to cells where both
+    ``free_map`` and ``room_mask`` are truthy — i.e. the snap stays inside
+    the room polygon. This prevents the room representative cell from
+    falling onto a free corridor cell just outside the doorway, which
+    would make the robot "navigate around" the room instead of into it.
+    If no in-polygon free cell exists within max_radius, the function
+    falls back to the unrestricted nearest free cell.
+    """
     if free_map is None:
         return [int(cell[0]), int(cell[1])]
 
     h, w = free_map.shape[:2]
     r0 = int(np.clip(round(cell[0]), 0, h - 1))
     c0 = int(np.clip(round(cell[1]), 0, w - 1))
-    if free_map[r0, c0]:
+
+    def _ok(r, c):
+        if not free_map[r, c]:
+            return False
+        if room_mask is not None and not room_mask[r, c]:
+            return False
+        return True
+
+    if _ok(r0, c0):
         return [r0, c0]
 
     for radius in range(1, max_radius + 1):
@@ -1501,7 +2077,7 @@ def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20)
             for cc in range(cmin, cmax + 1):
                 if rr not in (rmin, rmax) and cc not in (cmin, cmax):
                     continue
-                if not free_map[rr, cc]:
+                if not _ok(rr, cc):
                     continue
                 dist = float((rr - r0) ** 2 + (cc - c0) ** 2)
                 if dist < best_dist:
@@ -1510,6 +2086,11 @@ def _snap_to_nearest_free_cell(cell, free_map: np.ndarray, max_radius: int = 20)
         if best is not None:
             return best
 
+    # Polygon-restricted search exhausted with no hit. Retry without the
+    # mask so we still return SOME free cell rather than the (possibly
+    # blocked) input cell.
+    if room_mask is not None:
+        return _snap_to_nearest_free_cell(cell, free_map, max_radius, room_mask=None)
     return [r0, c0]
 
 
@@ -1551,6 +2132,7 @@ def select_best_room(
     w_unexplored: float = 0.20,
     w_cost: float = 0.15,
     w_penalty: float = 0.10,
+    room_provider=None,
 ):
     """Phase D — choose the next room to search before picking a candidate.
 
@@ -1558,6 +2140,8 @@ def select_best_room(
     so the "unexplored" term is implemented as a practical proxy derived from
     room visits and failed candidate inspections.
     """
+    from vlmaps.utils.room_priors import canonical_room_type
+
     if search_state is None or not search_state.rooms:
         return None, {}
 
@@ -1580,10 +2164,71 @@ def select_best_room(
     if not eligible_rooms:
         eligible_rooms = list(search_state.rooms.keys())
 
+    target_key = str(getattr(search_state, "target", "") or "").strip().lower()
+    likely_room_types = {
+        canonical_room_type(r)
+        for r in getattr(search_state, "likely_rooms", [])
+        if r
+    }
+
+    # Hard pin: when the user said "X in the Y" we MUST go to Y, even if
+    # the heatmap surrogate found nothing there. Force-include matching
+    # rooms in eligible_rooms so the room selector picks one of them and
+    # the robot navigates to the pinned room for thorough exploration.
+    pin_canon = canonical_room_type(getattr(search_state, "pinned_room", "") or "")
+    if pin_canon:
+        forced_pin_rooms = [
+            name for name in search_state.rooms.keys()
+            if canonical_room_type(name) == pin_canon
+        ]
+        if forced_pin_rooms:
+            eligible_rooms = forced_pin_rooms
+            print(
+                f"  [room-select] PINNED to '{pin_canon}' — restricting to "
+                f"{forced_pin_rooms} regardless of heatmap evidence"
+            )
+    elif target_key in _STRICT_LIKELY_ROOM_TARGETS and likely_room_types:
+        strict_rooms = [
+            name for name in eligible_rooms
+            if canonical_room_type(name) in likely_room_types
+        ]
+        if strict_rooms:
+            print(
+                "  [room-select] Strict likely-room filter for "
+                f"'{target_key}': {strict_rooms}"
+            )
+            eligible_rooms = strict_rooms
+        else:
+            # No heatmap candidates inside any likely room. Force-include
+            # the likely rooms anyway: select_best_room will use the room
+            # centroid as rep_cell and the robot will navigate THERE
+            # (not to the wrong room where the surrogate happened to hit).
+            forced = [
+                name for name in search_state.rooms.keys()
+                if canonical_room_type(name) in likely_room_types
+            ]
+            if forced:
+                print(
+                    f"  [room-select] STRICT no-candidate fallback for "
+                    f"'{target_key}': forcing eligible to {forced} "
+                    f"(will navigate to room centroid)"
+                )
+                eligible_rooms = forced
+
     bfs_dist = _compute_bfs_cost_map(robot_pos, free_map)
     finite_dists = bfs_dist[bfs_dist >= 0]
     max_cost = float(finite_dists.max()) if finite_dists.size > 0 else 1.0
     max_cost = max(max_cost, 1.0)
+
+    # Pre-build room polygon masks if the provider exposes its region grid
+    # so we can keep the snapped rep_cell INSIDE the room polygon (the
+    # robot then navigates into the room, not around its outer wall).
+    _region_grid = getattr(room_provider, "_region_grid", None) if room_provider else None
+    _regions = getattr(room_provider, "_regions", []) if room_provider else []
+    _name_to_mask = {}
+    if _region_grid is not None and _regions:
+        for _reg in _regions:
+            _name_to_mask[_reg["label"]] = (_region_grid == _reg["id"])
 
     room_scores = {}
     for room_name in eligible_rooms:
@@ -1592,7 +2237,8 @@ def select_best_room(
             rep_cell = room_best_cells[room_name][0]
         else:
             rep_cell = [rs.centroid[0], rs.centroid[1]]
-        rep_cell = _snap_to_nearest_free_cell(rep_cell, free_map)
+        _mask = _name_to_mask.get(room_name)
+        rep_cell = _snap_to_nearest_free_cell(rep_cell, free_map, room_mask=_mask)
 
         cost_cells = float(bfs_dist[rep_cell[0], rep_cell[1]])
         if cost_cells < 0:
@@ -1609,9 +2255,19 @@ def select_best_room(
 
         prior_score = float(rs.target_relevance)
         evidence_score = float(heatmap_evidence.get(room_name, 0.0))
+        # For level-3 small objects (strict targets), the heatmap evidence is
+        # surrogate-furniture noise (any room with tables/counters scores) and
+        # often outvotes the more reliable categorical prior. Reweight prior up
+        # and evidence down to make the scorer trust the room prior.
+        if target_key in _STRICT_LIKELY_ROOM_TARGETS:
+            local_w_prior = w_prior * 1.7
+            local_w_evidence = w_evidence * 0.5
+        else:
+            local_w_prior = w_prior
+            local_w_evidence = w_evidence
         total = (
-            w_prior * prior_score
-            + w_evidence * evidence_score
+            local_w_prior * prior_score
+            + local_w_evidence * evidence_score
             + w_unexplored * unexplored_score
             - w_cost * cost_score
             - w_penalty * penalty_score
@@ -2180,9 +2836,429 @@ def navigate_to_room_stage(
     return stage_ok, arrived_room
 
 
+def _room_mask_for(room_name: str, room_provider, shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Return a boolean mask for a manual/semantic room in full map coordinates."""
+    if room_provider is None or not room_provider.is_available() or not room_name:
+        return None
+    region_grid = getattr(room_provider, "_region_grid", None)
+    regions = getattr(room_provider, "_regions", [])
+    if region_grid is None or not regions:
+        return None
+
+    resolved = room_provider.resolve_room_name(room_name) or room_name
+    target_ids = [
+        int(reg["id"])
+        for reg in regions
+        if room_command_matches(reg.get("label"), resolved)
+    ]
+    if not target_ids:
+        return None
+
+    mask = np.isin(region_grid, target_ids)
+    if tuple(mask.shape[:2]) != tuple(shape[:2]):
+        print(
+            f"  [zone-explore] Room mask shape {mask.shape[:2]} does not match "
+            f"obstacle map {shape[:2]}; skipping zone exploration."
+        )
+        return None
+    return mask
+
+
+def _near_any_cell(cell: Tuple[int, int], cells: List[Tuple[int, int]], radius_cells: float) -> bool:
+    radius_sq = float(radius_cells) * float(radius_cells)
+    row, col = int(cell[0]), int(cell[1])
+    for er, ec in cells:
+        if float((int(er) - row) ** 2 + (int(ec) - col) ** 2) <= radius_sq:
+            return True
+    return False
+
+
+def _record_unique_scan_zone(search_state: Optional[SearchState], robot, cell=None) -> bool:
+    """Record current physical scan zone and return False when it is redundant."""
+    if search_state is None:
+        return True
+    if cell is None:
+        robot._set_nav_curr_pose()
+        cell = robot.curr_pos_on_map[:2]
+    radius_cells = _scan_dedup_radius_cells(robot)
+    is_new = search_state.record_scan_zone(int(round(cell[0])), int(round(cell[1])), radius_cells)
+    if is_new:
+        print(
+            f"  [scan-zone] Nueva zona de escaneo "
+            f"({search_state.n_unique_scan_zones}) en celda "
+            f"({int(round(cell[0]))}, {int(round(cell[1]))})"
+        )
+    else:
+        print(
+            f"  [scan-zone] Zona ya cubierta a menos de "
+            f"{_env_float(_ROOM_SCAN_DEDUP_RADIUS_ENV, _DEFAULT_SCAN_DEDUP_RADIUS_M):.2f} m; "
+            f"se evita repetir el escaneo."
+        )
+    return is_new
+
+
+def _generate_room_exploration_points(
+    robot,
+    room_name: str,
+    room_provider,
+    obs_map: np.ndarray,
+    search_state: Optional[SearchState],
+    *,
+    max_points: int,
+    min_clearance_cells: float = 3.0,
+) -> List[Tuple[int, int]]:
+    """Generate a compact route that covers the navigable part of a labeled room."""
+    if obs_map is None:
+        return []
+    room_mask = _room_mask_for(room_name, room_provider, obs_map.shape)
+    if room_mask is None:
+        return []
+
+    free_map = obs_map > 0
+    navigable = room_mask & free_map
+    if not navigable.any():
+        return []
+
+    dist_obs = distance_transform_edt(free_map)
+    room_depth = distance_transform_edt(room_mask)
+    cells_r, cells_c = np.where(navigable & (dist_obs >= float(min_clearance_cells)))
+    if len(cells_r) == 0:
+        cells_r, cells_c = np.where(navigable)
+    if len(cells_r) == 0:
+        return []
+
+    cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
+    sample_stride = max(6, int(round(0.75 / cell_size)))
+    spacing_cells = max(6.0, 1.0 / cell_size)
+    scan_radius = _scan_dedup_radius_cells(robot)
+    prior_scan_zones = list(getattr(search_state, "unique_scan_zones", []) if search_state else [])
+    false_zones = list(getattr(search_state, "false_positive_zones", []) if search_state else [])
+
+    grid_sample = ((cells_r % sample_stride) == 0) & ((cells_c % sample_stride) == 0)
+    sample_r = cells_r[grid_sample]
+    sample_c = cells_c[grid_sample]
+    if len(sample_r) < max_points:
+        sample_r, sample_c = cells_r, cells_c
+
+    scores = room_depth[sample_r, sample_c] * 1.5 + dist_obs[sample_r, sample_c] * 0.35
+    ranked = np.argsort(-scores)
+    candidate_cells: List[Tuple[int, int]] = []
+    for idx in ranked:
+        cell = (int(sample_r[idx]), int(sample_c[idx]))
+        if _near_any_cell(cell, prior_scan_zones, scan_radius):
+            continue
+        if _near_any_cell(cell, false_zones, max(scan_radius * 0.5, spacing_cells * 0.5)):
+            continue
+        if _near_any_cell(cell, candidate_cells, spacing_cells):
+            continue
+        candidate_cells.append(cell)
+        if len(candidate_cells) >= max(max_points * 4, max_points):
+            break
+
+    if not candidate_cells:
+        return []
+
+    robot._set_nav_curr_pose()
+    current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
+    ordered: List[Tuple[int, int]] = []
+    remaining = list(candidate_cells)
+    while remaining and len(ordered) < max_points:
+        best_idx = min(
+            range(len(remaining)),
+            key=lambda i: (remaining[i][0] - current[0]) ** 2 + (remaining[i][1] - current[1]) ** 2,
+        )
+        cell = remaining.pop(best_idx)
+        ordered.append(cell)
+        current = (float(cell[0]), float(cell[1]))
+    return ordered
+
+
+def _confirm_current_view_after_trigger(
+    robot,
+    target: str,
+    *,
+    surrogate_cat: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: Optional[np.ndarray],
+    path_cells: Optional[list],
+    search_state: Optional[SearchState],
+) -> bool:
+    """Confirm a low-threshold visual trigger with high-threshold YOLOE."""
+    from vlmaps.utils.yoloe_utils import get_session
+
+    session = get_session(target, conf_thresh=_confirm_conf_thresh())
+    if session is None:
+        return False
+
+    obs = robot.sim.get_sensor_observations(0)
+    if "color_sensor" not in obs:
+        return False
+    frame = obs["color_sensor"][:, :, :3]
+    detected, ann_rgb, _bbox = session.check(frame)
+    if ann_rgb is not None:
+        show_obs(
+            robot,
+            f"Confirmación cercana: {target}",
+            yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
+        )
+    else:
+        show_obs(robot, f"Confirmación cercana: {target}")
+
+    if not detected:
+        return False
+
+    if search_state is not None:
+        search_state.record_approach_attempt()
+    fine_visual_center(robot, session, target)
+    close_approach_after_detection(
+        robot,
+        session,
+        target,
+        surrogate_cat=surrogate_cat,
+        rgb_map_2d=rgb_map_2d,
+        heatmap=heatmap,
+        path_cells=path_cells,
+    )
+
+    obs2 = robot.sim.get_sensor_observations(0)
+    if "color_sensor" not in obs2:
+        return detected
+    frame2 = obs2["color_sensor"][:, :, :3]
+    detected2, ann2, _bbox2 = session.check(frame2)
+    if ann2 is not None:
+        show_obs(
+            robot,
+            f"Confirmación final: {target}",
+            yoloe_frame_bgr=cv2.cvtColor(ann2, cv2.COLOR_RGB2BGR),
+        )
+    if detected2:
+        freeze_found_target(target, ann2 if ann2 is not None else ann_rgb, None)
+    return bool(detected2)
+
+
+def explore_room_zone_with_yoloe(
+    robot,
+    target: str,
+    room_name: Optional[str],
+    room_provider,
+    rgb_map_2d: np.ndarray,
+    heatmap: Optional[np.ndarray],
+    path_cells: Optional[list],
+    search_state: Optional[SearchState],
+    *,
+    surrogate_cat: str = "",
+) -> Tuple[bool, Optional[str]]:
+    """Explore a labeled room/zone with low-threshold YOLOE during movement."""
+    if not _room_exploration_enabled():
+        return False, None
+    if room_provider is None or not room_provider.is_available() or not room_name:
+        print("  [zone-explore] Sin región de habitación disponible; se omite exploración.")
+        return False, None
+
+    resolved_room = room_provider.resolve_room_name(room_name) or room_name
+    max_points = _env_int(_ROOM_EXPLORE_MAX_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
+    timeout_s = _env_float(_ROOM_EXPLORE_TIMEOUT_ENV, _DEFAULT_ROOM_EXPLORE_TIMEOUT_S, 1.0)
+    max_attempts = _env_int(_ROOM_MAX_APPROACH_ATTEMPTS_ENV, _DEFAULT_MAX_APPROACH_ATTEMPTS, 1)
+    low_thresh = _env_float(_ROOM_YOLOE_LOW_THRESH_ENV, _DEFAULT_YOLOE_LOW_THRESH, 0.01)
+
+    print(f"  [state] ZONE_EXPLORE room={resolved_room} target={target}")
+    points = _generate_room_exploration_points(
+        robot,
+        resolved_room,
+        room_provider,
+        getattr(robot, "_safe_obs_map", robot.map.obstacles_map),
+        search_state,
+        max_points=max_points,
+        min_clearance_cells=3.0,
+    )
+    if search_state is not None:
+        search_state.record_zone_exploration(points)
+
+    if not points:
+        print(f"  [zone-explore] No hay puntos navegables útiles en '{resolved_room}'.")
+        return False, None
+
+    print(
+        f"  [zone-explore] {len(points)} punto(s) de exploración planificado(s), "
+        f"YOLOE bajo umbral={low_thresh:.2f}, tiempo máximo={timeout_s:.0f}s"
+    )
+
+    from vlmaps.utils.yoloe_utils import get_session
+
+    session_ref = {"low": get_session(target, conf_thresh=low_thresh)}
+    if session_ref["low"] is None:
+        print("  [zone-explore] YOLOE no disponible; se cancela exploración.")
+        return False, None
+
+    started = time.monotonic()
+    trigger = {"hit": False, "cell": None}
+
+    def _monitor(_step_idx: int, _action: str) -> bool:
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            return False
+        frame = obs["color_sensor"][:, :, :3]
+        detected, ann_rgb, _bbox = session_ref["low"].check(frame)
+        if ann_rgb is not None:
+            show_obs(
+                robot,
+                f"Explorando {resolved_room}: {target}",
+                yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
+            )
+        if detected:
+            robot._set_nav_curr_pose()
+            cell = (int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1]))
+            trigger["hit"] = True
+            trigger["cell"] = cell
+            if search_state is not None:
+                search_state.record_low_conf_detection()
+            print(f"  [zone-explore] YOLOE bajo umbral disparado en {cell}.")
+            return True
+        return False
+
+    for idx, point in enumerate(points, start=1):
+        if time.monotonic() - started > timeout_s:
+            print(f"  [zone-explore] Tiempo máximo agotado ({timeout_s:.0f}s).")
+            break
+        if search_state is not None and search_state.n_approach_attempts >= max_attempts:
+            print(f"  [zone-explore] Tope de acercamientos alcanzado ({max_attempts}).")
+            break
+
+        print(f"  [zone-explore] Punto {idx}/{len(points)}: {list(point)}")
+        try:
+            _, planned_actions = robot.plan_path_only(list(point))
+        except Exception as exc:
+            print(f"  [zone-explore] No se pudo planificar a {list(point)}: {exc}")
+            continue
+
+        polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+        dense = densify_path_cells(polyline)
+        if planned_actions:
+            execute_nav_replay(
+                robot,
+                planned_actions,
+                f"explore:{target}",
+                rgb_map_2d,
+                heatmap,
+                polyline,
+                display_path_cells=dense,
+                dist_map=distance_transform_edt(robot.map.obstacles_map),
+                goal_reached_tol_cells=2.0,
+                monitor_fn=_monitor,
+                monitor_stride=4,
+                stop_on_monitor=True,
+            )
+        else:
+            _monitor(-1, "already_at_point")
+
+        robot._set_nav_curr_pose()
+        if search_state is not None:
+            search_state.record_exploration_visit(
+                int(robot.curr_pos_on_map[0]),
+                int(robot.curr_pos_on_map[1]),
+            )
+
+        if not trigger["hit"]:
+            _monitor(-1, "post_point")
+
+        if trigger["hit"]:
+            print("  [state] APPROACH_DETECTION -> CONFIRM_DETECTION")
+            confirmed = _confirm_current_view_after_trigger(
+                robot,
+                target,
+                surrogate_cat=surrogate_cat,
+                rgb_map_2d=rgb_map_2d,
+                heatmap=heatmap,
+                path_cells=dense or path_cells,
+                search_state=search_state,
+            )
+            if confirmed:
+                print(f"  [zone-explore] ✓ Confirmado '{target}' durante exploración.")
+                return True, "zone_explore"
+
+            false_cell = trigger["cell"] or (
+                int(robot.curr_pos_on_map[0]),
+                int(robot.curr_pos_on_map[1]),
+            )
+            if search_state is not None:
+                search_state.record_false_positive_zone(false_cell[0], false_cell[1])
+            print(f"  [zone-explore] Falsa alarma en {false_cell}; se continúa.")
+            trigger["hit"] = False
+            trigger["cell"] = None
+            session_ref["low"] = get_session(target, conf_thresh=low_thresh)
+            if session_ref["low"] is None:
+                break
+
+    print(f"  [zone-explore] Finalizada sin confirmar '{target}'.")
+    return False, None
+
+
 def _room_instance_matches(actual_room, target_room: str) -> bool:
     """Backward-compatible shim for exact/base room-command matching."""
     return room_command_matches(actual_room, target_room)
+
+
+def _extract_explicit_room_hints(
+    instruction: str,
+    categories: list,
+    room_provider,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Parse "X in the Y" / "X in Y" patterns from the instruction.
+
+    Returns a tuple ``(hints, missing)`` where:
+      * ``hints`` maps target → resolved room name when Y exists in the
+        scene (used to pin the search room).
+      * ``missing`` is a list of (target, requested_room) tuples (encoded
+        as ``"target::room"``) where the user named a room Y that does
+        not exist in the scene. These should cause the query to fail
+        instead of silently falling back to LLM-derived candidates.
+    """
+    if not instruction or not categories:
+        return {}, []
+    text = re.sub(r"\s+", " ", instruction.strip().lower())
+    known_rooms = []
+    if room_provider is not None and getattr(room_provider, "is_available", lambda: False)():
+        try:
+            known_rooms = list(room_provider.list_rooms() or [])
+        except Exception:
+            known_rooms = []
+    if not known_rooms:
+        return {}, []
+
+    from vlmaps.utils.room_priors import canonical_room_type
+    canonical_set = {canonical_room_type(r) for r in known_rooms if r}
+    canonical_set.discard("")
+
+    hints: Dict[str, str] = {}
+    missing: List[str] = []
+    for cat in categories:
+        cat_l = str(cat or "").strip().lower()
+        if not cat_l:
+            continue
+        # Match "<cat> in (the )?<room>" with optional surrounding context.
+        pattern = re.compile(
+            rf"\b{re.escape(cat_l)}\s+in\s+(?:the\s+)?([a-z][a-z\s\.0-9]*?)(?:\s+(?:and|then|with|near|of|on|under)\b|[,\.;!?]|$)"
+        )
+        m = pattern.search(text)
+        if not m:
+            continue
+        room_phrase = m.group(1).strip()
+        # Try canonical room type first, then exact alias.
+        canonical = canonical_room_type(room_phrase)
+        if canonical and canonical in canonical_set:
+            hints[cat_l] = canonical
+            continue
+        # Try resolving as a room alias via room_provider.
+        try:
+            resolved = room_provider.resolve_room_name(room_phrase) if room_provider else None
+        except Exception:
+            resolved = None
+        if resolved:
+            hints[cat_l] = canonical_room_type(resolved) or resolved
+            continue
+        # User asked for a room that does not exist in this scene.
+        missing.append(f"{cat_l}::{room_phrase}")
+    return hints, missing
 
 
 def _resolve_instruction_room_targets(instruction: str, categories: list, room_provider) -> list:
@@ -2441,9 +3517,70 @@ def main(config: DictConfig) -> None:
             print(f"LLM error: {e}")
             continue
 
+        # Fallback: when the LLM strips a small-object query (e.g. "book") it
+        # sometimes returns an empty list because it judges the noun
+        # non-navigable. Recover by treating the bare instruction as the
+        # target if it matches a known canonical small-object label.
+        if not categories:
+            _candidate = instruction.strip().lower()
+            # Strip trailing punctuation and the leading "the".
+            _candidate = re.sub(r"^(the|a|an)\s+", "", _candidate)
+            _candidate = re.sub(r"[\.,!?]+$", "", _candidate).strip()
+            if _candidate and _candidate in (
+                _STRICT_LIKELY_ROOM_TARGETS | {"book", "bottle", "mug", "cup",
+                "teapot", "kettle", "toaster", "coffee maker", "laptop"}
+            ):
+                print(f"  [parser-fallback] Empty parse — using '{_candidate}' from instruction")
+                categories = [_candidate]
+            else:
+                print("  [parser] No targets extracted; skipping query")
+                continue
+
         categories = _resolve_instruction_room_targets(
             instruction, categories, _room_provider
         )
+
+        # Phase G follow-up: extract explicit "X in the Y" hints from the
+        # instruction so that room_object queries pin the search room
+        # instead of relying on heatmap evidence to break ties.
+        _explicit_room_hints, _missing_room_hints = _extract_explicit_room_hints(
+            instruction, categories, _room_provider
+        )
+        if _missing_room_hints:
+            _avail_rooms = sorted(_room_provider.list_rooms()) if _room_provider else []
+            for _entry in _missing_room_hints:
+                _t, _r = _entry.split("::", 1)
+                print(
+                    f"  [room-hint] ✗ Room '{_r}' (requested for target '{_t}') "
+                    f"does NOT exist in this scene. "
+                    f"Available rooms: {_avail_rooms}"
+                )
+            print("  [room-hint] Aborting query — strict pin to a non-existent room.")
+            continue
+        if _explicit_room_hints:
+            print(f"  [room-hint] Explicit pins from instruction: {_explicit_room_hints}")
+            # Drop duplicated room targets: when "the book in the office"
+            # gets parsed into ["book", "office"], the LLM is treating
+            # "office" as a separate goal. Now that the office is recorded
+            # as a pin for "book", remove it from the categories so we
+            # don't run a redundant room_command navigation afterwards.
+            from vlmaps.utils.room_priors import canonical_room_type as _crt
+            _hint_room_canon = {_crt(r) for r in _explicit_room_hints.values() if r}
+            _hint_room_canon.discard("")
+            _filtered_cats = []
+            _dropped = []
+            for _c in categories:
+                _c_canon = _crt(str(_c).strip().lower())
+                if _c_canon and _c_canon in _hint_room_canon:
+                    _dropped.append(str(_c))
+                    continue
+                _filtered_cats.append(_c)
+            if _dropped:
+                print(
+                    f"  [room-hint] Dropping redundant room target(s) {_dropped} "
+                    "(already captured as pin)"
+                )
+                categories = _filtered_cats
 
         target_plans = build_resolved_target_plans(
             categories,
@@ -2452,6 +3589,22 @@ def main(config: DictConfig) -> None:
             available_categories=_scene_categories,
             present_categories=_present_categories,
         )
+
+        # Apply explicit room pins by replacing likely_rooms on matching plans.
+        # This makes _STRICT_LIKELY_ROOM_TARGETS in select_best_room hard-pin
+        # to the user-specified room, overriding heatmap-driven tie-breaking.
+        if _explicit_room_hints:
+            from dataclasses import replace as _dc_replace
+            _new_plans = []
+            for _plan in target_plans:
+                _key = str(_plan.original_target or "").strip().lower()
+                _hint = _explicit_room_hints.get(_key)
+                if _hint and _plan.room_goal is None:
+                    _new_plans.append(_dc_replace(_plan, likely_rooms=[_hint]))
+                else:
+                    _new_plans.append(_plan)
+            target_plans = _new_plans
+
         log_resolved_target_plans(target_plans)
 
         robot.set_agent_state(start_tf)
@@ -2473,6 +3626,22 @@ def main(config: DictConfig) -> None:
                 likely_rooms=_plan.likely_rooms,
                 resolution_source=_plan.resolution_source,
             )
+            # If the user explicitly pinned a room via "X in the Y", record
+            # it on the SearchState so downstream stages can refuse to
+            # search outside this room.
+            _pin = _explicit_room_hints.get(
+                str(_plan.original_target or "").strip().lower()
+            ) if _explicit_room_hints else None
+            if _pin:
+                _ss.pinned_room = _pin
+            else:
+                _cano_t = str(_plan.canonical_target or "").strip().lower()
+                if _cano_t in _STRICT_LIKELY_ROOM_TARGETS and _plan.likely_rooms:
+                    _ss.pinned_room = _plan.likely_rooms[0]
+                    print(
+                        f"  [room-hint] Auto-pin '{_plan.canonical_target}' → "
+                        f"'{_ss.pinned_room}' (STRICT target + LLM likely_rooms)"
+                    )
             if _ss.rooms:
                 # Phase C: compute priors (LLM + manual table + scene evidence)
                 _priors = _ss.compute_priors()
@@ -2612,6 +3781,7 @@ def main(config: DictConfig) -> None:
                         robot.map.obstacles_map,
                         kept_components,
                         current_room=current_room,
+                        room_provider=_room_provider,
                     )
                     if _selected_room is not None:
                         _room_kept = [c for c in kept_components if c.get("room") == _selected_room]
@@ -2649,8 +3819,8 @@ def main(config: DictConfig) -> None:
                     print(f"  [skip] No heatmap signal for '{_heatmap_target}' in this scene.")
                     continue
 
-                from vlmaps.utils.yoloe_utils import get_session, shutdown_session, runtime_conf_thresh
-                _yoloe_session = get_session(_yoloe_target, conf_thresh=runtime_conf_thresh(0.3))
+                from vlmaps.utils.yoloe_utils import get_session, shutdown_session
+                _yoloe_session = get_session(_yoloe_target, conf_thresh=_confirm_conf_thresh())
 
             if room_goal is not None:
                 # goal_pos already set to safe interior goal above (Bug 1 fix)
@@ -2703,12 +3873,18 @@ def main(config: DictConfig) -> None:
                     # Fallback: plan to centroid then walk path backward
                     print(f"  [approach] No annulus goals found — falling back to path walk")
                     _initial_path, _ = robot.plan_path_only(obj_centroid)
-                    goal_pos, obj_centroid = select_safe_goal_from_path(
+                    # Keep the surrogate centroid we just chose — discard the
+                    # global heatmap argmax that select_safe_goal_from_path
+                    # would otherwise return (it can be a different table in
+                    # a different room, making the verify scan face the wrong
+                    # spot).
+                    goal_pos, _ = select_safe_goal_from_path(
                         _initial_path, heatmap, robot.map.obstacles_map,
                         room_provider=_room_provider,
                         required_room=best_comp.get("room"),
                     )
-                    print(f"  Fallback path-based goal: {goal_pos}")
+                    print(f"  Fallback path-based goal: {goal_pos} "
+                          f"(facing centroid kept at {obj_centroid})")
 
                 # Step 3: plan to the selected goal
                 _, planned_actions = robot.plan_path_only(goal_pos)
@@ -2993,6 +4169,11 @@ def main(config: DictConfig) -> None:
                                                   f"(dist={_s1_dist:.1f} \u2264 20) \u2014 accepting")
                                 if _yoloe_confirmed:
                                     fine_visual_center(robot, _yoloe_session, _yoloe_target)
+                                    close_approach_after_detection(
+                                        robot, _yoloe_session, _yoloe_target,
+                                        surrogate_cat=(_heatmap_target if _heatmap_target != _yoloe_target else ""),
+                                        rgb_map_2d=rgb_map_2d, heatmap=heatmap, path_cells=path_cells,
+                                    )
                             else:
                                 print(f"  YOLOE: ✗ '{_yoloe_target}' not detected.")
                     except Exception as e:
@@ -3004,36 +4185,211 @@ def main(config: DictConfig) -> None:
             if not _yoloe_confirmed:
                 print(f"  Starting local ±25° scan for '{_yoloe_target}'…")
                 _pitch_surrogate = _heatmap_target if _heatmap_target != _yoloe_target else ""
-                _yoloe_confirmed = scan_local_and_verify(
-                    robot,
-                    _yoloe_target,
-                    rgb_map_2d,
-                    heatmap,
-                    path_cells,
-                    surrogate_cat=_pitch_surrogate,
-                )
+                if _record_unique_scan_zone(_ss, robot):
+                    _yoloe_confirmed = scan_local_and_verify_with_aliases(
+                        robot,
+                        _yoloe_target,
+                        rgb_map_2d,
+                        heatmap,
+                        path_cells,
+                        surrogate_cat=_pitch_surrogate,
+                        target_cell=tuple(obj_centroid) if obj_centroid is not None else None,
+                    )
+                else:
+                    _yoloe_confirmed = False
                 if _yoloe_confirmed:
                     _scan_source = getattr(robot, "_last_verify_source", None) or "local_scan"
+                    _scan_label = getattr(robot, "_last_verify_label", _yoloe_target) or _yoloe_target
                     if _scan_source != "pitch_scan":
                         print(f"  [verify] source=local_scan")
                     _confirmation_source = _scan_source
                     if _yoloe_session is not None:
-                        fine_visual_center(robot, _yoloe_session, _yoloe_target)
+                        _center_session = _yoloe_session
+                        if _scan_label != _yoloe_target:
+                            from vlmaps.utils.yoloe_utils import get_session
+                            _center_session = get_session(_scan_label, conf_thresh=_confirm_conf_thresh())
+                        if _center_session is not None:
+                            fine_visual_center(robot, _center_session, _scan_label)
+                            close_approach_after_detection(
+                                robot, _center_session, _scan_label,
+                                surrogate_cat=_pitch_surrogate,
+                                rgb_map_2d=rgb_map_2d, heatmap=heatmap, path_cells=path_cells,
+                            )
 
             # Stage 3: Alternative route if local scan also failed
-            if not _yoloe_confirmed:
-                print(f"  Local scan failed — searching alternative route…")
+            #
+            # If the user pinned an explicit room ("X in the Y"), we must
+            # NOT escape to alternative routes in other rooms. Instead,
+            # sweep through every plausible surrogate furniture (table,
+            # desk, shelf, cabinet, sofa, bed, ...) WITHIN the pinned room
+            # so we exhaust the local search before declaring fail.
+            _pinned_room = getattr(_ss, "pinned_room", None) if _ss else None
+            if not _yoloe_confirmed and _pinned_room:
+                from vlmaps.utils.room_priors import canonical_room_type as _crt2
+                _pin_canon = _crt2(_pinned_room)
+                # Build the surrogate sweep list: start with the plan's
+                # surrogates, then add a defensive set of common hosts
+                # for small objects so we don't depend on the LLM having
+                # listed every possibility.
+                _sweep_list: List[str] = []
+                for _s in (_plan.surrogate_categories or []):
+                    if _s and _s.lower() not in {x.lower() for x in _sweep_list}:
+                        _sweep_list.append(_s)
+                for _s in ["table", "desk", "shelf", "shelving", "cabinet",
+                           "counter", "sofa", "bed", "chair"]:
+                    if _s not in {x.lower() for x in _sweep_list}:
+                        _sweep_list.append(_s)
+                # Skip the surrogate we already tried.
+                _sweep_list = [s for s in _sweep_list
+                               if s.lower() != str(_heatmap_target).lower()]
+
+                # Pre-compute heatmaps for each surrogate so we can rank
+                # them by distance-from-robot to the nearest in-pin
+                # candidate. The user wants the closest furniture searched
+                # first (shortest free path) — not the LLM's declaration
+                # order. We cache (heatmap, components_in_pin) to reuse
+                # below without recomputing.
                 robot._set_nav_curr_pose()
-                _navigated_alt = navigate_to_alternative(
-                    robot, _yoloe_target, kept_components,
-                    robot.curr_pos_on_map, rgb_map_2d, heatmap
+                _robot_rc = tuple(robot.curr_pos_on_map)
+                _ranked: list = []  # (dist, surr, hm, kc_in_pin)
+                for _surr in _sweep_list:
+                    try:
+                        _hm_s, _kc_s = compute_heatmap(robot, _surr)
+                    except Exception as _e:
+                        print(f"  [pin-sweep] '{_surr}' heatmap failed: {_e}")
+                        continue
+                    if not _kc_s:
+                        continue
+                    if _room_provider and _room_provider.is_available():
+                        for _comp in _kc_s:
+                            _cr, _cc = _comp["centroid"]
+                            _comp["room"] = _room_provider.get_room_at_cell(
+                                int(_cr), int(_cc)
+                            )
+                    _kc_in = [
+                        c for c in _kc_s
+                        if _crt2(c.get("room") or "") == _pin_canon
+                    ]
+                    if not _kc_in:
+                        continue
+                    _min_d = min(
+                        (float(c["centroid"][0]) - _robot_rc[0]) ** 2
+                        + (float(c["centroid"][1]) - _robot_rc[1]) ** 2
+                        for c in _kc_in
+                    )
+                    _ranked.append((_min_d, _surr, _hm_s, _kc_in))
+                _ranked.sort(key=lambda t: t[0])
+                _ordered_surrs = [t[1] for t in _ranked]
+                print(
+                    f"  [pin-sweep] Pinned to '{_pinned_room}' — "
+                    f"{len(_ranked)} surrogate(s) with candidates here, "
+                    f"nearest-first order: {_ordered_surrs}"
                 )
-                if _navigated_alt and _yoloe_session is not None:
+                _precomputed = {t[1]: (t[2], t[3]) for t in _ranked}
+                for _surr in _ordered_surrs:
+                    if _yoloe_confirmed:
+                        break
+                    _hm_s, _kc_in_pin = _precomputed[_surr]
+                    print(
+                        f"  [pin-sweep] '{_surr}' has {len(_kc_in_pin)} candidate(s) "
+                        f"in '{_pinned_room}' — verifying"
+                    )
+                    setattr(robot, "_alternative_tried_centroids", set())
+                    for _attempt in range(min(3, len(_kc_in_pin))):
+                        robot._set_nav_curr_pose()
+                        _navigated_alt = navigate_to_alternative(
+                            robot, _surr, _kc_in_pin,
+                            robot.curr_pos_on_map, rgb_map_2d, _hm_s
+                        )
+                        if not _navigated_alt:
+                            break
+                        try:
+                            _obs = robot.sim.get_sensor_observations(0)
+                            if "color_sensor" in _obs:
+                                _frame = _obs["color_sensor"][:, :, :3]
+                                _det, _ann, _bb = (False, None, None)
+                                if _yoloe_session is not None:
+                                    _det, _ann, _bb = _yoloe_session.check(_frame)
+                                if _det:
+                                    print(f"  [pin-sweep] ✓ Found '{_yoloe_target}' on '{_surr}'!")
+                                    _yoloe_confirmed = True
+                                    _confirmation_source = f"pin_sweep:{_surr}"
+                                    if _ann is not None:
+                                        freeze_found_target(_yoloe_target, _ann, obj_centroid)
+                                    fine_visual_center(robot, _yoloe_session, _yoloe_target)
+                                    close_approach_after_detection(
+                                        robot, _yoloe_session, _yoloe_target,
+                                        surrogate_cat=_surr,
+                                        rgb_map_2d=rgb_map_2d, heatmap=_hm_s, path_cells=path_cells,
+                                    )
+                                    break
+                                # Run at most one local scan for each physical zone.
+                                if _record_unique_scan_zone(_ss, robot):
+                                    _yoloe_confirmed = scan_local_and_verify_with_aliases(
+                                        robot, _yoloe_target, rgb_map_2d, _hm_s,
+                                        path_cells, surrogate_cat=_surr,
+                                        target_cell=getattr(robot, "_last_nav_target_cell", None),
+                                    )
+                                else:
+                                    _yoloe_confirmed = False
+                                if _yoloe_confirmed:
+                                    print(f"  [pin-sweep] ✓ Local scan found '{_yoloe_target}' near '{_surr}'!")
+                                    _confirmation_source = f"pin_sweep:{_surr}:local_scan"
+                                    fine_visual_center(robot, _yoloe_session, _yoloe_target)
+                                    close_approach_after_detection(
+                                        robot, _yoloe_session, _yoloe_target,
+                                        surrogate_cat=_surr,
+                                        rgb_map_2d=rgb_map_2d, heatmap=_hm_s, path_cells=path_cells,
+                                    )
+                                    break
+                        except Exception as _e:
+                            print(f"  [pin-sweep] verify error on '{_surr}': {_e}")
+                            break
+                if not _yoloe_confirmed:
+                    print(
+                        f"  [pin-sweep] Exhausted surrogates in '{_pinned_room}' — "
+                        f"activating room-zone exploration if enabled."
+                    )
+                    _zone_ok, _zone_source = explore_room_zone_with_yoloe(
+                        robot,
+                        _yoloe_target,
+                        _pinned_room,
+                        _room_provider,
+                        rgb_map_2d,
+                        heatmap,
+                        path_cells,
+                        _ss,
+                        surrogate_cat=_pitch_surrogate,
+                    )
+                    if _zone_ok:
+                        _yoloe_confirmed = True
+                        _confirmation_source = _zone_source
+                    else:
+                        print(
+                            f"  [pin-sweep] Strict pinned-room search failed for "
+                            f"'{_yoloe_target}'."
+                        )
+            elif not _yoloe_confirmed:
+                print(f"  Local scan failed — searching alternative route…")
+                _alt_nav_label = _heatmap_target if _heatmap_target != _yoloe_target else _yoloe_target
+                _navigated_alt = False
+                setattr(robot, "_alternative_tried_centroids", set())
+                for _alt_try in range(3):
+                    robot._set_nav_curr_pose()
+                    _navigated_alt = navigate_to_alternative(
+                        robot, _alt_nav_label, kept_components,
+                        robot.curr_pos_on_map, rgb_map_2d, heatmap
+                    )
+                    if not _navigated_alt:
+                        break
+                    print(f"  [verify] alternative attempt {_alt_try + 1}/3 for '{_yoloe_target}'")
                     try:
                         obs_data = robot.sim.get_sensor_observations(0)
                         if "color_sensor" in obs_data:
                             frame = obs_data["color_sensor"][:, :, :3]
-                            _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
+                            _yoloe_confirmed, _ann_frame, _bbox = (False, None, None)
+                            if _yoloe_session is not None:
+                                _yoloe_confirmed, _ann_frame, _bbox = _yoloe_session.check(frame)
                             if _ann_frame is not None:
                                 ann_bgr = cv2.cvtColor(_ann_frame, cv2.COLOR_RGB2BGR)
                                 show_obs(robot, f"YOLOE alt: {_yoloe_target}", yoloe_frame_bgr=ann_bgr)
@@ -3048,26 +4404,84 @@ def main(config: DictConfig) -> None:
                                     f"  YOLOE (alternative): ✗ '{_yoloe_target}' not found; "
                                     "running bounded local scan from alternative pose."
                                 )
-                                _yoloe_confirmed = scan_local_and_verify(
-                                    robot,
-                                    _yoloe_target,
-                                    rgb_map_2d,
-                                    heatmap,
-                                    path_cells,
-                                    surrogate_cat=_pitch_surrogate,
-                                )
+                                if _record_unique_scan_zone(_ss, robot):
+                                    _yoloe_confirmed = scan_local_and_verify_with_aliases(
+                                        robot,
+                                        _yoloe_target,
+                                        rgb_map_2d,
+                                        heatmap,
+                                        path_cells,
+                                        surrogate_cat=_pitch_surrogate,
+                                        target_cell=getattr(robot, "_last_nav_target_cell", None),
+                                    )
+                                else:
+                                    _yoloe_confirmed = False
                                 if _yoloe_confirmed:
                                     _scan_source = getattr(robot, "_last_verify_source", None) or "local_scan"
+                                    _scan_label = getattr(robot, "_last_verify_label", _yoloe_target) or _yoloe_target
                                     if _scan_source != "pitch_scan":
                                         print(f"  [verify] source=local_scan")
                                     _confirmation_source = _scan_source
-                                    fine_visual_center(robot, _yoloe_session, _yoloe_target)
-                                else:
-                                    print(f"  YOLOE (alternative scan): ✗ '{_yoloe_target}' not found. Giving up.")
+                                    _center_session = _yoloe_session
+                                    if _scan_label != _yoloe_target:
+                                        from vlmaps.utils.yoloe_utils import get_session
+                                        _center_session = get_session(_scan_label, conf_thresh=_confirm_conf_thresh())
+                                    if _center_session is not None:
+                                        fine_visual_center(robot, _center_session, _scan_label)
+                            if _yoloe_confirmed:
+                                break
+                            print(f"  YOLOE (alternative scan): ✗ '{_yoloe_target}' not found.")
                     except Exception as e:
                         print(f"  YOLOE error at alternative: {e}")
-                elif not _navigated_alt:
+                        if _record_unique_scan_zone(_ss, robot):
+                            _yoloe_confirmed = scan_local_and_verify_with_aliases(
+                                robot,
+                                _yoloe_target,
+                                rgb_map_2d,
+                                heatmap,
+                                path_cells,
+                                surrogate_cat=_pitch_surrogate,
+                                target_cell=getattr(robot, "_last_nav_target_cell", None),
+                            )
+                        else:
+                            _yoloe_confirmed = False
+                        if _yoloe_confirmed:
+                            _scan_source = getattr(robot, "_last_verify_source", None) or "local_scan"
+                            _confirmation_source = _scan_source
+                            break
+                if not _navigated_alt:
                     print(f"  No viable alternative route for '{_yoloe_target}'.")
+                elif not _yoloe_confirmed:
+                    print(f"  YOLOE (alternative scan): ✗ '{_yoloe_target}' not found. Giving up.")
+
+                if not _yoloe_confirmed:
+                    robot._set_nav_curr_pose()
+                    _actual_room_for_explore = None
+                    if _room_provider and _room_provider.is_available():
+                        _actual_room_for_explore = _room_provider.get_room_at_cell(
+                            int(robot.curr_pos_on_map[0]),
+                            int(robot.curr_pos_on_map[1]),
+                        )
+                    _explore_room = (
+                        _selected_room
+                        or (best_comp.get("room") if best_comp is not None else None)
+                        or _actual_room_for_explore
+                        or current_room
+                    )
+                    _zone_ok, _zone_source = explore_room_zone_with_yoloe(
+                        robot,
+                        _yoloe_target,
+                        _explore_room,
+                        _room_provider,
+                        rgb_map_2d,
+                        heatmap,
+                        path_cells,
+                        _ss,
+                        surrogate_cat=_pitch_surrogate,
+                    )
+                    if _zone_ok:
+                        _yoloe_confirmed = True
+                        _confirmation_source = _zone_source
 
             # ── Update SearchState with result ────────────────────────────
             robot._set_nav_curr_pose()

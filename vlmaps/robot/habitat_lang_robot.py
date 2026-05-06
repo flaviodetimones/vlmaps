@@ -107,13 +107,9 @@ class HabitatLanguageRobot(LangRobot):
 
         # Safety margin: dilate obstacles before building the visgraph.
         # 3 iterations at cell_size=0.05 m → ~15 cm clearance per side.
-        # NOTE: 5 iterations was tried but closed narrow doorways in HSSD
-        # scenes (some passages are only ~0.5 m wide = 10 cells; 5-iter
-        # bilateral dilation removes the full passage).  3 iterations keeps
-        # all real doorways open while still giving adequate wall clearance.
-        # Planning inflation: moderate dilation keeps HSSD doorways (~10 cells)
-        # open while giving adequate clearance (~15 cm/side at cs=0.05 m).
-        # 5 iterations closed narrow passages; 3 is the safe minimum here.
+        # Keep the planificador conservador; the useful extra space now comes
+        # from the relaxed HSSD navmesh radius above, not from reducing this
+        # planning inflation.
         # The execution shield uses the RAW map — intentionally different.
         _PLAN_DILATION_ITERS = 3
         from scipy.ndimage import binary_dilation as _bdilate
@@ -146,10 +142,29 @@ class HabitatLanguageRobot(LangRobot):
             raw_obstacle_map=cropped_obst_map,
         )
 
-        # ── Room provider (HSSD: native semantic_config.json polygons) ───────
-        from vlmaps.utils.room_provider import SemanticSceneRoomProvider
+        # ── Room provider ────────────────────────────────────────────────────
+        from vlmaps.utils.room_provider import LabelMeRoomProvider, SemanticSceneRoomProvider
         self.room_provider = None
-        if dataset_type == "hssd":
+        _room_labels_source = str(
+            os.environ.get(
+                "VLMAPS_ROOM_LABELS_SOURCE",
+                getattr(self.config, "room_labels_source", "auto"),
+            )
+        ).strip().lower()
+        if _room_labels_source in {"", "labelme"}:
+            _room_labels_source = "auto" if _room_labels_source == "" else "labelme"
+
+        _labelme_provider = LabelMeRoomProvider(
+            vlmaps_data_dir,
+            full_shape=(self.map.gs, self.map.gs),
+            offset=(self.vlmaps_dataloader.rmin, self.vlmaps_dataloader.cmin),
+        )
+        if _room_labels_source in {"auto", "labelme"} and _labelme_provider.is_available():
+            self.room_provider = _labelme_provider
+            print(
+                f"[setup_scene] Using manual LabelMe room regions for '{self.scene_name}'"
+            )
+        elif dataset_type == "hssd":
             _scene_cfg = str(getattr(self.config, "scene_dataset_config_file", ""))
             _sem_config = SemanticSceneRoomProvider.find_config_path(
                 _scene_cfg, self.scene_name
@@ -178,8 +193,16 @@ class HabitatLanguageRobot(LangRobot):
 
                 self.room_provider = SemanticSceneRoomProvider()
                 self.room_provider.build(_sem_config, _gs, hab_to_grid=_hab_to_grid)
+                print(
+                    f"[setup_scene] Using HSSD semantic room regions for '{self.scene_name}'"
+                )
             else:
                 print(f"[setup_scene] HSSD semantic config not found for '{self.scene_name}'")
+        elif _room_labels_source == "labelme":
+            print(
+                f"[setup_scene] Requested LabelMe room regions but none were found for "
+                f"'{self.scene_name}' in {Path(vlmaps_data_dir) / 'room_map'}"
+            )
 
         # self._setup_localizer(vlmaps_data_dir)
 
@@ -305,7 +328,10 @@ class HabitatLanguageRobot(LangRobot):
         if dataset_type == "hssd":
             nav_settings = habitat_sim.NavMeshSettings()
             nav_settings.set_defaults()
-            nav_settings.agent_radius = 0.25
+            # A radius of 0.25 m closes some semantically useful gaps between
+            # tables, counters and other furniture in HSSD. Relax it slightly
+            # so the robot can use those observation corridors.
+            nav_settings.agent_radius = 0.20
             nav_settings.agent_height = 1.5
             # include_static_objects: try as NavMeshSettings attribute (0.3.x),
             # then as keyword arg (0.2.x), then fall back silently.
@@ -318,6 +344,11 @@ class HabitatLanguageRobot(LangRobot):
             except TypeError:
                 self.sim.recompute_navmesh(self.sim.pathfinder, nav_settings)
             assert self.sim.pathfinder.is_loaded, "HSSD navmesh recomputation failed"
+            print(
+                f"[navmesh] recomputed for HSSD with "
+                f"agent_radius={nav_settings.agent_radius:.2f} m, "
+                f"agent_height={nav_settings.agent_height:.2f} m"
+            )
 
         # TODO: add in document to enable this features
         # load agent mesh for visualization

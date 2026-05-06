@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import re
 
@@ -200,53 +201,106 @@ class LabelMeRoomProvider(RoomProvider):
     Works for any scene where manual LabelMe annotation has been done.
     """
 
-    def __init__(self, scene_dir: str):
+    def __init__(self, scene_dir: str, full_shape=None, offset=(0, 0)):
         from vlmaps.utils.room_map_utils import load_room_map
         result = load_room_map(scene_dir)
         if result is None:
             self._available = False
             self._room_map = None
             self._categories = []
-            self._regions = {}
+            self._regions = []
+            self._regions_by_label = {}
+            self._region_grid = None
         else:
             self._available = True
-            self._room_map, self._categories, self._regions = result
+            self._room_map, self._categories, loaded_regions = result
+            self._regions_by_label = loaded_regions or {}
+            self._region_grid = np.zeros_like(self._room_map, dtype=np.int32)
+            self._regions = []
+
+            next_region_id = 1
+            for cat_idx, label in enumerate(self._categories):
+                binary = (self._room_map == cat_idx).astype(np.uint8)
+                n_labels, comps, stats, centroids = cv2.connectedComponentsWithStats(
+                    binary, connectivity=8
+                )
+                declared = list(self._regions_by_label.get(label, []))
+                for comp_id in range(1, n_labels):
+                    area = int(stats[comp_id, cv2.CC_STAT_AREA])
+                    cy = int(round(centroids[comp_id][1]))
+                    cx = int(round(centroids[comp_id][0]))
+                    meta = declared.pop(0) if declared else {}
+                    self._region_grid[comps == comp_id] = next_region_id
+                    self._regions.append(
+                        {
+                            "id": next_region_id,
+                            "label": label,
+                            "category": label,
+                            "centroid": meta.get("centroid", [cy, cx]),
+                            "area": int(meta.get("area", area)),
+                            "quality": float(meta.get("quality", area)),
+                        }
+                    )
+                    next_region_id += 1
+
+            if full_shape is not None and tuple(self._region_grid.shape) != tuple(full_shape):
+                full_h, full_w = int(full_shape[0]), int(full_shape[1])
+                off_r, off_c = int(offset[0]), int(offset[1])
+                h, w = self._region_grid.shape
+                expanded_grid = np.zeros((full_h, full_w), dtype=self._region_grid.dtype)
+                expanded_map = np.full((full_h, full_w), -1, dtype=self._room_map.dtype)
+
+                r0 = max(0, off_r)
+                c0 = max(0, off_c)
+                r1 = min(full_h, off_r + h)
+                c1 = min(full_w, off_c + w)
+                src_r0 = max(0, -off_r)
+                src_c0 = max(0, -off_c)
+                src_r1 = src_r0 + max(0, r1 - r0)
+                src_c1 = src_c0 + max(0, c1 - c0)
+
+                if r1 > r0 and c1 > c0:
+                    expanded_grid[r0:r1, c0:c1] = self._region_grid[src_r0:src_r1, src_c0:src_c1]
+                    expanded_map[r0:r1, c0:c1] = self._room_map[src_r0:src_r1, src_c0:src_c1]
+                    for region in self._regions:
+                        cr, cc = region["centroid"]
+                        region["centroid"] = [float(cr) + off_r, float(cc) + off_c]
+
+                self._region_grid = expanded_grid
+                self._room_map = expanded_map
 
     def is_available(self) -> bool:
         return self._available
 
     def get_room_at_cell(self, row: int, col: int) -> Optional[str]:
-        if not self._available or self._room_map is None:
+        if not self._available or self._region_grid is None:
             return None
-        if row < 0 or col < 0 or row >= self._room_map.shape[0] or col >= self._room_map.shape[1]:
+        if row < 0 or col < 0 or row >= self._region_grid.shape[0] or col >= self._region_grid.shape[1]:
             return None
-        label_id = int(self._room_map[row, col])
-        if label_id <= 0:
+        region_id = int(self._region_grid[row, col])
+        if region_id <= 0:
             return None
-        # regions keys are str or int depending on save format
-        region = self._regions.get(label_id) or self._regions.get(str(label_id))
-        if region is None:
-            return None
-        return region.get("label") or region.get("category")
+        for region in self._regions:
+            if int(region["id"]) == region_id:
+                return region.get("label") or region.get("category")
+        return None
 
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         if not self._available:
             return None
-        from vlmaps.utils.room_map_utils import find_room_goal
         resolved = self.resolve_room_name(room_name) or room_name
-        curr_pos = (0, 0)  # dummy — find_room_goal picks closest
-        result = find_room_goal(resolved, self._regions, curr_pos)
-        return result  # (row, col) or None
+        query = _normalize_room_text(resolved)
+        for region in self._regions:
+            label = _normalize_room_text(region.get("label") or region.get("category") or "")
+            if query == label:
+                r, c = region["centroid"]
+                return (float(r), float(c))
+        return None
 
     def list_rooms(self) -> List[str]:
         if not self._available:
             return []
-        labels = []
-        for region in self._regions.values():
-            lbl = region.get("label") or region.get("category")
-            if lbl and lbl not in labels:
-                labels.append(lbl)
-        return labels
+        return list(self._regions_by_label.keys())
 
 
 # ── Semantic scene provider (HSSD) ───────────────────────────────────────────

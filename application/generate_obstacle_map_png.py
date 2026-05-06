@@ -195,7 +195,9 @@ def main(config: DictConfig) -> None:
     cv2.imwrite(str(rgb_path), rgb_bgr)
     print(f"Saved: {rgb_path}  ({rgb_bgr.shape[1]}x{rgb_bgr.shape[0]} px)")
 
-    # 3. Labeled composite: RGB + obstacle overlay (red = walls)
+    # 3. Labeled composite for LabelMe.
+    # Highlight navigable floor in red, keep furniture/layout visible, and
+    # darken non-navigable/outside areas so room boundaries are easier to draw.
     # Crop RGB to match obstacle map dimensions
     rmin, rmax = robot.map.rmin, robot.map.rmax
     cmin, cmax = robot.map.cmin, robot.map.cmax
@@ -204,13 +206,26 @@ def main(config: DictConfig) -> None:
         rgb_crop = cv2.resize(rgb_crop, (obs.shape[1], obs.shape[0]),
                               interpolation=cv2.INTER_LINEAR)
 
-    # Blend: where obstacle (white), tint red; free space keeps RGB
-    labeled = rgb_crop.copy()
-    wall_mask = obs > 128
-    labeled[wall_mask] = (labeled[wall_mask] * 0.3).astype(np.uint8)
-    labeled[wall_mask, 2] = np.clip(
-        labeled[wall_mask, 2].astype(int) + 120, 0, 255
-    ).astype(np.uint8)
+    # obstacle_map.png stores navigable cells as white (255) and blocked cells
+    # as black (0). For annotation, use a semi-transparent red tint over the
+    # navigable area instead of flooding the whole scene, so furniture remains
+    # readable. Darken non-navigable cells and add a crisp boundary outline.
+    nav_mask = obs > 128
+    blocked_mask = ~nav_mask
+
+    base = cv2.convertScaleAbs(rgb_crop, alpha=1.05, beta=8)
+    labeled = (base * 0.78).astype(np.uint8)
+
+    nav_overlay = np.zeros_like(base)
+    nav_overlay[:, :] = (20, 25, 185)  # BGR: soft red, not pure saturated red
+    labeled[nav_mask] = cv2.addWeighted(
+        base[nav_mask], 0.50, nav_overlay[nav_mask], 0.50, 0
+    )
+
+    labeled[blocked_mask] = (base[blocked_mask] * 0.18).astype(np.uint8)
+
+    boundary = cv2.morphologyEx(nav_mask.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    labeled[boundary] = (235, 235, 235)
 
     labeled_path = scene_dir / "topdown_labeled.png"
     cv2.imwrite(str(labeled_path), labeled)
