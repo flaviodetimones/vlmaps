@@ -821,9 +821,38 @@ def _show_room_png_if_available(path: Path, window_name: str) -> None:
     ui_wait(1)
 
 
-def _annotation_json_exists(dataset_type: str, scene_name: str) -> bool:
+def _annotation_json_path(dataset_type: str, scene_name: str) -> Optional[Path]:
     root = Path("/workspace/annotations/room_labels") / str(dataset_type) / str(scene_name)
-    return any((root / name).exists() for name in ("room_labels.json", "topdown_labeled.json"))
+    for name in ("room_labels.json", "topdown_labeled.json"):
+        path = root / name
+        if path.exists():
+            return path
+    return None
+
+
+def _annotation_json_exists(dataset_type: str, scene_name: str) -> bool:
+    return _annotation_json_path(dataset_type, scene_name) is not None
+
+
+def _annotation_room_labels(dataset_type: str, scene_name: str) -> list:
+    path = _annotation_json_path(dataset_type, scene_name)
+    if path is None:
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        print(f"[room-debug] No se pudo leer la anotación LabelMe {path}: {exc}")
+        return []
+
+    labels = []
+    for shape in data.get("shapes", []) or []:
+        if shape.get("shape_type") != "polygon":
+            continue
+        label = str(shape.get("label") or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    return labels
 
 
 def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provider, rgb_map_2d: np.ndarray, obs_map: np.ndarray) -> None:
@@ -864,8 +893,23 @@ def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provi
         )
 
     provider_name = type(room_provider).__name__
+    annotation_labels = _annotation_room_labels(dataset_type, scene_name)
+    provider_rooms = list(room_provider.list_rooms())
+    missing_labels = [
+        label for label in annotation_labels
+        if not any(room_command_matches(label, room) for room in provider_rooms)
+    ]
+    if missing_labels:
+        raise SystemExit(
+            "[room-debug] El room_map cargado no contiene todas las regiones de LabelMe. "
+            f"Faltan: {missing_labels}. Relanza x) para que el menú reconvierta el JSON, "
+            "o usa n) Label rooms para regenerar room_map."
+        )
+
     print(f"[room-debug] Provider: {provider_name}")
-    print(f"[room-debug] Rooms   : {room_provider.list_rooms()}")
+    print(f"[room-debug] Rooms   : {provider_rooms}")
+    if annotation_labels:
+        print(f"[room-debug] LabelMe : {annotation_labels}")
     print(f"[room-debug] Voronoi : {'sí' if vor_shape is not None else 'no'}")
 
     _show_room_png_if_available(room_map_dir / "room_map_viz.png", "LabelMe room_map")
