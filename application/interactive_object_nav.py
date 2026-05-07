@@ -3047,9 +3047,10 @@ def explore_room_zone_with_yoloe(
     search_state: Optional[SearchState],
     *,
     surrogate_cat: str = "",
+    force: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Explore a labeled room/zone with low-threshold YOLOE during movement."""
-    if not _room_exploration_enabled():
+    if not force and not _room_exploration_enabled():
         return False, None
     if room_provider is None or not room_provider.is_available() or not room_name:
         print("  [zone-explore] Sin región de habitación disponible; se omite exploración.")
@@ -3297,6 +3298,30 @@ def _resolve_instruction_room_targets(instruction: str, categories: list, room_p
     return resolved
 
 
+def _extract_find_clause_target(instruction: str, room_provider) -> Optional[str]:
+    """Best-effort fallback for commands like "go to X and find the drill"."""
+    text = re.sub(r"\s+", " ", str(instruction or "").strip().lower())
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?:find|search for|look for)\s+(?:the\s+|a\s+|an\s+)?"
+        r"([a-z][a-z0-9 _-]*?)(?:\s+(?:in|inside|at|near|on|under)\b|[,\.;!?]|$)",
+        text,
+    )
+    if not match:
+        return None
+    target = match.group(1).strip(" .,_-")
+    if not target:
+        return None
+    if room_provider is not None and room_provider.is_available():
+        try:
+            if room_provider.resolve_room_name(target) is not None:
+                return None
+        except Exception:
+            pass
+    return target
+
+
 @dataclass(frozen=True)
 class ResolvedTargetPlan:
     original_target: str
@@ -3539,6 +3564,15 @@ def main(config: DictConfig) -> None:
         categories = _resolve_instruction_room_targets(
             instruction, categories, _room_provider
         )
+        _find_clause_target = _extract_find_clause_target(instruction, _room_provider)
+        if _find_clause_target:
+            _existing_cats = {str(c or "").strip().lower() for c in categories}
+            if _find_clause_target not in _existing_cats:
+                print(
+                    f"  [parser-fallback] Adding object target from find-clause: "
+                    f"'{_find_clause_target}'"
+                )
+                categories.append(_find_clause_target)
 
         # Phase G follow-up: extract explicit "X in the Y" hints from the
         # instruction so that room_object queries pin the search room
@@ -3590,15 +3624,35 @@ def main(config: DictConfig) -> None:
             present_categories=_present_categories,
         )
 
+        # Commands such as "go to the living room and find the drill" often
+        # arrive from the parser as two independent goals:
+        #   1) living_room [room]
+        #   2) drill [object]
+        # Treat the room command as a strict search context for the object,
+        # otherwise the object branch may select a different room or stop at a
+        # surrogate candidate without ever sweeping the LabelMe region.
+        _implicit_room_pins: Dict[str, str] = {}
+        _room_context_plans = [p for p in target_plans if p.room_goal is not None]
+        _object_context_plans = [p for p in target_plans if p.room_goal is None]
+        if _room_context_plans and _object_context_plans:
+            _context_room = _room_context_plans[0].original_target
+            if _context_room:
+                for _plan in _object_context_plans:
+                    _implicit_room_pins[str(_plan.original_target or "").strip().lower()] = _context_room
+                print(
+                    f"  [room-hint] Room command '{_context_room}' will constrain "
+                    f"object search target(s): {list(_implicit_room_pins.keys())}"
+                )
+
         # Apply explicit room pins by replacing likely_rooms on matching plans.
         # This makes _STRICT_LIKELY_ROOM_TARGETS in select_best_room hard-pin
         # to the user-specified room, overriding heatmap-driven tie-breaking.
-        if _explicit_room_hints:
+        if _explicit_room_hints or _implicit_room_pins:
             from dataclasses import replace as _dc_replace
             _new_plans = []
             for _plan in target_plans:
                 _key = str(_plan.original_target or "").strip().lower()
-                _hint = _explicit_room_hints.get(_key)
+                _hint = _explicit_room_hints.get(_key) or _implicit_room_pins.get(_key)
                 if _hint and _plan.room_goal is None:
                     _new_plans.append(_dc_replace(_plan, likely_rooms=[_hint]))
                 else:
@@ -3632,6 +3686,10 @@ def main(config: DictConfig) -> None:
             _pin = _explicit_room_hints.get(
                 str(_plan.original_target or "").strip().lower()
             ) if _explicit_room_hints else None
+            if not _pin:
+                _pin = _implicit_room_pins.get(
+                    str(_plan.original_target or "").strip().lower()
+                )
             if _pin:
                 _ss.pinned_room = _pin
             else:
@@ -3817,6 +3875,75 @@ def main(config: DictConfig) -> None:
 
                 if not kept_components:
                     print(f"  [skip] No heatmap signal for '{_heatmap_target}' in this scene.")
+                    _forced_room_for_explore = getattr(_ss, "pinned_room", None) if _ss else None
+                    if _forced_room_for_explore:
+                        print(
+                            f"  [room-search] '{_yoloe_target}' is constrained to "
+                            f"'{_forced_room_for_explore}' — exploring the LabelMe region "
+                            "instead of stopping at empty heatmap."
+                        )
+                        if current_room != _forced_room_for_explore:
+                            _safe_map_for_rooms = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+                            _stage_ok, _stage_room = navigate_to_room_stage(
+                                robot,
+                                _forced_room_for_explore,
+                                _room_provider,
+                                rgb_map_2d,
+                                _safe_map_for_rooms,
+                            )
+                            current_room = _stage_room
+                            if _ss:
+                                _ss.update_current_room(current_room)
+                            if not _stage_ok:
+                                print(
+                                    f"  [room-stage] Warning: staging move toward "
+                                    f"'{_forced_room_for_explore}' did not complete cleanly; "
+                                    "exploring from current pose."
+                                )
+
+                        _zone_ok, _zone_source = explore_room_zone_with_yoloe(
+                            robot,
+                            _yoloe_target,
+                            _forced_room_for_explore,
+                            _room_provider,
+                            rgb_map_2d,
+                            heatmap,
+                            [],
+                            _ss,
+                            surrogate_cat="",
+                            force=True,
+                        )
+                        robot._set_nav_curr_pose()
+                        _end_room = None
+                        if _room_provider and _room_provider.is_available():
+                            _end_room = _room_provider.get_room_at_cell(
+                                int(robot.curr_pos_on_map[0]),
+                                int(robot.curr_pos_on_map[1]),
+                            )
+                        if _ss:
+                            _ss.update_current_room(_end_room)
+                            if _zone_ok:
+                                _ss.record_object_seen(_end_room, _yoloe_target)
+                                _ss.mark_found(_end_room)
+                                if _zone_source:
+                                    _ss.mark_confirmation(_zone_source)
+                        if _zone_ok:
+                            print(f"  ✓ Found '{_yoloe_target}' via room-zone exploration.")
+                            show_obs(robot, f"FOUND: {_yoloe_target}")
+                            show_map(
+                                robot,
+                                rgb_map_2d,
+                                heatmap_2d=heatmap,
+                                label=f"FOUND: {_yoloe_target}",
+                            )
+                        else:
+                            print(
+                                f"  ✗ '{_yoloe_target}' not found after exploring "
+                                f"'{_forced_room_for_explore}'."
+                            )
+                        from vlmaps.utils.habitat_utils import agent_state2tf
+                        agent_state = robot.sim.get_agent(0).get_state()
+                        start_tf = agent_state2tf(agent_state)
                     continue
 
                 from vlmaps.utils.yoloe_utils import get_session, shutdown_session
@@ -4360,6 +4487,7 @@ def main(config: DictConfig) -> None:
                         path_cells,
                         _ss,
                         surrogate_cat=_pitch_surrogate,
+                        force=True,
                     )
                     if _zone_ok:
                         _yoloe_confirmed = True
