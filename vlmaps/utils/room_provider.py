@@ -106,6 +106,14 @@ class RoomProvider(ABC):
     def get_room_at_cell(self, row: int, col: int) -> Optional[str]:
         """Return the room name for a map grid cell, or None if unknown."""
 
+    def get_nearest_room_at_cell(self, row: int, col: int) -> Optional[str]:
+        """Return expanded room ownership for occupied/unlabelled cells.
+
+        Implementations that do not have a separate ownership layer fall back
+        to the navigable/manual room query.
+        """
+        return self.get_room_at_cell(row, col)
+
     @abstractmethod
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         """Return (row, col) centroid of the best matching room, or None."""
@@ -207,6 +215,7 @@ class LabelMeRoomProvider(RoomProvider):
         if result is None:
             self._available = False
             self._room_map = None
+            self._voronoi_map = None
             self._categories = []
             self._regions = []
             self._regions_by_label = {}
@@ -214,6 +223,9 @@ class LabelMeRoomProvider(RoomProvider):
         else:
             self._available = True
             self._room_map, self._categories, loaded_regions = result
+            _room_dir = Path(scene_dir) / "room_map"
+            _voronoi_file = _room_dir / "room_voronoi.npy"
+            self._voronoi_map = np.load(_voronoi_file) if _voronoi_file.exists() else None
             self._regions_by_label = loaded_regions or {}
             self._region_grid = np.zeros_like(self._room_map, dtype=np.int32)
             self._regions = []
@@ -249,6 +261,9 @@ class LabelMeRoomProvider(RoomProvider):
                 h, w = self._region_grid.shape
                 expanded_grid = np.zeros((full_h, full_w), dtype=self._region_grid.dtype)
                 expanded_map = np.full((full_h, full_w), -1, dtype=self._room_map.dtype)
+                expanded_voronoi = None
+                if self._voronoi_map is not None:
+                    expanded_voronoi = np.full((full_h, full_w), -1, dtype=self._voronoi_map.dtype)
 
                 r0 = max(0, off_r)
                 c0 = max(0, off_c)
@@ -262,12 +277,15 @@ class LabelMeRoomProvider(RoomProvider):
                 if r1 > r0 and c1 > c0:
                     expanded_grid[r0:r1, c0:c1] = self._region_grid[src_r0:src_r1, src_c0:src_c1]
                     expanded_map[r0:r1, c0:c1] = self._room_map[src_r0:src_r1, src_c0:src_c1]
+                    if expanded_voronoi is not None:
+                        expanded_voronoi[r0:r1, c0:c1] = self._voronoi_map[src_r0:src_r1, src_c0:src_c1]
                     for region in self._regions:
                         cr, cc = region["centroid"]
                         region["centroid"] = [float(cr) + off_r, float(cc) + off_c]
 
                 self._region_grid = expanded_grid
                 self._room_map = expanded_map
+                self._voronoi_map = expanded_voronoi
 
     def is_available(self) -> bool:
         return self._available
@@ -284,6 +302,18 @@ class LabelMeRoomProvider(RoomProvider):
             if int(region["id"]) == region_id:
                 return region.get("label") or region.get("category")
         return None
+
+    def get_nearest_room_at_cell(self, row: int, col: int) -> Optional[str]:
+        if not self._available:
+            return None
+        if self._voronoi_map is None:
+            return self.get_room_at_cell(row, col)
+        if row < 0 or col < 0 or row >= self._voronoi_map.shape[0] or col >= self._voronoi_map.shape[1]:
+            return None
+        cat_idx = int(self._voronoi_map[row, col])
+        if cat_idx < 0 or cat_idx >= len(self._categories):
+            return None
+        return self._categories[cat_idx]
 
     def get_room_centroid(self, room_name: str) -> Optional[Tuple[float, float]]:
         if not self._available:

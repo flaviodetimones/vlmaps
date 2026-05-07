@@ -3796,11 +3796,11 @@ def main(config: DictConfig) -> None:
                     rooms_count: dict = {}
                     for comp in kept_components:
                         cr, cc = comp["centroid"]
-                        comp["room"] = _room_provider.get_room_at_cell(int(cr), int(cc))
+                        comp["room"] = _room_provider.get_nearest_room_at_cell(int(cr), int(cc))
                         r = comp["room"] or "unknown"
                         rooms_count[r] = rooms_count.get(r, 0) + 1
                     if rooms_count:
-                        print(f"  Candidates by room: {rooms_count}")
+                        print(f"  Candidates by room (Voronoi ownership): {rooms_count}")
 
                 # Bug 2: re-compute room priors with heatmap evidence as
                 # dominant signal (direct query — heatmap has signal).
@@ -4390,7 +4390,7 @@ def main(config: DictConfig) -> None:
                     if _room_provider and _room_provider.is_available():
                         for _comp in _kc_s:
                             _cr, _cc = _comp["centroid"]
-                            _comp["room"] = _room_provider.get_room_at_cell(
+                            _comp["room"] = _room_provider.get_nearest_room_at_cell(
                                 int(_cr), int(_cc)
                             )
                     _kc_in = [

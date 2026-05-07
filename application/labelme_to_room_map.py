@@ -18,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 
 def _load_labelme(json_path: str):
@@ -77,7 +78,59 @@ def _extract_regions(room_map: np.ndarray, labels, min_region_size: int = 50):
     return regions
 
 
-def convert(json_path: str, scene_dir: str, min_region_size: int = 50, preview: bool = True):
+def _build_voronoi_room_map(
+    room_map: np.ndarray,
+    *,
+    max_distance_cells: int = 50,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand navigable LabelMe room labels to nearby unlabeled/occupied cells.
+
+    ``room_map`` remains the authoritative navigable mask. The Voronoi map is a
+    derived ownership layer for furniture/object centroids that usually fall on
+    non-navigable cells outside the manually painted floor.
+    """
+    known = room_map >= 0
+    voronoi = np.full_like(room_map, -1, dtype=np.int32)
+    distance_cells = np.full(room_map.shape, np.inf, dtype=np.float32)
+    if not np.any(known):
+        return voronoi, distance_cells
+
+    distance_cells, nearest = distance_transform_edt(
+        ~known,
+        return_indices=True,
+    )
+    nearest_rows, nearest_cols = nearest
+    assigned = distance_cells <= float(max_distance_cells)
+    voronoi[assigned] = room_map[nearest_rows[assigned], nearest_cols[assigned]]
+    return voronoi.astype(np.int32), distance_cells.astype(np.float32)
+
+
+def _render_voronoi_map(voronoi_map: np.ndarray, room_map: np.ndarray, labels) -> np.ndarray:
+    """Render a compact preview of navigable rooms plus Voronoi ownership."""
+    h, w = voronoi_map.shape[:2]
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    colors = rng.integers(70, 230, size=(max(1, len(labels)), 3), dtype=np.uint8)
+    for idx, _label in enumerate(labels):
+        expanded = voronoi_map == idx
+        navigable = room_map == idx
+        color = colors[idx].astype(np.float32)
+        canvas[expanded] = np.clip(color * 0.45, 0, 255).astype(np.uint8)
+        canvas[navigable] = color.astype(np.uint8)
+
+    boundary = ((room_map >= 0).astype(np.uint8) * 255)
+    contours, _ = cv2.findContours(boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(canvas, contours, -1, (255, 255, 255), 1)
+    return canvas
+
+
+def convert(
+    json_path: str,
+    scene_dir: str,
+    min_region_size: int = 50,
+    preview: bool = True,
+    voronoi_max_distance_cells: int = 50,
+):
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from vlmaps.utils.room_map_utils import (
         save_room_map,
@@ -106,9 +159,25 @@ def convert(json_path: str, scene_dir: str, min_region_size: int = 50, preview: 
     viz = render_room_map(room_map, labels, regions)
 
     save_room_map(scene_dir, room_map, labels, regions, viz_img=viz)
+    voronoi_map, voronoi_dist = _build_voronoi_room_map(
+        room_map,
+        max_distance_cells=voronoi_max_distance_cells,
+    )
+    room_map_dir = Path(scene_dir) / "room_map"
+    np.save(room_map_dir / "room_voronoi.npy", voronoi_map)
+    np.save(room_map_dir / "room_voronoi_distance.npy", voronoi_dist)
+    cv2.imwrite(
+        str(room_map_dir / "room_voronoi_viz.png"),
+        _render_voronoi_map(voronoi_map, room_map, labels),
+    )
 
     print(f"\nRoom map saved to: {Path(scene_dir) / 'room_map'}/")
     print(f"  Categories ({len(labels)}): {labels}")
+    print(
+        "  Voronoi    : "
+        f"{int((voronoi_map >= 0).sum())} assigned cells "
+        f"(max distance {voronoi_max_distance_cells} cells)"
+    )
     n_regions = sum(len(v) for v in regions.values())
     print(f"  Regions    ({n_regions}):")
     for label, infos in regions.items():
@@ -135,6 +204,8 @@ def main():
                         help="Scene dataset directory (contains obstacle_map.png)")
     parser.add_argument("--min-region-size", type=int, default=50,
                         help="Minimum pixel area for a room region (default: 50)")
+    parser.add_argument("--voronoi-max-distance-cells", type=int, default=50,
+                        help="Maximum expansion distance for furniture ownership (default: 50 cells)")
     parser.add_argument("--no-preview", action="store_true",
                         help="Do not open the OpenCV room-map preview window")
     args = parser.parse_args()
@@ -146,7 +217,13 @@ def main():
         print(f"ERROR: Scene dir not found: {args.scene}")
         sys.exit(1)
 
-    convert(args.json, args.scene, args.min_region_size, preview=not args.no_preview)
+    convert(
+        args.json,
+        args.scene,
+        args.min_region_size,
+        preview=not args.no_preview,
+        voronoi_max_distance_cells=args.voronoi_max_distance_cells,
+    )
 
 
 if __name__ == "__main__":
