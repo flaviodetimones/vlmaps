@@ -619,7 +619,11 @@ def emit_instruction_eval_summary(
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
              path_cells: list = None, label: str = "",
              zoom_radius: int = 300, output_px: int = 700,
-             target_cell: list = None):
+             target_cell: list = None,
+             room_mask: np.ndarray = None,
+             exploration_points: list = None,
+             visited_points: list = None,
+             current_exploration_point: list = None):
     """Display a top-down semantic map with optional zoom centered on the robot.
 
     Args:
@@ -646,6 +650,15 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
     # ── Base: RGB crop ────────────────────────────────────────────────────────
     canvas = rgb_map_2d[r0:r1, c0:c1].astype(np.float32).copy()
 
+    # ── Room/exploration overlay ─────────────────────────────────────────────
+    if room_mask is not None:
+        try:
+            mask_crop = room_mask[r0:r1, c0:c1].astype(bool)
+            color = np.array([50, 220, 255], dtype=np.float32)
+            canvas[mask_crop] = canvas[mask_crop] * 0.62 + color * 0.38
+        except Exception:
+            pass
+
     # ── Semantic heatmap overlay ──────────────────────────────────────────────
     if heatmap_2d is not None:
         h_crop = heatmap_2d[r0:r1, c0:c1]
@@ -666,6 +679,21 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
         )
         if len(pts) > 1:
             cv2.polylines(canvas_bgr, [pts], False, (0, 0, 255), 2)
+
+    def _draw_cell_marker(cell, color, radius=4, thickness=-1):
+        if cell is None:
+            return
+        rr = int(cell[0]) - r0
+        cc = int(cell[1]) - c0
+        if 0 <= rr < (r1 - r0) and 0 <= cc < (c1 - c0):
+            cv2.circle(canvas_bgr, (cc, rr), radius, color, thickness)
+            cv2.circle(canvas_bgr, (cc, rr), radius + 2, (255, 255, 255), 1)
+
+    for cell in exploration_points or []:
+        _draw_cell_marker(cell, (255, 180, 0), radius=3, thickness=-1)
+    for cell in visited_points or []:
+        _draw_cell_marker(cell, (120, 120, 120), radius=3, thickness=-1)
+    _draw_cell_marker(current_exploration_point, (0, 255, 255), radius=6, thickness=2)
 
     # ── Robot position ────────────────────────────────────────────────────────
     robot_r = row - r0
@@ -703,6 +731,165 @@ def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
 
     safe_imshow("Semantic Map", canvas_bgr)
     ui_wait(1)
+
+
+def _room_color_table(n: int) -> np.ndarray:
+    rng = np.random.default_rng(7)
+    return rng.integers(70, 230, size=(max(1, int(n)), 3), dtype=np.uint8)
+
+
+def _render_room_layer_overlay(
+    rgb_map_2d: np.ndarray,
+    room_provider,
+    *,
+    include_voronoi: bool = True,
+) -> Optional[np.ndarray]:
+    """Render expanded LabelMe/Voronoi layers in full VLMap coordinates."""
+    if room_provider is None or not room_provider.is_available():
+        return None
+    room_map = getattr(room_provider, "_room_map", None)
+    categories = list(getattr(room_provider, "_categories", []) or [])
+    if room_map is None or tuple(room_map.shape[:2]) != tuple(rgb_map_2d.shape[:2]):
+        return None
+
+    canvas = rgb_map_2d.astype(np.float32).copy()
+    colors = _room_color_table(len(categories)).astype(np.float32)
+
+    voronoi_map = getattr(room_provider, "_voronoi_map", None)
+    if include_voronoi and voronoi_map is not None and tuple(voronoi_map.shape[:2]) == tuple(room_map.shape[:2]):
+        for idx in range(len(categories)):
+            mask = voronoi_map == idx
+            canvas[mask] = canvas[mask] * 0.78 + colors[idx] * 0.22
+
+    for idx in range(len(categories)):
+        mask = room_map == idx
+        canvas[mask] = canvas[mask] * 0.35 + colors[idx] * 0.65
+
+    out = cv2.cvtColor(np.clip(canvas, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    region_grid = getattr(room_provider, "_region_grid", None)
+    regions = list(getattr(room_provider, "_regions", []) or [])
+    if region_grid is not None:
+        boundary = (room_map >= 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, (255, 255, 255), 1)
+    for region in regions:
+        try:
+            cr, cc = region["centroid"]
+            label = str(region.get("label") or region.get("category") or "")
+            r = int(round(float(cr)))
+            c = int(round(float(cc)))
+            if 0 <= r < out.shape[0] and 0 <= c < out.shape[1]:
+                cv2.circle(out, (c, r), 4, (255, 255, 255), -1)
+                cv2.putText(
+                    out,
+                    label,
+                    (c + 5, r - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    (0, 0, 0),
+                    3,
+                )
+                cv2.putText(
+                    out,
+                    label,
+                    (c + 5, r - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    (255, 255, 255),
+                    1,
+                )
+        except Exception:
+            continue
+    return out
+
+
+def _show_room_png_if_available(path: Path, window_name: str) -> None:
+    if is_eval_headless() or not path.exists():
+        return
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        return
+    max_side = max(img.shape[:2])
+    if max_side > 900:
+        scale = 900.0 / float(max_side)
+        img = cv2.resize(
+            img,
+            (max(1, int(img.shape[1] * scale)), max(1, int(img.shape[0] * scale))),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    safe_imshow(window_name, img)
+    ui_wait(1)
+
+
+def _annotation_json_exists(dataset_type: str, scene_name: str) -> bool:
+    root = Path("/workspace/annotations/room_labels") / str(dataset_type) / str(scene_name)
+    return any((root / name).exists() for name in ("room_labels.json", "topdown_labeled.json"))
+
+
+def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provider, rgb_map_2d: np.ndarray, obs_map: np.ndarray) -> None:
+    """Fail early on broken LabelMe/Voronoi data and show debug layers for x."""
+    if not _room_exploration_enabled():
+        return
+
+    scene_name = Path(scene_dir).name
+    annotation_exists = _annotation_json_exists(dataset_type, scene_name)
+    room_map_dir = Path(scene_dir) / "room_map"
+
+    if annotation_exists and not room_map_dir.exists():
+        raise SystemExit(
+            f"[room-debug] Hay anotación LabelMe para '{scene_name}', pero no existe {room_map_dir}. "
+            "Vuelve a ejecutar n) Label rooms para convertirla a room_map."
+        )
+    if room_provider is None or not room_provider.is_available():
+        raise SystemExit(
+            "[room-debug] x requiere regiones de habitación cargadas. "
+            "Convierte LabelMe con n) Label rooms antes de explorar por habitación."
+        )
+
+    expected_shape = tuple(obs_map.shape[:2])
+    room_shape = getattr(room_provider, "room_map_shape", lambda: None)()
+    if room_shape is not None and tuple(room_shape) != expected_shape:
+        raise SystemExit(
+            f"[room-debug] Dimensiones incompatibles: room_map={room_shape}, mapa={expected_shape}."
+        )
+    vor_shape = getattr(room_provider, "voronoi_shape", lambda: None)()
+    if vor_shape is None:
+        print(
+            "[room-debug] Aviso: no existe room_voronoi.npy; los muebles se asignarán "
+            "solo si caen dentro del polígono LabelMe."
+        )
+    elif tuple(vor_shape) != expected_shape:
+        raise SystemExit(
+            f"[room-debug] Dimensiones incompatibles: room_voronoi={vor_shape}, mapa={expected_shape}."
+        )
+
+    provider_name = type(room_provider).__name__
+    print(f"[room-debug] Provider: {provider_name}")
+    print(f"[room-debug] Rooms   : {room_provider.list_rooms()}")
+    print(f"[room-debug] Voronoi : {'sí' if vor_shape is not None else 'no'}")
+
+    _show_room_png_if_available(room_map_dir / "room_map_viz.png", "LabelMe room_map")
+    _show_room_png_if_available(room_map_dir / "room_voronoi_viz.png", "Voronoi ownership")
+
+    overlay = _render_room_layer_overlay(rgb_map_2d, room_provider, include_voronoi=True)
+    if overlay is not None:
+        debug_dir = Path(scene_dir) / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        out_path = debug_dir / "room_debug_overlay.png"
+        cv2.imwrite(str(out_path), overlay)
+        print(f"[room-debug] Overlay guardado: {out_path}")
+        if not is_eval_headless():
+            view = overlay
+            max_side = max(view.shape[:2])
+            if max_side > 1000:
+                scale = 1000.0 / float(max_side)
+                view = cv2.resize(
+                    view,
+                    (max(1, int(view.shape[1] * scale)), max(1, int(view.shape[0] * scale))),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            safe_imshow("Room debug overlay", view)
+            ui_wait(500)
 
 
 # ── Navigation helpers ────────────────────────────────────────────────────────
@@ -1430,6 +1617,10 @@ def execute_nav_replay(
     monitor_fn=None,
     monitor_stride: int = 4,
     stop_on_monitor: bool = False,
+    room_mask: np.ndarray = None,
+    exploration_points: list = None,
+    visited_points: list = None,
+    current_exploration_point: list = None,
 ) -> bool:
     """Follow the planned route using the dense rasterized path as control reference.
 
@@ -1676,7 +1867,11 @@ def execute_nav_replay(
         show_obs(robot, _step_label)
         if i % _MAP_REFRESH_STRIDE == 0 or i == _MAX_FOLLOW_STEPS - 1:
             show_map(robot, rgb_map_2d, heatmap_2d=heatmap,
-                     path_cells=dense_path, label=_step_label)
+                     path_cells=dense_path, label=_step_label,
+                     room_mask=room_mask,
+                     exploration_points=exploration_points,
+                     visited_points=visited_points,
+                     current_exploration_point=current_exploration_point)
         ui_wait(_NAV_STEP_DELAY_MS)
 
     print(f"  [nav] Path follower exceeded safety step budget "
@@ -2873,6 +3068,20 @@ def _near_any_cell(cell: Tuple[int, int], cells: List[Tuple[int, int]], radius_c
     return False
 
 
+def _path_stays_inside_mask(path_cells: list, room_mask: Optional[np.ndarray]) -> bool:
+    if room_mask is None or not path_cells:
+        return True
+    h, w = room_mask.shape[:2]
+    for row, col in path_cells:
+        r = int(round(row))
+        c = int(round(col))
+        if not (0 <= r < h and 0 <= c < w):
+            return False
+        if not bool(room_mask[r, c]):
+            return False
+    return True
+
+
 def _record_unique_scan_zone(search_state: Optional[SearchState], robot, cell=None) -> bool:
     """Record current physical scan zone and return False when it is redundant."""
     if search_state is None:
@@ -3036,6 +3245,84 @@ def _confirm_current_view_after_trigger(
     return bool(detected2)
 
 
+def _scan_room_exploration_yaws(
+    robot,
+    session,
+    target: str,
+    resolved_room: str,
+    rgb_map_2d: np.ndarray,
+    heatmap: Optional[np.ndarray],
+    room_mask: Optional[np.ndarray],
+    exploration_points: list,
+    visited_points: list,
+    current_point: Tuple[int, int],
+    *,
+    sweep_deg: float = 30.0,
+) -> bool:
+    """Check current, left and right views during room exploration.
+
+    This is deliberately low-threshold and lightweight. High-threshold
+    confirmation stays in _confirm_current_view_after_trigger.
+    """
+    if session is None:
+        return False
+    step_deg = float(getattr(robot, "turn_angle", 5.0) or 5.0)
+    if step_deg <= 0:
+        return False
+    n_side_steps = max(1, int(round(float(sweep_deg) / step_deg)))
+    sweep_effective = n_side_steps * step_deg
+
+    def _check(label: str) -> bool:
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            return False
+        frame = obs["color_sensor"][:, :, :3]
+        detected, ann_rgb, _bbox = session.check(frame)
+        if ann_rgb is not None:
+            show_obs(
+                robot,
+                label,
+                yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
+            )
+        else:
+            show_obs(robot, label)
+        show_map(
+            robot,
+            rgb_map_2d,
+            heatmap_2d=heatmap,
+            label=label,
+            room_mask=room_mask,
+            exploration_points=exploration_points,
+            visited_points=visited_points,
+            current_exploration_point=current_point,
+        )
+        ui_wait(_SCAN_STEP_DELAY_MS)
+        return bool(detected)
+
+    if _check(f"Exploración {resolved_room} 0°: {target}"):
+        return True
+
+    try:
+        for _ in range(n_side_steps):
+            robot.sim.step("turn_left")
+            if _check(f"Exploración {resolved_room} -{sweep_effective:.0f}°: {target}"):
+                return True
+        for _ in range(n_side_steps):
+            robot.sim.step("turn_right")
+        robot._set_nav_curr_pose()
+
+        for _ in range(n_side_steps):
+            robot.sim.step("turn_right")
+            if _check(f"Exploración {resolved_room} +{sweep_effective:.0f}°: {target}"):
+                return True
+        for _ in range(n_side_steps):
+            robot.sim.step("turn_left")
+    finally:
+        robot._set_nav_curr_pose()
+
+    return False
+
+
 def explore_room_zone_with_yoloe(
     robot,
     target: str,
@@ -3061,6 +3348,12 @@ def explore_room_zone_with_yoloe(
     timeout_s = _env_float(_ROOM_EXPLORE_TIMEOUT_ENV, _DEFAULT_ROOM_EXPLORE_TIMEOUT_S, 1.0)
     max_attempts = _env_int(_ROOM_MAX_APPROACH_ATTEMPTS_ENV, _DEFAULT_MAX_APPROACH_ATTEMPTS, 1)
     low_thresh = _env_float(_ROOM_YOLOE_LOW_THRESH_ENV, _DEFAULT_YOLOE_LOW_THRESH, 0.01)
+    room_mask = _room_mask_for(
+        resolved_room,
+        room_provider,
+        getattr(robot, "_safe_obs_map", robot.map.obstacles_map).shape,
+    )
+    visited_points: List[Tuple[int, int]] = []
 
     print(f"  [state] ZONE_EXPLORE room={resolved_room} target={target}")
     points = _generate_room_exploration_points(
@@ -3083,6 +3376,16 @@ def explore_room_zone_with_yoloe(
         f"  [zone-explore] {len(points)} punto(s) de exploración planificado(s), "
         f"YOLOE bajo umbral={low_thresh:.2f}, tiempo máximo={timeout_s:.0f}s"
     )
+    show_map(
+        robot,
+        rgb_map_2d,
+        heatmap_2d=heatmap,
+        label=f"Exploración: {resolved_room}",
+        room_mask=room_mask,
+        exploration_points=points,
+        visited_points=visited_points,
+    )
+    ui_wait(300)
 
     from vlmaps.utils.yoloe_utils import get_session
 
@@ -3126,6 +3429,16 @@ def explore_room_zone_with_yoloe(
             break
 
         print(f"  [zone-explore] Punto {idx}/{len(points)}: {list(point)}")
+        show_map(
+            robot,
+            rgb_map_2d,
+            heatmap_2d=heatmap,
+            label=f"Exploración {idx}/{len(points)}: {resolved_room}",
+            room_mask=room_mask,
+            exploration_points=points,
+            visited_points=visited_points,
+            current_exploration_point=point,
+        )
         try:
             _, planned_actions = robot.plan_path_only(list(point))
         except Exception as exc:
@@ -3134,6 +3447,12 @@ def explore_room_zone_with_yoloe(
 
         polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
         dense = densify_path_cells(polyline)
+        if room_mask is not None and dense and not _path_stays_inside_mask(dense, room_mask):
+            print(
+                f"  [zone-explore] Ruta descartada: saldría de '{resolved_room}' "
+                f"para llegar a {list(point)}."
+            )
+            continue
         if planned_actions:
             execute_nav_replay(
                 robot,
@@ -3148,19 +3467,54 @@ def explore_room_zone_with_yoloe(
                 monitor_fn=_monitor,
                 monitor_stride=4,
                 stop_on_monitor=True,
+                room_mask=room_mask,
+                exploration_points=points,
+                visited_points=visited_points,
+                current_exploration_point=point,
             )
         else:
             _monitor(-1, "already_at_point")
 
         robot._set_nav_curr_pose()
+        visited_cell = (
+            int(robot.curr_pos_on_map[0]),
+            int(robot.curr_pos_on_map[1]),
+        )
+        visited_points.append(visited_cell)
         if search_state is not None:
             search_state.record_exploration_visit(
-                int(robot.curr_pos_on_map[0]),
-                int(robot.curr_pos_on_map[1]),
+                visited_cell[0],
+                visited_cell[1],
             )
 
         if not trigger["hit"]:
             _monitor(-1, "post_point")
+        if not trigger["hit"]:
+            if _scan_room_exploration_yaws(
+                robot,
+                session_ref["low"],
+                target,
+                resolved_room,
+                rgb_map_2d,
+                heatmap,
+                room_mask,
+                points,
+                visited_points,
+                point,
+                sweep_deg=30.0,
+            ):
+                robot._set_nav_curr_pose()
+                trigger["hit"] = True
+                trigger["cell"] = (
+                    int(robot.curr_pos_on_map[0]),
+                    int(robot.curr_pos_on_map[1]),
+                )
+                if search_state is not None:
+                    search_state.record_low_conf_detection()
+                print(
+                    f"  [zone-explore] YOLOE bajo umbral disparado durante "
+                    f"barrido ±30° en {trigger['cell']}."
+                )
 
         if trigger["hit"]:
             print("  [state] APPROACH_DETECTION -> CONFIRM_DETECTION")
@@ -3492,6 +3846,13 @@ def main(config: DictConfig) -> None:
     _room_provider = getattr(robot, "room_provider", None)
     if _room_provider and _room_provider.is_available():
         print(f"Room provider active. Rooms: {_room_provider.list_rooms()}")
+    validate_and_show_room_layers(
+        Path(scene_dir),
+        _dataset_type,
+        _room_provider,
+        rgb_map_2d,
+        robot.map.obstacles_map,
+    )
     print(f"Heatmap mode: {get_runtime_heatmap_mode()}")
 
     # Determine which categories actually have signal in the current scene using
@@ -3802,6 +4163,18 @@ def main(config: DictConfig) -> None:
                     if rooms_count:
                         print(f"  Candidates by room (Voronoi ownership): {rooms_count}")
 
+                _pinned_room_for_plan = getattr(_ss, "pinned_room", None) if _ss else None
+                if _pinned_room_for_plan and kept_components:
+                    _before_pin_filter = len(kept_components)
+                    kept_components = [
+                        comp for comp in kept_components
+                        if room_command_matches(comp.get("room"), _pinned_room_for_plan)
+                    ]
+                    print(
+                        f"  [room-search] Strict room pin '{_pinned_room_for_plan}': "
+                        f"{len(kept_components)}/{_before_pin_filter} heatmap candidate(s) kept"
+                    )
+
                 # Bug 2: re-compute room priors with heatmap evidence as
                 # dominant signal (direct query — heatmap has signal).
                 if _ss and kept_components:
@@ -4019,6 +4392,17 @@ def main(config: DictConfig) -> None:
             # Capture planned path both as geometric polyline and dense raster.
             path_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
             path_cells = densify_path_cells(path_polyline)
+            _pinned_room_for_path = getattr(_ss, "pinned_room", None) if _ss else None
+            _pinned_room_mask = (
+                _room_mask_for(_pinned_room_for_path, _room_provider, robot.map.obstacles_map.shape)
+                if room_goal is None and _pinned_room_for_path else None
+            )
+            _path_outside_pinned_room = (
+                room_goal is None
+                and _pinned_room_mask is not None
+                and bool(path_cells)
+                and not _path_stays_inside_mask(path_cells, _pinned_room_mask)
+            )
 
             n_actions = len(planned_actions)
             print(f"  Path computed: {len(path_polyline)} polyline waypoint(s), "
@@ -4050,12 +4434,14 @@ def main(config: DictConfig) -> None:
                 _goal_unsafe = _goal_cl < _MIN_GOAL_CLEARANCE
                 _path_unsafe = _safety["min_clearance"] < _MIN_PATH_CLEARANCE
 
-                if _goal_unsafe or _path_unsafe:
+                if _goal_unsafe or _path_unsafe or _path_outside_pinned_room:
                     _reasons = []
                     if _goal_unsafe:
                         _reasons.append(f"goal_cl={_goal_cl:.1f}<{_MIN_GOAL_CLEARANCE}")
                     if _path_unsafe:
                         _reasons.append(f"min_cl={_safety['min_clearance']:.1f}<{_MIN_PATH_CLEARANCE}")
+                    if _path_outside_pinned_room:
+                        _reasons.append(f"path leaves pinned room '{_pinned_room_for_path}'")
                     print(f"  [safety] Unsafe path rejected before execution ({', '.join(_reasons)}).")
 
                     # Mark current centroid as tried; try up to 3 alternatives
@@ -4097,15 +4483,22 @@ def main(config: DictConfig) -> None:
                         _, _nc_acts = robot.plan_path_only(_nc_goal)
                         _nc_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
                         _nc_path = densify_path_cells(_nc_polyline)
+                        _nc_outside_pinned_room = (
+                            _pinned_room_mask is not None
+                            and bool(_nc_path)
+                            and not _path_stays_inside_mask(_nc_path, _pinned_room_mask)
+                        )
                         _nc_safety = _compute_path_safety(_nc_path, robot.map.obstacles_map)
                         _nc_gcl = 0.0
                         if _nc_goal and 0 <= int(_nc_goal[0]) < _dist_map_safety.shape[0]:
                             _nc_gcl = float(_dist_map_safety[int(_nc_goal[0]), int(_nc_goal[1])])
                         print(f"  [safety] Alt candidate: goal_cl={_nc_gcl:.1f} "
-                              f"min_cl={_nc_safety['min_clearance']:.1f}")
+                              f"min_cl={_nc_safety['min_clearance']:.1f} "
+                              f"leaves_room={_nc_outside_pinned_room}")
 
                         if (_nc_gcl >= _MIN_GOAL_CLEARANCE and
-                                _nc_safety["min_clearance"] >= _MIN_PATH_CLEARANCE):
+                                _nc_safety["min_clearance"] >= _MIN_PATH_CLEARANCE and
+                                not _nc_outside_pinned_room):
                             goal_pos      = _nc_goal
                             obj_centroid  = _nc_cen
                             planned_actions = _nc_acts
@@ -4123,6 +4516,42 @@ def main(config: DictConfig) -> None:
                                 _ss._tried_centroids = _tried_set_now
 
                     if not _safe_alt_found:
+                        if _pinned_room_for_path:
+                            print(
+                                f"  [safety] No safe in-room candidate found for "
+                                f"'{_yoloe_target}' — switching to LabelMe exploration."
+                            )
+                            if _yoloe_session is not None:
+                                from vlmaps.utils.yoloe_utils import shutdown_session
+                                shutdown_session()
+                            _zone_ok, _zone_source = explore_room_zone_with_yoloe(
+                                robot,
+                                _yoloe_target,
+                                _pinned_room_for_path,
+                                _room_provider,
+                                rgb_map_2d,
+                                heatmap,
+                                path_cells,
+                                _ss,
+                                surrogate_cat="",
+                                force=True,
+                            )
+                            if _zone_ok:
+                                print(f"  ✓ Found '{_yoloe_target}' via room-zone exploration.")
+                                show_obs(robot, f"FOUND: {_yoloe_target}")
+                                show_map(
+                                    robot,
+                                    rgb_map_2d,
+                                    heatmap_2d=heatmap,
+                                    label=f"FOUND: {_yoloe_target}",
+                                    room_mask=_pinned_room_mask,
+                                )
+                            else:
+                                print(
+                                    f"  ✗ '{_yoloe_target}' not found after exploring "
+                                    f"'{_pinned_room_for_path}'."
+                                )
+                            continue
                         print(f"  [safety] No safe candidate found for '{_yoloe_target}' — skipping.")
                         if _yoloe_session is not None:
                             from vlmaps.utils.yoloe_utils import shutdown_session

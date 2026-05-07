@@ -216,6 +216,7 @@ class LabelMeRoomProvider(RoomProvider):
             self._available = False
             self._room_map = None
             self._voronoi_map = None
+            self._room_map_dir = Path(scene_dir) / "room_map"
             self._categories = []
             self._regions = []
             self._regions_by_label = {}
@@ -224,6 +225,7 @@ class LabelMeRoomProvider(RoomProvider):
             self._available = True
             self._room_map, self._categories, loaded_regions = result
             _room_dir = Path(scene_dir) / "room_map"
+            self._room_map_dir = _room_dir
             _voronoi_file = _room_dir / "room_voronoi.npy"
             self._voronoi_map = np.load(_voronoi_file) if _voronoi_file.exists() else None
             self._regions_by_label = loaded_regions or {}
@@ -331,6 +333,22 @@ class LabelMeRoomProvider(RoomProvider):
         if not self._available:
             return []
         return list(self._regions_by_label.keys())
+
+    def has_voronoi(self) -> bool:
+        return self._available and self._voronoi_map is not None
+
+    def room_map_shape(self) -> Optional[Tuple[int, int]]:
+        if self._room_map is None:
+            return None
+        return tuple(self._room_map.shape[:2])
+
+    def voronoi_shape(self) -> Optional[Tuple[int, int]]:
+        if self._voronoi_map is None:
+            return None
+        return tuple(self._voronoi_map.shape[:2])
+
+    def room_map_dir(self) -> Path:
+        return self._room_map_dir
 
 
 # ── Semantic scene provider (HSSD) ───────────────────────────────────────────
