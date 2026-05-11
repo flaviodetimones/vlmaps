@@ -2128,6 +2128,75 @@ def _planned_approach_to_surrogate(
     return bool(ok)
 
 
+def _planned_approach_to_target_cell(
+    robot,
+    target_cell: Optional[Tuple[int, int]],
+    *,
+    rgb_map_2d: Optional[np.ndarray] = None,
+    heatmap: Optional[np.ndarray] = None,
+    room_mask: Optional[np.ndarray] = None,
+    min_dist_cells: float = 6.0,
+    max_dist_cells: float = 18.0,
+    min_clearance_cells: float = 3.0,
+) -> bool:
+    """Move to a safe navigable standoff around a semantic target cell."""
+    if target_cell is None:
+        return False
+
+    safe_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+    robot._set_nav_curr_pose()
+    cur_r, cur_c = int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
+    room_provider = getattr(robot, "room_provider", None)
+    required_room = None
+    if room_provider is not None and getattr(room_provider, "is_available", lambda: False)():
+        required_room = room_provider.get_room_at_cell(cur_r, cur_c)
+    goals = find_safe_candidate_approach_goals(
+        target_cell,
+        safe_map,
+        robot_pos=(cur_r, cur_c),
+        room_provider=room_provider,
+        required_room=required_room,
+        min_dist=min_dist_cells,
+        max_dist=max_dist_cells,
+        min_clearance=min_clearance_cells,
+        top_k=8,
+    )
+    if not goals:
+        print("  [planned-approach] no safe standoff around detected target cell")
+        return False
+
+    for goal in goals:
+        try:
+            _, planned_actions = robot.plan_path_only(goal)
+        except Exception:
+            continue
+        if not planned_actions:
+            return True
+        planned_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+        planned_dense = densify_path_cells(planned_polyline)
+        if room_mask is not None and planned_dense and not _path_stays_inside_mask(planned_dense, room_mask):
+            continue
+        print(
+            f"  [planned-approach] target_cell={tuple(int(v) for v in target_cell)} "
+            f"standoff={goal}"
+        )
+        ok = execute_nav_replay(
+            robot,
+            planned_actions,
+            "approach_target",
+            rgb_map_2d if rgb_map_2d is not None else np.zeros((1, 1, 3), dtype=np.uint8),
+            heatmap if heatmap is not None else np.zeros((1, 1), dtype=np.float32),
+            planned_polyline,
+            display_path_cells=planned_dense,
+            dist_map=distance_transform_edt(robot.map.obstacles_map),
+            goal_reached_tol_cells=1.5,
+            room_mask=room_mask,
+        )
+        if ok:
+            return True
+    return False
+
+
 def close_approach_after_detection(
     robot,
     session,
@@ -2347,6 +2416,18 @@ def _approach_and_confirm_detection(
         fine_visual_center(robot, approach_session, label)
     except Exception as exc:
         print(f"  [confirm-approach] visual centering skipped: {exc}")
+
+    if target_cell is not None:
+        try:
+            _planned_approach_to_target_cell(
+                robot,
+                target_cell,
+                rgb_map_2d=rgb_map_2d,
+                heatmap=heatmap,
+                room_mask=room_mask,
+            )
+        except Exception as exc:
+            print(f"  [confirm-approach] target-cell approach skipped: {exc}")
 
     if surrogate_cat:
         try:
@@ -3377,7 +3458,6 @@ def _generate_room_exploration_points(
     )
 
     dist_obs = distance_transform_edt(free_map)
-    room_depth = distance_transform_edt(room_mask)
     cells_r, cells_c = np.where(navigable & (dist_obs >= float(min_clearance_cells)))
     if len(cells_r) == 0:
         cells_r, cells_c = np.where(navigable)
@@ -3397,40 +3477,51 @@ def _generate_room_exploration_points(
     if len(sample_r) < target_points:
         sample_r, sample_c = cells_r, cells_c
 
-    scores = room_depth[sample_r, sample_c] * 1.5 + dist_obs[sample_r, sample_c] * 0.35
-    ranked = np.argsort(-scores)
     candidate_cells: List[Tuple[int, int]] = []
-    candidate_scores: List[float] = []
-    for idx in ranked:
+    for idx in range(len(sample_r)):
         cell = (int(sample_r[idx]), int(sample_c[idx]))
         if _near_any_cell(cell, prior_scan_zones, scan_radius):
             continue
         if _near_any_cell(cell, false_zones, max(scan_radius * 0.5, spacing_cells * 0.5)):
             continue
         candidate_cells.append(cell)
-        candidate_scores.append(float(scores[idx]))
-        if len(candidate_cells) >= max(target_points * 16, target_points):
-            break
 
     if not candidate_cells:
         return []
 
-    # Farthest-point sampling: choose distributed viewpoints across the room,
-    # while mildly preferring central/high-clearance cells.
+    room_rows, room_cols = np.where(navigable)
+    center_r = float(np.mean(room_rows))
+    center_c = float(np.mean(room_cols))
+
+    def _cell_angle(cell: Tuple[int, int]) -> float:
+        return float(np.arctan2(cell[0] - center_r, cell[1] - center_c))
+
+    def _cell_radius_sq(cell: Tuple[int, int]) -> float:
+        dr = float(cell[0] - center_r)
+        dc = float(cell[1] - center_c)
+        return dr * dr + dc * dc
+
     selected: List[Tuple[int, int]] = []
     selected_set = set()
-    if candidate_scores:
-        first_idx = int(np.argmax(np.asarray(candidate_scores, dtype=np.float32)))
-        selected.append(candidate_cells[first_idx])
-        selected_set.add(candidate_cells[first_idx])
+    sector_count = max(1, min(int(target_points), len(candidate_cells)))
+    sector_bins: List[List[Tuple[int, int]]] = [[] for _ in range(sector_count)]
+    for cell in candidate_cells:
+        ang = (_cell_angle(cell) + float(np.pi)) / (2.0 * float(np.pi))
+        idx = min(sector_count - 1, int(np.floor(ang * sector_count)))
+        sector_bins[idx].append(cell)
 
-    score_arr = np.asarray(candidate_scores, dtype=np.float32)
-    if score_arr.size:
-        score_min = float(score_arr.min())
-        score_span = float(score_arr.max() - score_min) or 1.0
-    else:
-        score_min, score_span = 0.0, 1.0
+    for bucket in sector_bins:
+        if not bucket:
+            continue
+        chosen = max(
+            bucket,
+            key=lambda cell: (_cell_radius_sq(cell), float(dist_obs[cell[0], cell[1]])),
+        )
+        if chosen not in selected_set:
+            selected.append(chosen)
+            selected_set.add(chosen)
 
+    # Backfill with farthest-point sampling when some sectors are empty.
     while len(selected) < target_points and len(selected) < len(candidate_cells):
         best_idx = None
         best_value = -float("inf")
@@ -3441,8 +3532,7 @@ def _generate_room_exploration_points(
                 float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
                 for sr, sc in selected
             ) if selected else 0.0
-            norm_score = (float(candidate_scores[i]) - score_min) / score_span
-            value = min_dist_sq + norm_score * (spacing_cells ** 2) * 0.25
+            value = min_dist_sq + _cell_radius_sq(cell) * 0.10
             if value > best_value:
                 best_value = value
                 best_idx = i
@@ -3455,11 +3545,7 @@ def _generate_room_exploration_points(
     if not circuit:
         return []
 
-    center_r = float(sum(cell[0] for cell in circuit)) / float(len(circuit))
-    center_c = float(sum(cell[1] for cell in circuit)) / float(len(circuit))
-    circuit.sort(
-        key=lambda cell: float(np.arctan2(cell[0] - center_r, cell[1] - center_c))
-    )
+    circuit.sort(key=_cell_angle)
 
     robot._set_nav_curr_pose()
     current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
@@ -3480,6 +3566,24 @@ def _generate_room_exploration_points(
     return ordered[:target_points]
 
 
+def _best_heatmap_cell_in_mask(
+    heatmap: Optional[np.ndarray],
+    room_mask: Optional[np.ndarray],
+) -> Optional[Tuple[int, int]]:
+    """Strongest semantic target cell inside the active room mask."""
+    if heatmap is None or room_mask is None:
+        return None
+    if heatmap.shape[:2] != room_mask.shape[:2]:
+        return None
+    masked = np.where(room_mask, heatmap, -np.inf)
+    if not np.isfinite(masked).any():
+        return None
+    row, col = np.unravel_index(int(np.argmax(masked)), masked.shape)
+    if not np.isfinite(masked[row, col]):
+        return None
+    return int(row), int(col)
+
+
 def _confirm_current_view_after_trigger(
     robot,
     target: str,
@@ -3490,6 +3594,7 @@ def _confirm_current_view_after_trigger(
     path_cells: Optional[list],
     search_state: Optional[SearchState],
     room_mask: Optional[np.ndarray] = None,
+    target_cell: Optional[Tuple[int, int]] = None,
 ) -> bool:
     """Approach a low-threshold visual trigger, then confirm from close range."""
     from vlmaps.utils.yoloe_utils import get_session
@@ -3555,7 +3660,7 @@ def _confirm_current_view_after_trigger(
         path_cells=path_cells,
         search_state=search_state,
         room_mask=room_mask,
-        target_cell=None,
+        target_cell=target_cell,
         source="zone_explore",
     )
 
@@ -3671,6 +3776,7 @@ def explore_room_zone_with_yoloe(
         room_provider,
         getattr(robot, "_safe_obs_map", robot.map.obstacles_map).shape,
     )
+    room_heatmap_cell = _best_heatmap_cell_in_mask(heatmap, room_mask)
     visited_points: List[Tuple[int, int]] = []
 
     print(f"  [state] ZONE_EXPLORE room={resolved_room} target={target}")
@@ -3850,6 +3956,7 @@ def explore_room_zone_with_yoloe(
                 path_cells=dense or path_cells,
                 search_state=search_state,
                 room_mask=room_mask,
+                target_cell=room_heatmap_cell,
             )
             if confirmed:
                 print(f"  [zone-explore] ✓ Confirmado '{target}' durante exploración.")
