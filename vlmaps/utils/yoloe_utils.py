@@ -81,6 +81,7 @@ class YoloeSession:
         self.weights = weights
         self.target = target
         self.conf_thresh = conf_thresh
+        self.last_conf: Optional[float] = None
         self._proc: Optional[subprocess.Popen] = None
         self._tmpdir = tempfile.TemporaryDirectory()
         self._in_path = Path(self._tmpdir.name) / "frame.png"
@@ -181,9 +182,11 @@ class YoloeSession:
                 bbox_center = (float(parts[1]), float(parts[2]))
             except ValueError:
                 pass
+        self.last_conf = None
         if found and len(parts) >= 4:
             try:
                 _conf_val = float(parts[3])
+                self.last_conf = _conf_val
                 print(f"  [YOLOE-CONF] target={self.target} conf={_conf_val:.3f} bbox=({bbox_center[0]:.0f},{bbox_center[1]:.0f})", flush=True)
             except (ValueError, TypeError):
                 pass

@@ -82,7 +82,7 @@ _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 8
 _DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
 _DEFAULT_SCAN_DEDUP_RADIUS_M = 1.5
 _DEFAULT_YOLOE_LOW_THRESH = 0.40
-_DEFAULT_YOLOE_CONFIRM_THRESH = 0.65
+_DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 32
 
@@ -2182,6 +2182,7 @@ def close_approach_after_detection(
     Returns True if the robot got at least one step closer.
     """
     advanced = 0
+    target_conf = _confirm_conf_thresh()
     # Seed the sticky overlay with the bbox stashed by the most recent
     # successful scan stage. This avoids the "Lost detection at step 1
     # (no prior)" failure when fine_visual_center nudged the camera and
@@ -2197,6 +2198,7 @@ def close_approach_after_detection(
             break
         frame = obs["color_sensor"][:, :, :3]
         det, ann_rgb, bbox_center = session.check(frame)
+        current_conf = float(getattr(session, "last_conf", 0.0) or 0.0)
         if det:
             miss_streak = 0
             if ann_rgb is not None:
@@ -2236,6 +2238,13 @@ def close_approach_after_detection(
             # always sees the bbox marker — meets "que no deje de detectarlo".
             show_obs(robot, f"Approach {step_i+1}/{max_steps}: {cat}",
                      yoloe_frame_bgr=last_positive_bgr)
+
+        if det and advanced > 0 and current_conf >= target_conf:
+            print(
+                f"  [close-approach] Confianza {current_conf:.3f} >= "
+                f"{target_conf:.2f} tras {advanced} avance(s) — se detiene el acercamiento."
+            )
+            break
 
         # Recentre horizontally before each forward step so the path is straight.
         cx, _cy = bbox_center
@@ -3645,7 +3654,7 @@ def explore_room_zone_with_yoloe(
     surrogate_cat: str = "",
     force: bool = False,
 ) -> Tuple[bool, Optional[str]]:
-    """Explore a labeled room/zone by visiting points and scanning on arrival."""
+    """Explore a labeled room/zone with a fixed circuit plus visual triggers."""
     if not force and not _room_exploration_enabled():
         return False, None
     if room_provider is None or not room_provider.is_available() or not room_name:
@@ -3737,6 +3746,39 @@ def explore_room_zone_with_yoloe(
                 f"para llegar a {list(point)}."
             )
             continue
+        trigger = {"hit": False, "cell": None, "during_route": False}
+
+        def _monitor(_step_idx: int, _action: str) -> bool:
+            obs = robot.sim.get_sensor_observations(0)
+            if "color_sensor" not in obs:
+                return False
+            frame = obs["color_sensor"][:, :, :3]
+            detected, ann_rgb, _bbox = session_ref["low"].check(frame)
+            if ann_rgb is not None:
+                ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+                if detected:
+                    setattr(robot, "_last_yoloe_positive_bgr", ann_bgr)
+                show_obs(
+                    robot,
+                    f"Explorando {resolved_room}: {target}",
+                    yoloe_frame_bgr=ann_bgr,
+                )
+            if detected:
+                robot._set_nav_curr_pose()
+                trigger["hit"] = True
+                trigger["during_route"] = True
+                trigger["cell"] = (
+                    int(robot.curr_pos_on_map[0]),
+                    int(robot.curr_pos_on_map[1]),
+                )
+                if search_state is not None:
+                    search_state.record_low_conf_detection()
+                print(
+                    f"  [zone-explore] YOLOE bajo umbral disparado en trayecto "
+                    f"hacia {list(point)} en {trigger['cell']}."
+                )
+                return True
+            return False
         if planned_actions:
             execute_nav_replay(
                 robot,
@@ -3748,6 +3790,9 @@ def explore_room_zone_with_yoloe(
                 display_path_cells=dense,
                 dist_map=distance_transform_edt(robot.map.obstacles_map),
                 goal_reached_tol_cells=2.0,
+                monitor_fn=_monitor,
+                monitor_stride=4,
+                stop_on_monitor=True,
                 room_mask=room_mask,
                 exploration_points=points,
                 visited_points=visited_points,
@@ -3766,21 +3811,21 @@ def explore_room_zone_with_yoloe(
                 visited_cell[1],
             )
 
-        trigger_hit = False
-        trigger_cell = None
-        if _scan_room_exploration_yaws(
-            robot,
-            session_ref["low"],
-            target,
-            resolved_room,
-            rgb_map_2d,
-            heatmap,
-            room_mask,
-            points,
-            visited_points,
-            point,
-            sweep_deg=30.0,
-        ):
+        trigger_hit = bool(trigger["hit"])
+        trigger_cell = trigger["cell"]
+        if not trigger_hit and _scan_room_exploration_yaws(
+                robot,
+                session_ref["low"],
+                target,
+                resolved_room,
+                rgb_map_2d,
+                heatmap,
+                room_mask,
+                points,
+                visited_points,
+                point,
+                sweep_deg=30.0,
+            ):
             robot._set_nav_curr_pose()
             trigger_hit = True
             trigger_cell = (
