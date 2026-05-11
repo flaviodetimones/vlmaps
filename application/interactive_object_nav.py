@@ -77,6 +77,7 @@ _ROOM_YOLOE_LOW_THRESH_ENV = "VLMAPS_YOLOE_ROOM_LOW_THRESH"
 _ROOM_YOLOE_CONFIRM_THRESH_ENV = "VLMAPS_YOLOE_CONFIRM_THRESH"
 _ROOM_MAX_APPROACH_ATTEMPTS_ENV = "VLMAPS_MAX_APPROACH_ATTEMPTS"
 _ROOM_EXPLORE_MAX_POINTS_CAP_ENV = "VLMAPS_EXPLORE_MAX_POINTS_CAP"
+_ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
 
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 8
 _DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
@@ -85,6 +86,7 @@ _DEFAULT_YOLOE_LOW_THRESH = 0.40
 _DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 32
+_DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -3501,8 +3503,6 @@ def _generate_room_exploration_points(
         dc = float(cell[1] - center_c)
         return dr * dr + dc * dc
 
-    selected: List[Tuple[int, int]] = []
-    selected_set = set()
     row_min = int(room_rows.min())
     row_max = int(room_rows.max())
     col_min = int(room_cols.min())
@@ -3524,6 +3524,7 @@ def _generate_room_exploration_points(
         tile_bins[rr * n_cols + cc].append(cell)
 
     tile_reps: List[Tuple[int, int]] = []
+    tile_rep_set = set()
     for tile_idx, bucket in enumerate(tile_bins):
         if not bucket:
             continue
@@ -3538,60 +3539,68 @@ def _generate_room_exploration_points(
                 - ((cell[0] - tile_center_r) ** 2 + (cell[1] - tile_center_c) ** 2) * 0.01
             ),
         )
-        if chosen not in selected_set:
+        if chosen not in tile_rep_set:
             tile_reps.append(chosen)
-            selected_set.add(chosen)
+            tile_rep_set.add(chosen)
 
-    selected_set = set()
-    if len(tile_reps) <= target_points:
-        selected = list(tile_reps)
-        selected_set = set(selected)
-    else:
-        robot._set_nav_curr_pose()
-        current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
-        first_idx = min(
-            range(len(tile_reps)),
-            key=lambda i: (tile_reps[i][0] - current[0]) ** 2 + (tile_reps[i][1] - current[1]) ** 2,
-        )
-        selected.append(tile_reps[first_idx])
-        selected_set.add(tile_reps[first_idx])
-        while len(selected) < target_points:
-            best_idx = None
+    pool: List[Tuple[int, int]] = []
+    pool_set = set()
+    for cell in tile_reps + candidate_cells:
+        if cell not in pool_set:
+            pool.append(cell)
+            pool_set.add(cell)
+
+    min_sep_m = _env_float(
+        _ROOM_EXPLORE_POINT_MIN_SEP_ENV,
+        _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M,
+        0.0,
+    )
+    requested_sep_cells = float(min_sep_m) / cell_size
+
+    def _select_with_min_sep(min_sep_cells: float) -> List[Tuple[int, int]]:
+        min_sep_sq = float(min_sep_cells) * float(min_sep_cells)
+        chosen_cells: List[Tuple[int, int]] = []
+        chosen_set = set()
+        while len(chosen_cells) < target_points and len(chosen_cells) < len(pool):
+            best_cell = None
             best_value = -float("inf")
-            for i, cell in enumerate(tile_reps):
-                if cell in selected_set:
+            for cell in pool:
+                if cell in chosen_set:
                     continue
-                min_dist_sq = min(
-                    float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
-                    for sr, sc in selected
-                )
-                if min_dist_sq > best_value:
-                    best_value = min_dist_sq
-                    best_idx = i
-            if best_idx is None:
+                if chosen_cells:
+                    nearest_sq = min(
+                        float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
+                        for sr, sc in chosen_cells
+                    )
+                    if nearest_sq < min_sep_sq:
+                        continue
+                else:
+                    nearest_sq = _cell_radius_sq(cell)
+                # Separation dominates; clearance only breaks ties.
+                value = nearest_sq + float(dist_obs[cell[0], cell[1]]) * 0.20
+                if value > best_value:
+                    best_value = value
+                    best_cell = cell
+            if best_cell is None:
                 break
-            selected.append(tile_reps[best_idx])
-            selected_set.add(tile_reps[best_idx])
+            chosen_cells.append(best_cell)
+            chosen_set.add(best_cell)
+        return chosen_cells
 
-    # Backfill when some tiles are empty or filtered out.
-    while len(selected) < target_points and len(selected) < len(candidate_cells):
-        best_idx = None
-        best_value = -float("inf")
-        for i, cell in enumerate(candidate_cells):
-            if cell in selected_set:
-                continue
-            min_dist_sq = min(
-                float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
-                for sr, sc in selected
-            ) if selected else 0.0
-            value = min_dist_sq + _cell_radius_sq(cell) * 0.10
-            if value > best_value:
-                best_value = value
-                best_idx = i
-        if best_idx is None:
+    selected: List[Tuple[int, int]] = []
+    used_sep_cells = 0.0
+    for factor in (1.0, 0.85, 0.70, 0.55, 0.40, 0.0):
+        sep_cells = requested_sep_cells * factor
+        selected = _select_with_min_sep(sep_cells)
+        used_sep_cells = sep_cells
+        if len(selected) >= min(target_points, len(pool)):
             break
-        selected.append(candidate_cells[best_idx])
-        selected_set.add(candidate_cells[best_idx])
+
+    if selected:
+        print(
+            f"  [zone-explore] Separación mínima entre puntos: "
+            f"{used_sep_cells * cell_size:.2f} m ({len(selected)}/{target_points})"
+        )
 
     circuit = list(selected or candidate_cells)
     if not circuit:
