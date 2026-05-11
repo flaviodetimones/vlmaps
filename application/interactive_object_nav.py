@@ -70,6 +70,7 @@ _SURROGATE_PITCH_DEG = {}
 _DEFAULT_PITCH_DEG = [-15.0]
 
 _ROOM_EXPLORATION_ENV = "VLMAPS_ROOM_EXPLORATION"
+_ROOM_EXPLORE_POINTS_ENV = "VLMAPS_EXPLORE_POINTS"
 _ROOM_EXPLORE_MAX_POINTS_ENV = "VLMAPS_EXPLORE_MAX_POINTS"
 _ROOM_EXPLORE_TIMEOUT_ENV = "VLMAPS_EXPLORE_TIMEOUT_S"
 _ROOM_SCAN_DEDUP_RADIUS_ENV = "VLMAPS_SCAN_DEDUP_RADIUS_M"
@@ -78,6 +79,8 @@ _ROOM_YOLOE_CONFIRM_THRESH_ENV = "VLMAPS_YOLOE_CONFIRM_THRESH"
 _ROOM_MAX_APPROACH_ATTEMPTS_ENV = "VLMAPS_MAX_APPROACH_ATTEMPTS"
 _ROOM_EXPLORE_MAX_POINTS_CAP_ENV = "VLMAPS_EXPLORE_MAX_POINTS_CAP"
 _ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
+_ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
+_ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
 
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 8
 _DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
@@ -118,6 +121,12 @@ def _env_float(name: str, default: float, min_value: Optional[float] = None) -> 
 
 def _room_exploration_enabled() -> bool:
     return _env_flag(_ROOM_EXPLORATION_ENV, False)
+
+
+def _room_exploration_point_count() -> int:
+    if os.environ.get(_ROOM_EXPLORE_POINTS_ENV) is not None:
+        return _env_int(_ROOM_EXPLORE_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
+    return _env_int(_ROOM_EXPLORE_MAX_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
 
 
 def _confirm_conf_thresh() -> float:
@@ -3424,6 +3433,246 @@ def _scaled_room_exploration_point_count(
     return base, ref_area
 
 
+def _nearest_neighbor_circuit(points: List[Tuple[int, int]], current: Tuple[float, float]) -> List[Tuple[int, int]]:
+    if not points:
+        return []
+    remaining = set(points)
+    first = min(
+        remaining,
+        key=lambda cell: (cell[0] - current[0]) ** 2 + (cell[1] - current[1]) ** 2,
+    )
+    ordered = [first]
+    remaining.remove(first)
+    while remaining:
+        prev = ordered[-1]
+        nxt = min(
+            remaining,
+            key=lambda cell: (cell[0] - prev[0]) ** 2 + (cell[1] - prev[1]) ** 2,
+        )
+        ordered.append(nxt)
+        remaining.remove(nxt)
+    return ordered
+
+
+def _coverage_ratio(navigable: np.ndarray, points: List[Tuple[int, int]], radius_cells: float) -> float:
+    if not points or navigable is None or not navigable.any():
+        return 0.0
+    nav_coords = np.column_stack(np.where(navigable))
+    pts = np.asarray(points, dtype=np.float32)
+    coords = nav_coords.astype(np.float32)
+    min_sq = np.full((coords.shape[0],), np.inf, dtype=np.float32)
+    chunk = 8192
+    for start in range(0, coords.shape[0], chunk):
+        part = coords[start:start + chunk]
+        d2 = ((part[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2)
+        min_sq[start:start + chunk] = d2.min(axis=1)
+    return float((min_sq <= float(radius_cells) ** 2).mean())
+
+
+def _sanitize_debug_token(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return cleaned.strip("_") or "target"
+
+
+def _save_room_exploration_debug_image(
+    robot,
+    room_name: str,
+    target: str,
+    room_mask: np.ndarray,
+    navigable: np.ndarray,
+    candidate_masks: Dict[str, np.ndarray],
+    points: List[Tuple[int, int]],
+    coverage_radius_cells: float,
+) -> None:
+    if not _env_flag(_ROOM_EXPLORE_DEBUG_ENV, False):
+        return
+    try:
+        h, w = room_mask.shape[:2]
+        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        raw_obs = getattr(robot.map, "obstacles_map", None)
+        raw_free = (raw_obs > 0) if raw_obs is not None else None
+        if raw_free is not None and raw_free.shape == room_mask.shape:
+            canvas[raw_free] = (35, 35, 35)
+        canvas[room_mask.astype(bool)] = (55, 45, 95)
+        canvas[navigable.astype(bool)] = (70, 80, 130)
+
+        if "C" in candidate_masks:
+            canvas[candidate_masks["C"].astype(bool)] = (90, 95, 140)
+        if "B" in candidate_masks:
+            canvas[candidate_masks["B"].astype(bool)] = (115, 140, 90)
+        if "A" in candidate_masks:
+            canvas[candidate_masks["A"].astype(bool)] = (120, 170, 120)
+
+        if points:
+            pts_xy = np.asarray([(int(c), int(r)) for r, c in points], dtype=np.int32)
+            if len(pts_xy) > 1:
+                cv2.polylines(canvas, [pts_xy], False, (0, 255, 255), 1, cv2.LINE_AA)
+            radius = max(2, int(round(float(coverage_radius_cells) * 0.15)))
+            for idx, (row, col) in enumerate(points, start=1):
+                cv2.circle(canvas, (int(col), int(row)), radius + 2, (255, 255, 255), -1)
+                cv2.circle(canvas, (int(col), int(row)), radius, (0, 255, 255), -1)
+                cv2.putText(
+                    canvas,
+                    str(idx),
+                    (int(col) + 4, int(row) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        scene_id = int(getattr(getattr(robot, "config", None), "scene_id", 0))
+        scene_dir = Path(robot.vlmaps_data_save_dirs[scene_id])
+        debug_dir = scene_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        out_path = debug_dir / (
+            f"zone_explore_{_sanitize_debug_token(room_name)}_"
+            f"{_sanitize_debug_token(target)}.png"
+        )
+        cv2.imwrite(str(out_path), canvas)
+        print(f"  [zone-explore] Debug guardado: {out_path}")
+    except Exception as exc:
+        print(f"  [zone-explore] No se pudo guardar debug de exploración: {exc}")
+
+
+def _component_seed_cells(mask: np.ndarray, dist_obs: np.ndarray, limit: int) -> List[Tuple[int, int]]:
+    n_labels, comps, stats, centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
+    comp_ids = list(range(1, n_labels))
+    comp_ids.sort(key=lambda cid: int(stats[cid, cv2.CC_STAT_AREA]), reverse=True)
+    seeds: List[Tuple[int, int]] = []
+    for cid in comp_ids[:max(0, int(limit))]:
+        ys, xs = np.where(comps == cid)
+        if len(ys) == 0:
+            continue
+        cy, cx = float(centroids[cid][1]), float(centroids[cid][0])
+        best_idx = max(
+            range(len(ys)),
+            key=lambda i: (
+                float(dist_obs[int(ys[i]), int(xs[i])]) * 3.0
+                - ((float(ys[i]) - cy) ** 2 + (float(xs[i]) - cx) ** 2) * 0.01
+            ),
+        )
+        seeds.append((int(ys[best_idx]), int(xs[best_idx])))
+    return seeds
+
+
+def _cluster_room_candidates(
+    candidate_mask: np.ndarray,
+    navigable: np.ndarray,
+    dist_obs: np.ndarray,
+    target_points: int,
+    min_sep_cells: float,
+    current: Tuple[float, float],
+) -> List[Tuple[int, int]]:
+    rows, cols = np.where(candidate_mask)
+    if len(rows) == 0:
+        return []
+    coords_i = np.column_stack([rows, cols]).astype(np.int32)
+    if len(coords_i) <= target_points:
+        return [(int(r), int(c)) for r, c in coords_i]
+
+    k = min(max(1, int(target_points)), len(coords_i))
+    coords = coords_i.astype(np.float32)
+    coord_tuples = [(int(r), int(c)) for r, c in coords_i]
+    coord_set = set(coord_tuples)
+
+    seeds = [cell for cell in _component_seed_cells(candidate_mask, dist_obs, k) if cell in coord_set]
+    if not seeds:
+        center = np.asarray(np.column_stack(np.where(navigable)).mean(axis=0), dtype=np.float32)
+        first_idx = int(np.argmin(((coords - center[None, :]) ** 2).sum(axis=1)))
+        seeds.append(coord_tuples[first_idx])
+
+    centers = [np.asarray(seed, dtype=np.float32) for seed in seeds[:k]]
+    while len(centers) < k:
+        center_arr = np.stack(centers, axis=0)
+        d2 = ((coords[:, None, :] - center_arr[None, :, :]) ** 2).sum(axis=2)
+        min_d2 = d2.min(axis=1)
+        next_idx = int(np.argmax(min_d2))
+        centers.append(coords[next_idx].copy())
+
+    centers_arr = np.stack(centers, axis=0).astype(np.float32)
+    labels = np.zeros((coords.shape[0],), dtype=np.int32)
+    for _ in range(24):
+        d2 = ((coords[:, None, :] - centers_arr[None, :, :]) ** 2).sum(axis=2)
+        labels = d2.argmin(axis=1).astype(np.int32)
+        new_centers = centers_arr.copy()
+        for idx in range(k):
+            member_coords = coords[labels == idx]
+            if len(member_coords) == 0:
+                nearest_to_any = d2.min(axis=1)
+                new_centers[idx] = coords[int(np.argmax(nearest_to_any))]
+            else:
+                new_centers[idx] = member_coords.mean(axis=0)
+        if np.allclose(new_centers, centers_arr, atol=0.25):
+            centers_arr = new_centers
+            break
+        centers_arr = new_centers
+    d2 = ((coords[:, None, :] - centers_arr[None, :, :]) ** 2).sum(axis=2)
+    labels = d2.argmin(axis=1).astype(np.int32)
+
+    medoids: List[Tuple[int, int]] = []
+    for idx in range(k):
+        member_idx = np.where(labels == idx)[0]
+        if len(member_idx) == 0:
+            continue
+        member_coords = coords[member_idx]
+        center = centers_arr[idx]
+        center_d2 = ((member_coords - center[None, :]) ** 2).sum(axis=1)
+        clear_bonus = np.asarray(
+            [float(dist_obs[int(coords_i[j, 0]), int(coords_i[j, 1])]) for j in member_idx],
+            dtype=np.float32,
+        )
+        best_local = int(np.argmin(center_d2 - clear_bonus * 0.50))
+        cell = (int(coords_i[member_idx[best_local], 0]), int(coords_i[member_idx[best_local], 1]))
+        if cell not in medoids:
+            medoids.append(cell)
+
+    def _accepts(candidate: Tuple[int, int], chosen: List[Tuple[int, int]], sep_cells: float) -> bool:
+        if sep_cells <= 0 or not chosen:
+            return True
+        sep_sq = float(sep_cells) ** 2
+        return all(
+            float((candidate[0] - row) ** 2 + (candidate[1] - col) ** 2) >= sep_sq
+            for row, col in chosen
+        )
+
+    chosen: List[Tuple[int, int]] = []
+    for factor in (1.0, 0.85, 0.70, 0.55, 0.40, 0.0):
+        sep = float(min_sep_cells) * factor
+        chosen = []
+        for cell in medoids:
+            if _accepts(cell, chosen, sep):
+                chosen.append(cell)
+        while len(chosen) < k:
+            best_cell = None
+            best_score = -float("inf")
+            for cell in coord_tuples:
+                if cell in chosen or not _accepts(cell, chosen, sep):
+                    continue
+                if chosen:
+                    nearest_sq = min(
+                        float((cell[0] - row) ** 2 + (cell[1] - col) ** 2)
+                        for row, col in chosen
+                    )
+                else:
+                    nearest_sq = -float((cell[0] - current[0]) ** 2 + (cell[1] - current[1]) ** 2)
+                score = nearest_sq + float(dist_obs[cell[0], cell[1]]) * 0.10
+                if score > best_score:
+                    best_score = score
+                    best_cell = cell
+            if best_cell is None:
+                break
+            chosen.append(best_cell)
+        if len(chosen) >= k:
+            break
+
+    return chosen[:k]
+
+
 def _generate_room_exploration_points(
     robot,
     room_name: str,
@@ -3433,6 +3682,7 @@ def _generate_room_exploration_points(
     *,
     max_points: int,
     min_clearance_cells: float = 3.0,
+    target: str = "",
 ) -> List[Tuple[int, int]]:
     """Generate a distributed circuit of viewpoints over the navigable room."""
     if obs_map is None:
@@ -3460,96 +3710,10 @@ def _generate_room_exploration_points(
     )
 
     dist_obs = distance_transform_edt(free_map)
-    cells_r, cells_c = np.where(navigable & (dist_obs >= float(min_clearance_cells)))
-    if len(cells_r) == 0:
-        cells_r, cells_c = np.where(navigable)
-    if len(cells_r) == 0:
-        return []
-
     cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
-    sample_stride = max(4, int(round(0.55 / cell_size)))
-    spacing_cells = max(6.0, 1.0 / cell_size)
     scan_radius = _scan_dedup_radius_cells(robot)
     prior_scan_zones = list(getattr(search_state, "unique_scan_zones", []) if search_state else [])
     false_zones = list(getattr(search_state, "false_positive_zones", []) if search_state else [])
-
-    grid_sample = ((cells_r % sample_stride) == 0) & ((cells_c % sample_stride) == 0)
-    sample_r = cells_r[grid_sample]
-    sample_c = cells_c[grid_sample]
-    if len(sample_r) < target_points:
-        sample_r, sample_c = cells_r, cells_c
-
-    candidate_cells: List[Tuple[int, int]] = []
-    for idx in range(len(sample_r)):
-        cell = (int(sample_r[idx]), int(sample_c[idx]))
-        if _near_any_cell(cell, prior_scan_zones, scan_radius):
-            continue
-        if _near_any_cell(cell, false_zones, max(scan_radius * 0.5, spacing_cells * 0.5)):
-            continue
-        candidate_cells.append(cell)
-
-    if not candidate_cells:
-        return []
-
-    room_rows, room_cols = np.where(navigable)
-    center_r = float(np.mean(room_rows))
-    center_c = float(np.mean(room_cols))
-
-    def _cell_angle(cell: Tuple[int, int]) -> float:
-        return float(np.arctan2(cell[0] - center_r, cell[1] - center_c))
-
-    def _cell_radius_sq(cell: Tuple[int, int]) -> float:
-        dr = float(cell[0] - center_r)
-        dc = float(cell[1] - center_c)
-        return dr * dr + dc * dc
-
-    row_min = int(room_rows.min())
-    row_max = int(room_rows.max())
-    col_min = int(room_cols.min())
-    col_max = int(room_cols.max())
-    room_h = max(1, row_max - row_min + 1)
-    room_w = max(1, col_max - col_min + 1)
-    aspect = float(room_w) / float(room_h)
-    n_cols = max(1, int(round(np.sqrt(float(target_points) * max(aspect, 1e-3)))))
-    n_rows = max(1, int(np.ceil(float(target_points) / float(n_cols))))
-    while n_rows * n_cols < target_points:
-        n_cols += 1
-
-    tile_h = float(room_h) / float(n_rows)
-    tile_w = float(room_w) / float(n_cols)
-    tile_bins: List[List[Tuple[int, int]]] = [[] for _ in range(n_rows * n_cols)]
-    for cell in candidate_cells:
-        rr = min(n_rows - 1, max(0, int((cell[0] - row_min) / max(tile_h, 1e-6))))
-        cc = min(n_cols - 1, max(0, int((cell[1] - col_min) / max(tile_w, 1e-6))))
-        tile_bins[rr * n_cols + cc].append(cell)
-
-    tile_reps: List[Tuple[int, int]] = []
-    tile_rep_set = set()
-    for tile_idx, bucket in enumerate(tile_bins):
-        if not bucket:
-            continue
-        rr = tile_idx // n_cols
-        cc = tile_idx % n_cols
-        tile_center_r = float(row_min) + (rr + 0.5) * tile_h
-        tile_center_c = float(col_min) + (cc + 0.5) * tile_w
-        chosen = max(
-            bucket,
-            key=lambda cell: (
-                float(dist_obs[cell[0], cell[1]]) * 5.0
-                - ((cell[0] - tile_center_r) ** 2 + (cell[1] - tile_center_c) ** 2) * 0.01
-            ),
-        )
-        if chosen not in tile_rep_set:
-            tile_reps.append(chosen)
-            tile_rep_set.add(chosen)
-
-    pool: List[Tuple[int, int]] = []
-    pool_set = set()
-    for cell in tile_reps + candidate_cells:
-        if cell not in pool_set:
-            pool.append(cell)
-            pool_set.add(cell)
-
     min_sep_m = _env_float(
         _ROOM_EXPLORE_POINT_MIN_SEP_ENV,
         _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M,
@@ -3557,73 +3721,82 @@ def _generate_room_exploration_points(
     )
     requested_sep_cells = float(min_sep_m) / cell_size
 
-    def _select_with_min_sep(min_sep_cells: float) -> List[Tuple[int, int]]:
-        min_sep_sq = float(min_sep_cells) * float(min_sep_cells)
-        chosen_cells: List[Tuple[int, int]] = []
-        chosen_set = set()
-        while len(chosen_cells) < target_points and len(chosen_cells) < len(pool):
-            best_cell = None
-            best_value = -float("inf")
-            for cell in pool:
-                if cell in chosen_set:
-                    continue
-                if chosen_cells:
-                    nearest_sq = min(
-                        float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
-                        for sr, sc in chosen_cells
-                    )
-                    if nearest_sq < min_sep_sq:
-                        continue
-                else:
-                    nearest_sq = _cell_radius_sq(cell)
-                # Separation dominates; clearance only breaks ties.
-                value = nearest_sq + float(dist_obs[cell[0], cell[1]]) * 0.20
-                if value > best_value:
-                    best_value = value
-                    best_cell = cell
-            if best_cell is None:
-                break
-            chosen_cells.append(best_cell)
-            chosen_set.add(best_cell)
-        return chosen_cells
-
-    selected: List[Tuple[int, int]] = []
-    used_sep_cells = 0.0
-    for factor in (1.0, 0.85, 0.70, 0.55, 0.40, 0.0):
-        sep_cells = requested_sep_cells * factor
-        selected = _select_with_min_sep(sep_cells)
-        used_sep_cells = sep_cells
-        if len(selected) >= min(target_points, len(pool)):
-            break
-
-    if selected:
-        print(
-            f"  [zone-explore] Separación mínima entre puntos: "
-            f"{used_sep_cells * cell_size:.2f} m ({len(selected)}/{target_points})"
-        )
-
-    circuit = list(selected or candidate_cells)
-    if not circuit:
-        return []
-
-    circuit.sort(key=_cell_angle)
-
     robot._set_nav_curr_pose()
     current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
-    start_idx = min(
-        range(len(circuit)),
-        key=lambda i: (circuit[i][0] - current[0]) ** 2 + (circuit[i][1] - current[1]) ** 2,
+
+    exclusion_u8 = np.zeros_like(navigable, dtype=np.uint8)
+    for row, col in prior_scan_zones:
+        cv2.circle(exclusion_u8, (int(col), int(row)), int(round(scan_radius)), 1, -1)
+    for row, col in false_zones:
+        cv2.circle(
+            exclusion_u8,
+            (int(col), int(row)),
+            int(round(max(scan_radius * 0.5, requested_sep_cells * 0.4))),
+            1,
+            -1,
+        )
+    exclusion = exclusion_u8.astype(bool)
+
+    levels = [
+        ("A", float(min_clearance_cells), navigable & (dist_obs >= float(min_clearance_cells)) & ~exclusion),
+        ("B", 2.0, navigable & (dist_obs >= 2.0) & ~exclusion),
+        ("C", 0.0, navigable & ~exclusion),
+    ]
+    level_counts = {name: int(mask.sum()) for name, _clearance, mask in levels}
+    print(
+        "  [zone-explore] Candidatas por nivel: "
+        f"A={level_counts['A']} B={level_counts['B']} C={level_counts['C']}"
     )
-    ordered = circuit[start_idx:] + circuit[:start_idx]
 
-    if len(ordered) >= 3:
-        second = ordered[1]
-        last = ordered[-1]
-        dist_second = (second[0] - current[0]) ** 2 + (second[1] - current[1]) ** 2
-        dist_last = (last[0] - current[0]) ** 2 + (last[1] - current[1]) ** 2
-        if dist_last < dist_second:
-            ordered = [ordered[0]] + list(reversed(ordered[1:]))
+    coverage_radius_cells = max(float(requested_sep_cells), 0.85 / cell_size)
+    best_points: List[Tuple[int, int]] = []
+    best_level = ""
+    best_coverage = -1.0
+    best_score = -float("inf")
+    for level_idx, (level_name, _clearance, level_mask) in enumerate(levels):
+        if not level_mask.any():
+            continue
+        points = _cluster_room_candidates(
+            level_mask,
+            navigable,
+            dist_obs,
+            target_points,
+            requested_sep_cells,
+            current,
+        )
+        if not points:
+            continue
+        coverage = _coverage_ratio(navigable, points, coverage_radius_cells)
+        mean_clearance = float(np.mean([dist_obs[row, col] for row, col in points])) if points else 0.0
+        score = coverage * 100.0 + min(len(points), target_points) * 2.0 + mean_clearance * 0.05 - level_idx * 1.5
+        if score > best_score:
+            best_score = score
+            best_points = points
+            best_level = level_name
+            best_coverage = coverage
+        if len(points) >= target_points and coverage >= 0.82:
+            break
 
+    if not best_points:
+        return []
+
+    ordered = _nearest_neighbor_circuit(best_points[:target_points], current)
+    final_coverage = _coverage_ratio(navigable, ordered, coverage_radius_cells)
+    print(
+        f"  [zone-explore] Nivel elegido={best_level}; cobertura≈{final_coverage * 100:.1f}% "
+        f"a {coverage_radius_cells * cell_size:.2f} m; separación objetivo={min_sep_m:.2f} m"
+    )
+    print(f"  [zone-explore] Puntos finales: {[list(p) for p in ordered[:target_points]]}")
+    _save_room_exploration_debug_image(
+        robot,
+        room_name,
+        target,
+        room_mask,
+        navigable,
+        {name: mask for name, _clearance, mask in levels},
+        ordered[:target_points],
+        coverage_radius_cells,
+    )
     return ordered[:target_points]
 
 
@@ -3863,10 +4036,15 @@ def explore_room_zone_with_yoloe(
         return False, None
 
     resolved_room = room_provider.resolve_room_name(room_name) or room_name
-    max_points = _env_int(_ROOM_EXPLORE_MAX_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
+    max_points = _room_exploration_point_count()
     timeout_s = _env_float(_ROOM_EXPLORE_TIMEOUT_ENV, _DEFAULT_ROOM_EXPLORE_TIMEOUT_S, 1.0)
     max_attempts = _env_int(_ROOM_MAX_APPROACH_ATTEMPTS_ENV, _DEFAULT_MAX_APPROACH_ATTEMPTS, 1)
     low_thresh = _env_float(_ROOM_YOLOE_LOW_THRESH_ENV, _DEFAULT_YOLOE_LOW_THRESH, 0.01)
+    min_clearance_cells = _env_float(
+        _ROOM_EXPLORE_MIN_CLEARANCE_ENV,
+        3.0,
+        0.0,
+    )
     room_mask = _room_mask_for(
         resolved_room,
         room_provider,
@@ -3880,10 +4058,11 @@ def explore_room_zone_with_yoloe(
         robot,
         resolved_room,
         room_provider,
-        getattr(robot, "_safe_obs_map", robot.map.obstacles_map),
+        robot.map.obstacles_map,
         search_state,
         max_points=max_points,
-        min_clearance_cells=3.0,
+        min_clearance_cells=min_clearance_cells,
+        target=target,
     )
     if search_state is not None:
         search_state.record_zone_exploration(points)
