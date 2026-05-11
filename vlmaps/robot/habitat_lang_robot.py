@@ -106,12 +106,17 @@ class HabitatLanguageRobot(LangRobot):
             cropped_obst_map = self.map.get_customized_obstacle_cropped()
 
         # Safety margin: dilate obstacles before building the visgraph.
-        # 3 iterations at cell_size=0.05 m → ~15 cm clearance per side.
-        # Keep the planificador conservador; the useful extra space now comes
-        # from the relaxed HSSD navmesh radius above, not from reducing this
-        # planning inflation.
-        # The execution shield uses the RAW map — intentionally different.
-        _PLAN_DILATION_ITERS = 3
+        # Default is 2 iterations at cell_size=0.05 m, around 10 cm per side.
+        # It can be raised again with VLMAPS_PLAN_DILATION_ITERS=3 if a scene
+        # needs more conservative paths. The execution shield still uses the
+        # raw map, intentionally different from this planning map.
+        try:
+            _PLAN_DILATION_ITERS = max(
+                0,
+                int(os.environ.get("VLMAPS_PLAN_DILATION_ITERS", "2")),
+            )
+        except (TypeError, ValueError):
+            _PLAN_DILATION_ITERS = 2
         from scipy.ndimage import binary_dilation as _bdilate
         _obs_mask = (cropped_obst_map == 0).astype(bool)
         _obs_mask_dilated = _bdilate(_obs_mask, iterations=_PLAN_DILATION_ITERS)

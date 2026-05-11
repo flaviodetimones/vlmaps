@@ -81,6 +81,8 @@ _ROOM_EXPLORE_MAX_POINTS_CAP_ENV = "VLMAPS_EXPLORE_MAX_POINTS_CAP"
 _ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
 _ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
 _ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
+_APPROACH_MIN_CLEARANCE_ENV = "VLMAPS_APPROACH_MIN_CLEARANCE_CELLS"
+_APPROACH_RAW_FALLBACK_ENV = "VLMAPS_APPROACH_RAW_FALLBACK"
 
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 8
 _DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
@@ -90,6 +92,7 @@ _DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 32
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
+_DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -134,6 +137,14 @@ def _confirm_conf_thresh() -> float:
 
     return runtime_conf_thresh(
         _env_float(_ROOM_YOLOE_CONFIRM_THRESH_ENV, _DEFAULT_YOLOE_CONFIRM_THRESH, 0.01)
+    )
+
+
+def _approach_min_clearance_cells() -> float:
+    return _env_float(
+        _APPROACH_MIN_CLEARANCE_ENV,
+        _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS,
+        0.0,
     )
 
 
@@ -1101,10 +1112,9 @@ def face_toward_pos(robot, target_row: float, target_col: float,
                     smooth: bool = False, label: str = "Facing…") -> None:
     """Turn robot to face directly toward a specific map (row, col) position.
 
-    Coordinate math (base frame: x=north=-row, y=west=-col, CCW-positive):
-      angle = arctan2(-dy_map, -dx_map)  maps (row,col) deltas to base angle.
-    Turn sign: robot.turn(+) = turn_right (CW) = decreasing base angle,
-      matching convert_goal_to_actions convention (turn_right_angle = curr - target).
+    Uses the same map-angle convention as ``Map.get_delta_angle_to``:
+    0 degrees faces north/up in the map, positive angles turn right/east.
+    A positive delta therefore maps to Habitat's ``turn_right`` action.
     Each step is shown individually for smooth demo visualisation.
 
     If *smooth* is True, the per-step UI wait uses ``_SCAN_STEP_DELAY_MS``
@@ -1112,13 +1122,20 @@ def face_toward_pos(robot, target_row: float, target_col: float,
     target instead of teleporting. Use this before a verification scan.
     """
     robot._set_nav_curr_pose()
-    dx = target_row - robot.curr_pos_on_map[0]   # positive = south = -x_base
-    dy = target_col - robot.curr_pos_on_map[1]   # positive = east  = -y_base
-    angle = np.arctan2(-dy, -dx) * 180.0 / np.pi  # CCW-positive, 0°=north
-    turn = (robot.curr_ang_deg_on_map - angle + 180) % 360 - 180  # +→CW→turn_right
-    n_turns = int(abs(turn) / robot.turn_angle)
+    drow = float(target_row) - float(robot.curr_pos_on_map[0])
+    dcol = float(target_col) - float(robot.curr_pos_on_map[1])
+    target_angle = float(np.degrees(np.arctan2(dcol, -drow)))
+    turn = (target_angle - float(robot.curr_ang_deg_on_map) + 180.0) % 360.0 - 180.0
+    turn_step = max(1e-6, float(robot.turn_angle))
+    n_turns = int(np.floor(abs(turn) / turn_step + 0.5))
+    if n_turns == 0:
+        return
     action = "turn_right" if turn > 0 else "turn_left"
     delay = _SCAN_STEP_DELAY_MS if smooth else _NAV_STEP_DELAY_MS
+    print(
+        f"  [face] current={float(robot.curr_ang_deg_on_map):.1f}° "
+        f"target={target_angle:.1f}° delta={turn:.1f}° -> {action} x{n_turns}"
+    )
     for _ in range(n_turns):
         robot.sim.step(action)
         show_obs(robot, label)
@@ -1618,7 +1635,7 @@ def navigate_to_alternative(
             required_room=alt.get("room"),
             min_dist=8.0,
             max_dist=25.0,
-            min_clearance=3.0,
+            min_clearance=_approach_min_clearance_cells(),
         )
         if approach_goals:
             standoff_alt = approach_goals[0]
@@ -2148,63 +2165,92 @@ def _planned_approach_to_target_cell(
     room_mask: Optional[np.ndarray] = None,
     min_dist_cells: float = 6.0,
     max_dist_cells: float = 18.0,
-    min_clearance_cells: float = 3.0,
+    min_clearance_cells: Optional[float] = None,
 ) -> bool:
     """Move to a safe navigable standoff around a semantic target cell."""
     if target_cell is None:
         return False
 
     safe_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
+    raw_map = robot.map.obstacles_map
+    clearance = (
+        float(min_clearance_cells)
+        if min_clearance_cells is not None
+        else _approach_min_clearance_cells()
+    )
     robot._set_nav_curr_pose()
     cur_r, cur_c = int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
     room_provider = getattr(robot, "room_provider", None)
     required_room = None
     if room_provider is not None and getattr(room_provider, "is_available", lambda: False)():
-        required_room = room_provider.get_room_at_cell(cur_r, cur_c)
-    goals = find_safe_candidate_approach_goals(
-        target_cell,
-        safe_map,
-        robot_pos=(cur_r, cur_c),
-        room_provider=room_provider,
-        required_room=required_room,
-        min_dist=min_dist_cells,
-        max_dist=max_dist_cells,
-        min_clearance=min_clearance_cells,
-        top_k=8,
-    )
-    if not goals:
-        print("  [planned-approach] no safe standoff around detected target cell")
-        return False
+        room_here = room_provider.get_room_at_cell(cur_r, cur_c)
+        if room_here and room_here != "unknown":
+            required_room = room_here
 
-    for goal in goals:
-        try:
-            _, planned_actions = robot.plan_path_only(goal)
-        except Exception:
+    attempts = [("inflado", safe_map, clearance)]
+    if _env_flag(_APPROACH_RAW_FALLBACK_ENV, True) and raw_map is not safe_map:
+        # Last resort for tight LabelMe regions: pick a goal in the raw
+        # navigable map, then still ask the planner to reach it. If the
+        # visgraph cannot route there, this attempt naturally fails.
+        attempts.append(("bruto", raw_map, min(clearance, 1.0)))
+
+    for map_name, approach_map, map_clearance in attempts:
+        goals = find_safe_candidate_approach_goals(
+            target_cell,
+            approach_map,
+            robot_pos=(cur_r, cur_c),
+            room_provider=room_provider,
+            required_room=required_room,
+            min_dist=min_dist_cells,
+            max_dist=max_dist_cells,
+            min_clearance=map_clearance,
+            top_k=12,
+        )
+        if not goals:
+            print(
+                f"  [planned-approach] sin standoff en mapa {map_name} "
+                f"(clearance>={map_clearance:.1f})"
+            )
             continue
-        if not planned_actions:
-            return True
-        planned_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
-        planned_dense = densify_path_cells(planned_polyline)
-        if room_mask is not None and planned_dense and not _path_stays_inside_mask(planned_dense, room_mask):
-            continue
+
+        for goal in goals:
+            try:
+                _, planned_actions = robot.plan_path_only(goal)
+            except Exception:
+                continue
+            if not planned_actions:
+                print(
+                    f"  [planned-approach] target_cell={tuple(int(v) for v in target_cell)} "
+                    f"standoff={goal} mapa={map_name}; ya está cerca"
+                )
+                return True
+            planned_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+            planned_dense = densify_path_cells(planned_polyline)
+            if room_mask is not None and planned_dense and not _path_stays_inside_mask(planned_dense, room_mask):
+                continue
+            print(
+                f"  [planned-approach] target_cell={tuple(int(v) for v in target_cell)} "
+                f"standoff={goal} mapa={map_name} clearance={map_clearance:.1f}"
+            )
+            ok = execute_nav_replay(
+                robot,
+                planned_actions,
+                "approach_target",
+                rgb_map_2d if rgb_map_2d is not None else np.zeros((1, 1, 3), dtype=np.uint8),
+                heatmap if heatmap is not None else np.zeros((1, 1), dtype=np.float32),
+                planned_polyline,
+                display_path_cells=planned_dense,
+                dist_map=distance_transform_edt(robot.map.obstacles_map),
+                goal_reached_tol_cells=1.5,
+                room_mask=room_mask,
+            )
+            if ok:
+                return True
         print(
-            f"  [planned-approach] target_cell={tuple(int(v) for v in target_cell)} "
-            f"standoff={goal}"
+            f"  [planned-approach] los standoff del mapa {map_name} no tienen ruta válida"
         )
-        ok = execute_nav_replay(
-            robot,
-            planned_actions,
-            "approach_target",
-            rgb_map_2d if rgb_map_2d is not None else np.zeros((1, 1, 3), dtype=np.uint8),
-            heatmap if heatmap is not None else np.zeros((1, 1), dtype=np.float32),
-            planned_polyline,
-            display_path_cells=planned_dense,
-            dist_map=distance_transform_edt(robot.map.obstacles_map),
-            goal_reached_tol_cells=1.5,
-            room_mask=room_mask,
-        )
-        if ok:
-            return True
+
+    print("  [planned-approach] no se pudo acercar al objetivo detectado")
     return False
 
 
@@ -2403,6 +2449,11 @@ def _approach_and_confirm_detection(
         return False
     if approach_session is None:
         approach_session = confirm_session
+    approach_retry_thresh = _env_float(
+        _ROOM_YOLOE_LOW_THRESH_ENV,
+        _DEFAULT_YOLOE_LOW_THRESH,
+        0.01,
+    )
 
     if search_state is not None:
         search_state.record_approach_attempt()
@@ -2427,6 +2478,13 @@ def _approach_and_confirm_detection(
         fine_visual_center(robot, approach_session, label)
     except Exception as exc:
         print(f"  [confirm-approach] visual centering skipped: {exc}")
+        retry_session = get_session(label, conf_thresh=approach_retry_thresh)
+        if retry_session is not None:
+            approach_session = retry_session
+            try:
+                fine_visual_center(robot, approach_session, label)
+            except Exception as retry_exc:
+                print(f"  [confirm-approach] visual centering retry skipped: {retry_exc}")
 
     if target_cell is not None:
         try:
@@ -2467,6 +2525,22 @@ def _approach_and_confirm_detection(
         )
     except Exception as exc:
         print(f"  [confirm-approach] close approach skipped: {exc}")
+        retry_session = get_session(label, conf_thresh=approach_retry_thresh)
+        if retry_session is not None:
+            approach_session = retry_session
+            try:
+                close_approach_after_detection(
+                    robot,
+                    approach_session,
+                    label,
+                    surrogate_cat=surrogate_cat,
+                    rgb_map_2d=rgb_map_2d,
+                    heatmap=heatmap,
+                    path_cells=path_cells,
+                    room_mask=room_mask,
+                )
+            except Exception as retry_exc:
+                print(f"  [confirm-approach] close approach retry skipped: {retry_exc}")
 
     try:
         fine_visual_center(robot, confirm_session, label)
@@ -2477,7 +2551,14 @@ def _approach_and_confirm_detection(
     if "color_sensor" not in obs:
         return False
     frame = obs["color_sensor"][:, :, :3]
-    detected, ann_rgb, _bbox = confirm_session.check(frame)
+    try:
+        detected, ann_rgb, _bbox = confirm_session.check(frame)
+    except Exception as exc:
+        print(f"  [confirm-approach] final confirmation retry after YOLOE error: {exc}")
+        confirm_session = get_session(label, conf_thresh=_confirm_conf_thresh())
+        if confirm_session is None:
+            return False
+        detected, ann_rgb, _bbox = confirm_session.check(frame)
     if ann_rgb is not None:
         show_obs(
             robot,
@@ -3064,7 +3145,7 @@ def find_safe_candidate_approach_goals(
     required_room: str = None,
     min_dist: float = 8.0,
     max_dist: float = 25.0,
-    min_clearance: float = 3.0,
+    min_clearance: float = 2.0,
     n_angles: int = 16,
     top_k: int = 5,
 ) -> list:
@@ -3151,7 +3232,7 @@ def find_reachable_room_goal(
     room_provider,
     obs_map: np.ndarray,
     top_k: int = 8,
-    min_clearance: float = 3.0,
+    min_clearance: float = 2.0,
 ) -> list:
     """Return up to top_k safe navigable cells inside target_room.
 
@@ -3681,7 +3762,7 @@ def _generate_room_exploration_points(
     search_state: Optional[SearchState],
     *,
     max_points: int,
-    min_clearance_cells: float = 3.0,
+    min_clearance_cells: float = 2.0,
     target: str = "",
 ) -> List[Tuple[int, int]]:
     """Generate a distributed circuit of viewpoints over the navigable room."""
@@ -3828,7 +3909,11 @@ def _forward_target_cell_from_view(
     """Project a target cell in the current viewing direction inside the room."""
     try:
         robot._set_nav_curr_pose()
-        free_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map) > 0
+        # Use the raw navigable map here. The detected object is often near
+        # furniture; the inflated planning map can stop the projection too soon
+        # and make the later approach choose a viewpoint that is not actually
+        # closer to the visual evidence.
+        free_map = robot.map.obstacles_map > 0
         row = int(robot.curr_pos_on_map[0])
         col = int(robot.curr_pos_on_map[1])
         ang = float(robot.curr_ang_deg_on_map)
@@ -4042,7 +4127,7 @@ def explore_room_zone_with_yoloe(
     low_thresh = _env_float(_ROOM_YOLOE_LOW_THRESH_ENV, _DEFAULT_YOLOE_LOW_THRESH, 0.01)
     min_clearance_cells = _env_float(
         _ROOM_EXPLORE_MIN_CLEARANCE_ENV,
-        3.0,
+        2.0,
         0.0,
     )
     room_mask = _room_mask_for(
@@ -5067,7 +5152,8 @@ def main(config: DictConfig) -> None:
                     robot_pos=_robot_rc,
                     room_provider=_room_provider,
                     required_room=best_comp.get("room"),
-                    min_dist=8.0, max_dist=25.0, min_clearance=3.0,
+                    min_dist=8.0, max_dist=25.0,
+                    min_clearance=_approach_min_clearance_cells(),
                 )
                 if _approach_goals:
                     goal_pos = _approach_goals[0]
@@ -5114,7 +5200,7 @@ def main(config: DictConfig) -> None:
                   f"(controller preview: {n_actions} actions).")
 
             # ── Safety metrics + Bug 3 execution gate ────────────────────────
-            _MIN_GOAL_CLEARANCE = 3.0   # cells (~15 cm at cs=0.05 m)
+            _MIN_GOAL_CLEARANCE = _approach_min_clearance_cells()
             _MIN_PATH_CLEARANCE = 1.0   # cells — zero is definitely in obstacle
 
             _goal_cl = 0.0
@@ -5173,7 +5259,8 @@ def main(config: DictConfig) -> None:
                             robot_pos=_robot_rc,
                             room_provider=_room_provider,
                             required_room=_nc.get("room"),
-                            min_dist=8.0, max_dist=25.0, min_clearance=3.0,
+                            min_dist=8.0, max_dist=25.0,
+                            min_clearance=_approach_min_clearance_cells(),
                         )
                         if _nc_app:
                             _nc_goal = _nc_app[0]
