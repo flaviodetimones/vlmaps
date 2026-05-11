@@ -3319,22 +3319,17 @@ def _scaled_room_exploration_point_count(
     navigable_area: int,
     base_points: int,
 ) -> Tuple[int, float]:
-    """Scale exploration points linearly with room area.
+    """Return the fixed number of exploration points requested by the user.
 
-    ``base_points`` means: number of points for one typical room area n.
-    A room of 2n gets 2*base_points; 0.75n gets round(0.75*base_points).
+    The old area-scaled version made large rooms explode to 20+ stops, which
+    breaks the intended "circuit of viewpoints" behavior. The room area is
+    still returned for logging/debugging, but the count is now fixed.
     """
     base = max(1, int(base_points))
-    cap = _env_int(
-        _ROOM_EXPLORE_MAX_POINTS_CAP_ENV,
-        max(_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP, base * 4),
-        1,
-    )
     ref_area = _room_navigable_area_reference(room_provider, obs_map)
     if ref_area <= 0:
         ref_area = float(max(1, navigable_area))
-    scaled = int(round(float(base) * float(max(1, navigable_area)) / float(ref_area)))
-    return max(1, min(int(cap), scaled)), ref_area
+    return base, ref_area
 
 
 def _generate_room_exploration_points(
@@ -3347,7 +3342,7 @@ def _generate_room_exploration_points(
     max_points: int,
     min_clearance_cells: float = 3.0,
 ) -> List[Tuple[int, int]]:
-    """Generate a compact route that covers the navigable part of a labeled room."""
+    """Generate a distributed circuit of viewpoints over the navigable room."""
     if obs_map is None:
         return []
     room_mask = _room_mask_for(room_name, room_provider, obs_map.shape)
@@ -3369,8 +3364,7 @@ def _generate_room_exploration_points(
     )
     print(
         f"  [zone-explore] Área navegable '{room_name}': {navigable_area} celdas; "
-        f"referencia n={ref_area:.0f}; puntos={target_points} "
-        f"(base={int(max_points)})"
+        f"referencia n={ref_area:.0f}; puntos fijos={target_points}"
     )
 
     dist_obs = distance_transform_edt(free_map)
@@ -3448,19 +3442,33 @@ def _generate_room_exploration_points(
         selected.append(candidate_cells[best_idx])
         selected_set.add(candidate_cells[best_idx])
 
+    circuit = list(selected or candidate_cells)
+    if not circuit:
+        return []
+
+    center_r = float(sum(cell[0] for cell in circuit)) / float(len(circuit))
+    center_c = float(sum(cell[1] for cell in circuit)) / float(len(circuit))
+    circuit.sort(
+        key=lambda cell: float(np.arctan2(cell[0] - center_r, cell[1] - center_c))
+    )
+
     robot._set_nav_curr_pose()
     current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
-    ordered: List[Tuple[int, int]] = []
-    remaining = list(selected or candidate_cells)
-    while remaining and len(ordered) < target_points:
-        best_idx = min(
-            range(len(remaining)),
-            key=lambda i: (remaining[i][0] - current[0]) ** 2 + (remaining[i][1] - current[1]) ** 2,
-        )
-        cell = remaining.pop(best_idx)
-        ordered.append(cell)
-        current = (float(cell[0]), float(cell[1]))
-    return ordered
+    start_idx = min(
+        range(len(circuit)),
+        key=lambda i: (circuit[i][0] - current[0]) ** 2 + (circuit[i][1] - current[1]) ** 2,
+    )
+    ordered = circuit[start_idx:] + circuit[:start_idx]
+
+    if len(ordered) >= 3:
+        second = ordered[1]
+        last = ordered[-1]
+        dist_second = (second[0] - current[0]) ** 2 + (second[1] - current[1]) ** 2
+        dist_last = (last[0] - current[0]) ** 2 + (last[1] - current[1]) ** 2
+        if dist_last < dist_second:
+            ordered = [ordered[0]] + list(reversed(ordered[1:]))
+
+    return ordered[:target_points]
 
 
 def _confirm_current_view_after_trigger(
@@ -3637,7 +3645,7 @@ def explore_room_zone_with_yoloe(
     surrogate_cat: str = "",
     force: bool = False,
 ) -> Tuple[bool, Optional[str]]:
-    """Explore a labeled room/zone with low-threshold YOLOE during movement."""
+    """Explore a labeled room/zone by visiting points and scanning on arrival."""
     if not force and not _room_exploration_enabled():
         return False, None
     if room_provider is None or not room_provider.is_available() or not room_name:
@@ -3696,34 +3704,6 @@ def explore_room_zone_with_yoloe(
         return False, None
 
     started = time.monotonic()
-    trigger = {"hit": False, "cell": None}
-
-    def _monitor(_step_idx: int, _action: str) -> bool:
-        obs = robot.sim.get_sensor_observations(0)
-        if "color_sensor" not in obs:
-            return False
-        frame = obs["color_sensor"][:, :, :3]
-        detected, ann_rgb, _bbox = session_ref["low"].check(frame)
-        if ann_rgb is not None:
-            ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
-            if detected:
-                setattr(robot, "_last_yoloe_positive_bgr", ann_bgr)
-            show_obs(
-                robot,
-                f"Explorando {resolved_room}: {target}",
-                yoloe_frame_bgr=ann_bgr,
-            )
-        if detected:
-            robot._set_nav_curr_pose()
-            cell = (int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1]))
-            trigger["hit"] = True
-            trigger["cell"] = cell
-            if search_state is not None:
-                search_state.record_low_conf_detection()
-            print(f"  [zone-explore] YOLOE bajo umbral disparado en {cell}.")
-            return True
-        return False
-
     for idx, point in enumerate(points, start=1):
         if time.monotonic() - started > timeout_s:
             print(f"  [zone-explore] Tiempo máximo agotado ({timeout_s:.0f}s).")
@@ -3768,16 +3748,11 @@ def explore_room_zone_with_yoloe(
                 display_path_cells=dense,
                 dist_map=distance_transform_edt(robot.map.obstacles_map),
                 goal_reached_tol_cells=2.0,
-                monitor_fn=_monitor,
-                monitor_stride=4,
-                stop_on_monitor=True,
                 room_mask=room_mask,
                 exploration_points=points,
                 visited_points=visited_points,
                 current_exploration_point=point,
             )
-        else:
-            _monitor(-1, "already_at_point")
 
         robot._set_nav_curr_pose()
         visited_cell = (
@@ -3791,36 +3766,35 @@ def explore_room_zone_with_yoloe(
                 visited_cell[1],
             )
 
-        if not trigger["hit"]:
-            _monitor(-1, "post_point")
-        if not trigger["hit"]:
-            if _scan_room_exploration_yaws(
-                robot,
-                session_ref["low"],
-                target,
-                resolved_room,
-                rgb_map_2d,
-                heatmap,
-                room_mask,
-                points,
-                visited_points,
-                point,
-                sweep_deg=30.0,
-            ):
-                robot._set_nav_curr_pose()
-                trigger["hit"] = True
-                trigger["cell"] = (
-                    int(robot.curr_pos_on_map[0]),
-                    int(robot.curr_pos_on_map[1]),
-                )
-                if search_state is not None:
-                    search_state.record_low_conf_detection()
-                print(
-                    f"  [zone-explore] YOLOE bajo umbral disparado durante "
-                    f"barrido ±30° en {trigger['cell']}."
-                )
+        trigger_hit = False
+        trigger_cell = None
+        if _scan_room_exploration_yaws(
+            robot,
+            session_ref["low"],
+            target,
+            resolved_room,
+            rgb_map_2d,
+            heatmap,
+            room_mask,
+            points,
+            visited_points,
+            point,
+            sweep_deg=30.0,
+        ):
+            robot._set_nav_curr_pose()
+            trigger_hit = True
+            trigger_cell = (
+                int(robot.curr_pos_on_map[0]),
+                int(robot.curr_pos_on_map[1]),
+            )
+            if search_state is not None:
+                search_state.record_low_conf_detection()
+            print(
+                f"  [zone-explore] YOLOE bajo umbral disparado durante "
+                f"barrido ±30° en {trigger_cell}."
+            )
 
-        if trigger["hit"]:
+        if trigger_hit:
             print("  [state] APPROACH_DETECTION -> CONFIRM_DETECTION")
             confirmed = _confirm_current_view_after_trigger(
                 robot,
@@ -3836,15 +3810,13 @@ def explore_room_zone_with_yoloe(
                 print(f"  [zone-explore] ✓ Confirmado '{target}' durante exploración.")
                 return True, "zone_explore"
 
-            false_cell = trigger["cell"] or (
+            false_cell = trigger_cell or (
                 int(robot.curr_pos_on_map[0]),
                 int(robot.curr_pos_on_map[1]),
             )
             if search_state is not None:
                 search_state.record_false_positive_zone(false_cell[0], false_cell[1])
             print(f"  [zone-explore] Falsa alarma en {false_cell}; se continúa.")
-            trigger["hit"] = False
-            trigger["cell"] = None
             session_ref["low"] = get_session(target, conf_thresh=low_thresh)
             if session_ref["low"] is None:
                 break
