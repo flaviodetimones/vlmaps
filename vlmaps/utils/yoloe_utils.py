@@ -163,15 +163,22 @@ class YoloeSession:
         """
         if not self._ready or self._proc is None:
             return False, frame_rgb.copy(), None
+        if self._proc.poll() is not None:
+            self._ready = False
+            return False, frame_rgb.copy(), None
 
         with self._io_lock:
             cv2.imwrite(
                 str(self._in_path),
                 cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
             )
-            self._proc.stdin.write(f"{self._in_path}|{self._out_path}\n")
-            self._proc.stdin.flush()
-            line = self._proc.stdout.readline().strip()
+            try:
+                self._proc.stdin.write(f"{self._in_path}|{self._out_path}\n")
+                self._proc.stdin.flush()
+                line = self._proc.stdout.readline().strip()
+            except (BrokenPipeError, OSError):
+                self._ready = False
+                return False, frame_rgb.copy(), None
 
         # Parse response: "0" or "1|cx|cy" or "1|cx|cy|conf"
         parts = line.split("|")
@@ -277,7 +284,7 @@ class YoloeSession:
 
 # ── Module-level session cache ────────────────────────────────────────────────
 
-_session: Optional[YoloeSession] = None
+_sessions = {}
 
 
 def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession]:
@@ -287,19 +294,17 @@ def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession
     The first call blocks while the model loads (~10 s); subsequent calls
     return immediately.
     """
-    global _session
-
-    if (
-        _session is not None
-        and _session.target == target
-        and abs(float(getattr(_session, "conf_thresh", conf_thresh)) - float(conf_thresh)) < 1e-9
-    ):
-        return _session
-
-    # Stop previous session if target or confidence threshold changed.
-    if _session is not None:
-        _session.stop()
-        _session = None
+    key = (str(target), float(conf_thresh))
+    cached = _sessions.get(key)
+    if cached is not None:
+        proc = getattr(cached, "_proc", None)
+        if getattr(cached, "_ready", False) and proc is not None and proc.poll() is None:
+            return cached
+        try:
+            cached.stop()
+        except Exception:
+            pass
+        _sessions.pop(key, None)
 
     try:
         weights = _find_weights()
@@ -315,16 +320,19 @@ def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession
         return None
 
     print("  [YOLOE] Session ready.")
-    _session = sess
-    return _session
+    _sessions[key] = sess
+    return sess
 
 
 def shutdown_session():
     """Stop the global session (call on program exit)."""
-    global _session
-    if _session is not None:
-        _session.stop()
-        _session = None
+    global _sessions
+    for sess in list(_sessions.values()):
+        try:
+            sess.stop()
+        except Exception:
+            pass
+    _sessions = {}
 
 
 # ── Legacy one-shot helper (kept for compatibility) ───────────────────────────

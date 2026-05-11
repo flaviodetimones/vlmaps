@@ -3503,25 +3503,77 @@ def _generate_room_exploration_points(
 
     selected: List[Tuple[int, int]] = []
     selected_set = set()
-    sector_count = max(1, min(int(target_points), len(candidate_cells)))
-    sector_bins: List[List[Tuple[int, int]]] = [[] for _ in range(sector_count)]
-    for cell in candidate_cells:
-        ang = (_cell_angle(cell) + float(np.pi)) / (2.0 * float(np.pi))
-        idx = min(sector_count - 1, int(np.floor(ang * sector_count)))
-        sector_bins[idx].append(cell)
+    row_min = int(room_rows.min())
+    row_max = int(room_rows.max())
+    col_min = int(room_cols.min())
+    col_max = int(room_cols.max())
+    room_h = max(1, row_max - row_min + 1)
+    room_w = max(1, col_max - col_min + 1)
+    aspect = float(room_w) / float(room_h)
+    n_cols = max(1, int(round(np.sqrt(float(target_points) * max(aspect, 1e-3)))))
+    n_rows = max(1, int(np.ceil(float(target_points) / float(n_cols))))
+    while n_rows * n_cols < target_points:
+        n_cols += 1
 
-    for bucket in sector_bins:
+    tile_h = float(room_h) / float(n_rows)
+    tile_w = float(room_w) / float(n_cols)
+    tile_bins: List[List[Tuple[int, int]]] = [[] for _ in range(n_rows * n_cols)]
+    for cell in candidate_cells:
+        rr = min(n_rows - 1, max(0, int((cell[0] - row_min) / max(tile_h, 1e-6))))
+        cc = min(n_cols - 1, max(0, int((cell[1] - col_min) / max(tile_w, 1e-6))))
+        tile_bins[rr * n_cols + cc].append(cell)
+
+    tile_reps: List[Tuple[int, int]] = []
+    for tile_idx, bucket in enumerate(tile_bins):
         if not bucket:
             continue
+        rr = tile_idx // n_cols
+        cc = tile_idx % n_cols
+        tile_center_r = float(row_min) + (rr + 0.5) * tile_h
+        tile_center_c = float(col_min) + (cc + 0.5) * tile_w
         chosen = max(
             bucket,
-            key=lambda cell: (_cell_radius_sq(cell), float(dist_obs[cell[0], cell[1]])),
+            key=lambda cell: (
+                float(dist_obs[cell[0], cell[1]]) * 5.0
+                - ((cell[0] - tile_center_r) ** 2 + (cell[1] - tile_center_c) ** 2) * 0.01
+            ),
         )
         if chosen not in selected_set:
-            selected.append(chosen)
+            tile_reps.append(chosen)
             selected_set.add(chosen)
 
-    # Backfill with farthest-point sampling when some sectors are empty.
+    selected_set = set()
+    if len(tile_reps) <= target_points:
+        selected = list(tile_reps)
+        selected_set = set(selected)
+    else:
+        robot._set_nav_curr_pose()
+        current = (float(robot.curr_pos_on_map[0]), float(robot.curr_pos_on_map[1]))
+        first_idx = min(
+            range(len(tile_reps)),
+            key=lambda i: (tile_reps[i][0] - current[0]) ** 2 + (tile_reps[i][1] - current[1]) ** 2,
+        )
+        selected.append(tile_reps[first_idx])
+        selected_set.add(tile_reps[first_idx])
+        while len(selected) < target_points:
+            best_idx = None
+            best_value = -float("inf")
+            for i, cell in enumerate(tile_reps):
+                if cell in selected_set:
+                    continue
+                min_dist_sq = min(
+                    float((cell[0] - sr) ** 2 + (cell[1] - sc) ** 2)
+                    for sr, sc in selected
+                )
+                if min_dist_sq > best_value:
+                    best_value = min_dist_sq
+                    best_idx = i
+            if best_idx is None:
+                break
+            selected.append(tile_reps[best_idx])
+            selected_set.add(tile_reps[best_idx])
+
+    # Backfill when some tiles are empty or filtered out.
     while len(selected) < target_points and len(selected) < len(candidate_cells):
         best_idx = None
         best_value = -float("inf")
@@ -3584,6 +3636,38 @@ def _best_heatmap_cell_in_mask(
     return int(row), int(col)
 
 
+def _forward_target_cell_from_view(
+    robot,
+    room_mask: Optional[np.ndarray],
+    *,
+    min_dist_cells: int = 6,
+    max_dist_cells: int = 28,
+) -> Optional[Tuple[int, int]]:
+    """Project a target cell in the current viewing direction inside the room."""
+    try:
+        robot._set_nav_curr_pose()
+        free_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map) > 0
+        row = int(robot.curr_pos_on_map[0])
+        col = int(robot.curr_pos_on_map[1])
+        ang = float(robot.curr_ang_deg_on_map)
+        dr = -float(np.cos(np.deg2rad(ang)))
+        dc = float(np.sin(np.deg2rad(ang)))
+        best = None
+        for step in range(int(min_dist_cells), int(max_dist_cells) + 1):
+            rr = int(round(row + dr * step))
+            cc = int(round(col + dc * step))
+            if not (0 <= rr < free_map.shape[0] and 0 <= cc < free_map.shape[1]):
+                break
+            if room_mask is not None and not bool(room_mask[rr, cc]):
+                break
+            if not bool(free_map[rr, cc]):
+                break
+            best = (rr, cc)
+        return best
+    except Exception:
+        return None
+
+
 def _confirm_current_view_after_trigger(
     robot,
     target: str,
@@ -3609,10 +3693,12 @@ def _confirm_current_view_after_trigger(
     frame = obs["color_sensor"][:, :, :3]
     detected, ann_rgb, _bbox = session.check(frame)
     approach_session = session
+    visual_target_cell = None
     if ann_rgb is not None:
         ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
         if detected:
             setattr(robot, "_last_yoloe_positive_bgr", ann_bgr)
+            visual_target_cell = _forward_target_cell_from_view(robot, room_mask)
         show_obs(
             robot,
             f"Detección antes de acercar: {target}",
@@ -3639,6 +3725,7 @@ def _confirm_current_view_after_trigger(
                 )
             if low_detected:
                 approach_session = low_session
+                visual_target_cell = _forward_target_cell_from_view(robot, room_mask)
                 print(
                     f"  [zone-explore] El alto umbral aún no confirma, "
                     f"pero hay disparo visual bajo; se acerca antes de decidir."
@@ -3660,7 +3747,7 @@ def _confirm_current_view_after_trigger(
         path_cells=path_cells,
         search_state=search_state,
         room_mask=room_mask,
-        target_cell=target_cell,
+        target_cell=visual_target_cell or target_cell,
         source="zone_explore",
     )
 
