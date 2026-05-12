@@ -62,6 +62,39 @@ _closed_windows: set = set()
 _shown_windows: set = set()   # windows that have been successfully shown at least once
 _frozen_detection_bgr = None  # frozen YOLOE frame shown until next search
 _frozen_target_cell = None    # last confirmed map target marker
+_ORIGINAL_CV2_IMSHOW = cv2.imshow
+_UI_COMPACT_ENV = "VLMAPS_UI_COMPACT"
+_UI_TILE_ENV = "VLMAPS_UI_TILE"
+_UI_ALLOWED_WINDOWS = {"Room debug overlay", "Semantic Map", "1st person"}
+_UI_WINDOW_POSITIONS = {
+    "Room debug overlay": (20, 40),
+    "Semantic Map": (760, 40),
+    "1st person": (20, 610),
+}
+
+
+def _raw_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _compact_ui_enabled() -> bool:
+    return _raw_env_flag(_UI_COMPACT_ENV, False)
+
+
+def _tile_ui_enabled() -> bool:
+    return _raw_env_flag(_UI_TILE_ENV, False)
+
+
+def _filtered_cv2_imshow(name: str, img: np.ndarray) -> None:
+    if _compact_ui_enabled() and str(name) not in _UI_ALLOWED_WINDOWS:
+        return
+    _ORIGINAL_CV2_IMSHOW(name, img)
+
+
+cv2.imshow = _filtered_cv2_imshow
 
 _HEATMAP_MODE_ENV = "VLMAPS_HEATMAP_MODE"
 _HEADLESS_EVAL_ENV = "VLMAPS_EVAL_HEADLESS"
@@ -255,6 +288,8 @@ def safe_imshow(name: str, img: np.ndarray) -> None:
     """Show img in a named window. If the user closed it, skip silently."""
     if is_eval_headless():
         return
+    if _compact_ui_enabled() and name not in _UI_ALLOWED_WINDOWS:
+        return
     if name in _closed_windows:
         return
     try:
@@ -266,6 +301,12 @@ def safe_imshow(name: str, img: np.ndarray) -> None:
                 return
         cv2.imshow(name, img)
         _shown_windows.add(name)
+        if _tile_ui_enabled() and name in _UI_WINDOW_POSITIONS:
+            try:
+                x, y = _UI_WINDOW_POSITIONS[name]
+                cv2.moveWindow(name, int(x), int(y))
+            except Exception:
+                pass
     except Exception:
         _closed_windows.add(name)
 
@@ -812,54 +853,74 @@ def _render_room_layer_overlay(
     if room_map is None or tuple(room_map.shape[:2]) != tuple(rgb_map_2d.shape[:2]):
         return None
 
-    canvas = rgb_map_2d.astype(np.float32).copy()
+    # Keep the RGB floorplan visible but make room ownership the dominant signal.
+    canvas = rgb_map_2d.astype(np.float32) * 0.14
     colors = _room_color_table(len(categories)).astype(np.float32)
 
     voronoi_map = getattr(room_provider, "_voronoi_map", None)
     if include_voronoi and voronoi_map is not None and tuple(voronoi_map.shape[:2]) == tuple(room_map.shape[:2]):
+        domain = voronoi_map >= 0
+        canvas[domain] = canvas[domain] * 0.35 + np.array([24.0, 24.0, 24.0], dtype=np.float32) * 0.65
         for idx in range(len(categories)):
             mask = voronoi_map == idx
-            canvas[mask] = canvas[mask] * 0.78 + colors[idx] * 0.22
+            canvas[mask] = canvas[mask] * 0.25 + colors[idx] * 0.75
 
     for idx in range(len(categories)):
         mask = room_map == idx
-        canvas[mask] = canvas[mask] * 0.35 + colors[idx] * 0.65
+        canvas[mask] = canvas[mask] * 0.15 + colors[idx] * 0.85
 
     out = cv2.cvtColor(np.clip(canvas, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    region_grid = getattr(room_provider, "_region_grid", None)
     regions = list(getattr(room_provider, "_regions", []) or [])
-    if region_grid is not None:
-        boundary = (room_map >= 0).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(out, contours, -1, (255, 255, 255), 1)
+
+    if include_voronoi and voronoi_map is not None and tuple(voronoi_map.shape[:2]) == tuple(room_map.shape[:2]):
+        for idx in range(len(categories)):
+            mask = (voronoi_map == idx).astype(np.uint8) * 255
+            if mask.any():
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                bgr = tuple(int(v) for v in colors[idx][::-1])
+                cv2.drawContours(out, contours, -1, bgr, 1)
+
+    for idx in range(len(categories)):
+        mask = (room_map == idx).astype(np.uint8) * 255
+        if mask.any():
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(out, contours, -1, (255, 255, 255), 2)
+
+    label_items = []
     for region in regions:
         try:
             cr, cc = region["centroid"]
             label = str(region.get("label") or region.get("category") or "")
-            r = int(round(float(cr)))
-            c = int(round(float(cc)))
-            if 0 <= r < out.shape[0] and 0 <= c < out.shape[1]:
-                cv2.circle(out, (c, r), 4, (255, 255, 255), -1)
-                cv2.putText(
-                    out,
-                    label,
-                    (c + 5, r - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    (0, 0, 0),
-                    3,
-                )
-                cv2.putText(
-                    out,
-                    label,
-                    (c + 5, r - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    (255, 255, 255),
-                    1,
-                )
+            if label:
+                label_items.append((label, int(round(float(cr))), int(round(float(cc)))))
         except Exception:
             continue
+
+    if not label_items:
+        for idx, label in enumerate(categories):
+            rows, cols = np.where(room_map == idx)
+            if rows.size > 0:
+                label_items.append((str(label), int(np.mean(rows)), int(np.mean(cols))))
+
+    for label, r, c in label_items:
+        if not (0 <= r < out.shape[0] and 0 <= c < out.shape[1]):
+            continue
+        text = str(label)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.42
+        thickness = 1
+        (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+        tx = min(max(c + 6, 2), max(2, out.shape[1] - tw - 6))
+        ty = min(max(r - 6, th + 4), max(th + 4, out.shape[0] - baseline - 3))
+        cv2.circle(out, (c, r), 4, (255, 255, 255), -1)
+        cv2.rectangle(
+            out,
+            (tx - 3, ty - th - 3),
+            (tx + tw + 3, ty + baseline + 3),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(out, text, (tx, ty), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return out
 
 
@@ -972,8 +1033,9 @@ def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provi
         print(f"[room-debug] LabelMe : {annotation_labels}")
     print(f"[room-debug] Voronoi : {'sí' if vor_shape is not None else 'no'}")
 
-    _show_room_png_if_available(room_map_dir / "room_map_viz.png", "LabelMe room_map")
-    _show_room_png_if_available(room_map_dir / "room_voronoi_viz.png", "Voronoi ownership")
+    if not _compact_ui_enabled():
+        _show_room_png_if_available(room_map_dir / "room_map_viz.png", "LabelMe room_map")
+        _show_room_png_if_available(room_map_dir / "room_voronoi_viz.png", "Voronoi ownership")
 
     overlay = _render_room_layer_overlay(rgb_map_2d, room_provider, include_voronoi=True)
     if overlay is not None:
@@ -985,8 +1047,9 @@ def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provi
         if not is_eval_headless():
             view = overlay
             max_side = max(view.shape[:2])
-            if max_side > 1000:
-                scale = 1000.0 / float(max_side)
+            max_display_side = 720 if _compact_ui_enabled() else 1000
+            if max_side > max_display_side:
+                scale = float(max_display_side) / float(max_side)
                 view = cv2.resize(
                     view,
                     (max(1, int(view.shape[1] * scale)), max(1, int(view.shape[0] * scale))),
