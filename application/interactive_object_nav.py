@@ -72,6 +72,7 @@ _DEFAULT_PITCH_DEG = [-15.0]
 
 _ROOM_EXPLORATION_ENV = "VLMAPS_ROOM_EXPLORATION"
 _ROOM_EXPLORE_POINTS_ENV = "VLMAPS_EXPLORE_POINTS"
+_ROOM_EXPLORE_POINTS_AUTO_ENV = "VLMAPS_EXPLORE_POINTS_AUTO"
 _ROOM_EXPLORE_MAX_POINTS_ENV = "VLMAPS_EXPLORE_MAX_POINTS"
 _ROOM_EXPLORE_TIMEOUT_ENV = "VLMAPS_EXPLORE_TIMEOUT_S"
 _ROOM_SCAN_DEDUP_RADIUS_ENV = "VLMAPS_SCAN_DEDUP_RADIUS_M"
@@ -79,6 +80,9 @@ _ROOM_YOLOE_LOW_THRESH_ENV = "VLMAPS_YOLOE_ROOM_LOW_THRESH"
 _ROOM_YOLOE_CONFIRM_THRESH_ENV = "VLMAPS_YOLOE_CONFIRM_THRESH"
 _ROOM_MAX_APPROACH_ATTEMPTS_ENV = "VLMAPS_MAX_APPROACH_ATTEMPTS"
 _ROOM_EXPLORE_MAX_POINTS_CAP_ENV = "VLMAPS_EXPLORE_MAX_POINTS_CAP"
+_ROOM_EXPLORE_MIN_POINTS_ENV = "VLMAPS_EXPLORE_MIN_POINTS"
+_ROOM_EXPLORE_REFERENCE_AREA_M2_ENV = "VLMAPS_EXPLORE_REFERENCE_AREA_M2"
+_ROOM_EXPLORE_POINTS_PER_REFERENCE_ENV = "VLMAPS_EXPLORE_POINTS_PER_REFERENCE"
 _ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
 _ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
 _ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
@@ -91,7 +95,10 @@ _DEFAULT_SCAN_DEDUP_RADIUS_M = 1.5
 _DEFAULT_YOLOE_LOW_THRESH = 0.40
 _DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
-_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 32
+_DEFAULT_ROOM_EXPLORE_MIN_POINTS = 4
+_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 20
+_DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 20.0
+_DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 8
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
 
@@ -128,9 +135,19 @@ def _room_exploration_enabled() -> bool:
 
 
 def _room_exploration_point_count() -> int:
-    if os.environ.get(_ROOM_EXPLORE_POINTS_ENV) is not None:
+    raw = os.environ.get(_ROOM_EXPLORE_POINTS_ENV)
+    if raw is not None and raw.strip().lower() != "auto":
         return _env_int(_ROOM_EXPLORE_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
     return _env_int(_ROOM_EXPLORE_MAX_POINTS_ENV, _DEFAULT_ROOM_EXPLORE_MAX_POINTS, 1)
+
+
+def _room_exploration_auto_points_enabled() -> bool:
+    raw = os.environ.get(_ROOM_EXPLORE_POINTS_ENV)
+    if raw is not None and raw.strip().lower() == "auto":
+        return True
+    if raw is not None:
+        return _env_flag(_ROOM_EXPLORE_POINTS_AUTO_ENV, False)
+    return _env_flag(_ROOM_EXPLORE_POINTS_AUTO_ENV, True)
 
 
 def _confirm_conf_thresh() -> float:
@@ -3536,20 +3553,72 @@ def _scaled_room_exploration_point_count(
     room_name: str,
     room_provider,
     obs_map: np.ndarray,
+    navigable_mask: np.ndarray,
     navigable_area: int,
     base_points: int,
-) -> Tuple[int, float]:
-    """Return the fixed number of exploration points requested by the user.
-
-    The old area-scaled version made large rooms explode to 20+ stops, which
-    breaks the intended "circuit of viewpoints" behavior. The room area is
-    still returned for logging/debugging, but the count is now fixed.
-    """
+    cell_size: float = 0.05,
+) -> Tuple[int, float, str]:
+    """Return the exploration point count for a labelled navigable room."""
     base = max(1, int(base_points))
     ref_area = _room_navigable_area_reference(room_provider, obs_map)
     if ref_area <= 0:
         ref_area = float(max(1, navigable_area))
-    return base, ref_area
+    if not _room_exploration_auto_points_enabled():
+        return base, ref_area, "manual"
+
+    cell_size = max(float(cell_size or 0.05), 1e-6)
+    points_per_ref = _env_int(
+        _ROOM_EXPLORE_POINTS_PER_REFERENCE_ENV,
+        max(1, base),
+        1,
+    )
+    min_points = _env_int(
+        _ROOM_EXPLORE_MIN_POINTS_ENV,
+        _DEFAULT_ROOM_EXPLORE_MIN_POINTS,
+        1,
+    )
+    max_points = _env_int(
+        _ROOM_EXPLORE_MAX_POINTS_CAP_ENV,
+        _DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP,
+        min_points,
+    )
+
+    # Shape factor: elongated or sparse rooms need more viewpoints than compact rooms
+    # with the same area, otherwise the circuit ignores arms/corners.
+    shape_factor = 1.0
+    if navigable_mask is not None and navigable_mask.any():
+        rows, cols = np.where(navigable_mask)
+        height = max(1, int(rows.max() - rows.min() + 1))
+        width = max(1, int(cols.max() - cols.min() + 1))
+        bbox_area = float(height * width)
+        fill_ratio = float(navigable_area) / max(1.0, bbox_area)
+        aspect = max(float(height) / max(1.0, float(width)), float(width) / max(1.0, float(height)))
+        if fill_ratio < 0.50:
+            shape_factor += min(0.35, (0.50 - fill_ratio) * 0.9)
+        if aspect > 2.0:
+            shape_factor += min(0.25, (aspect - 2.0) * 0.08)
+
+    area_m2 = float(navigable_area) * cell_size * cell_size
+    ref_area_m2_raw = os.environ.get(_ROOM_EXPLORE_REFERENCE_AREA_M2_ENV)
+    if ref_area_m2_raw is not None and ref_area_m2_raw.strip():
+        ref_area_m2 = _env_float(
+            _ROOM_EXPLORE_REFERENCE_AREA_M2_ENV,
+            _DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2,
+            0.1,
+        )
+        reference_units = max(1.0, ref_area_m2 / (cell_size * cell_size))
+        reference_desc = f"ref={ref_area_m2:.1f}m2"
+    else:
+        reference_units = max(1.0, float(ref_area))
+        reference_desc = f"ref={reference_units:.0f}cel"
+
+    raw_points = (float(navigable_area) / reference_units) * float(points_per_ref) * shape_factor
+    target = int(round(raw_points))
+    target = max(min_points, min(max_points, target))
+    return target, ref_area, (
+        f"auto area={area_m2:.1f}m2 {reference_desc} "
+        f"base={points_per_ref} shape={shape_factor:.2f} min={min_points} max={max_points}"
+    )
 
 
 def _nearest_neighbor_circuit(points: List[Tuple[int, int]], current: Tuple[float, float]) -> List[Tuple[int, int]]:
@@ -3816,20 +3885,22 @@ def _generate_room_exploration_points(
         return []
 
     navigable_area = int(navigable.sum())
-    target_points, ref_area = _scaled_room_exploration_point_count(
+    cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
+    target_points, ref_area, point_mode = _scaled_room_exploration_point_count(
         room_name,
         room_provider,
         obs_map,
+        navigable,
         navigable_area,
         max_points,
+        cell_size,
     )
     print(
         f"  [zone-explore] Área navegable '{room_name}': {navigable_area} celdas; "
-        f"referencia n={ref_area:.0f}; puntos fijos={target_points}"
+        f"referencia n={ref_area:.0f}; puntos={target_points} ({point_mode})"
     )
 
     dist_obs = distance_transform_edt(free_map)
-    cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
     scan_radius = _scan_dedup_radius_cells(robot)
     prior_scan_zones = list(getattr(search_state, "unique_scan_zones", []) if search_state else [])
     false_zones = list(getattr(search_state, "false_positive_zones", []) if search_state else [])
