@@ -96,8 +96,8 @@ _DEFAULT_YOLOE_LOW_THRESH = 0.40
 _DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
 _DEFAULT_ROOM_EXPLORE_MIN_POINTS = 4
-_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 20
-_DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 20.0
+_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 16
+_DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 8.0
 _DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 8
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
@@ -2069,6 +2069,7 @@ def fine_visual_center(
     px_per_step = img_w * (robot.turn_angle / img_fov_h)
     tolerance_px = px_per_step / 2.0
     detected_once = False
+    last_action = None
 
     for step_i in range(max_turns):
         obs = robot.sim.get_sensor_observations(0)
@@ -2079,14 +2080,23 @@ def fine_visual_center(
         found, ann_rgb, bbox_center = session.check(frame)
 
         if ann_rgb is not None:
+            setattr(robot, "_last_yoloe_positive_bgr", cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
             show_obs(robot, f"Centering {step_i+1}/{max_turns}: {cat}",
                      yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
 
         if not found or bbox_center is None:
             print(f"  [center] Step {step_i+1}: '{cat}' not detected.")
+            if detected_once and last_action is not None:
+                undo = "turn_right" if last_action == "turn_left" else "turn_left"
+                robot.sim.step(undo)
+                print(f"  [center] Detección perdida tras centrar; se deshace el último giro con {undo}.")
+                show_obs(robot, f"Centering recovery: {cat}")
+                ui_wait(_NAV_STEP_DELAY_MS)
             break
 
         detected_once = True
+        setattr(robot, "_last_yoloe_bbox_center", bbox_center)
+        setattr(robot, "_last_yoloe_seen_angle_deg", float(getattr(robot, "curr_ang_deg_on_map", 0.0)))
         cx, _cy = bbox_center
         err_x = cx - img_w / 2.0
 
@@ -2097,6 +2107,7 @@ def fine_visual_center(
         action = "turn_right" if err_x > 0 else "turn_left"
         print(f"  [center] Step {step_i+1}: err_x={err_x:+.1f}px → {action}")
         robot.sim.step(action)
+        last_action = action
         ui_wait(_NAV_STEP_DELAY_MS)
 
     robot._set_nav_curr_pose()
@@ -2201,8 +2212,8 @@ def _planned_approach_to_target_cell(
     rgb_map_2d: Optional[np.ndarray] = None,
     heatmap: Optional[np.ndarray] = None,
     room_mask: Optional[np.ndarray] = None,
-    min_dist_cells: float = 6.0,
-    max_dist_cells: float = 18.0,
+    min_dist_cells: float = 3.0,
+    max_dist_cells: float = 14.0,
     min_clearance_cells: Optional[float] = None,
 ) -> bool:
     """Move to a safe navigable standoff around a semantic target cell."""
@@ -2242,7 +2253,8 @@ def _planned_approach_to_target_cell(
             min_dist=min_dist_cells,
             max_dist=max_dist_cells,
             min_clearance=map_clearance,
-            top_k=12,
+            top_k=24,
+            rank_mode="target_proximity",
         )
         if not goals:
             print(
@@ -2261,6 +2273,16 @@ def _planned_approach_to_target_cell(
                     f"  [planned-approach] target_cell={tuple(int(v) for v in target_cell)} "
                     f"standoff={goal} mapa={map_name}; ya está cerca"
                 )
+                try:
+                    face_toward_pos(
+                        robot,
+                        float(target_cell[0]),
+                        float(target_cell[1]),
+                        smooth=True,
+                        label="planned-approach: facing detected object",
+                    )
+                except Exception:
+                    pass
                 return True
             planned_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
             planned_dense = densify_path_cells(planned_polyline)
@@ -2283,6 +2305,16 @@ def _planned_approach_to_target_cell(
                 room_mask=room_mask,
             )
             if ok:
+                try:
+                    face_toward_pos(
+                        robot,
+                        float(target_cell[0]),
+                        float(target_cell[1]),
+                        smooth=True,
+                        label="planned-approach: facing detected object",
+                    )
+                except Exception:
+                    pass
                 return True
         print(
             f"  [planned-approach] los standoff del mapa {map_name} no tienen ruta válida"
@@ -2353,7 +2385,7 @@ def close_approach_after_detection(
     # (no prior)" failure when fine_visual_center nudged the camera and
     # the first close-approach frame happens to miss the object.
     last_positive_bgr = getattr(robot, "_last_yoloe_positive_bgr", None)
-    last_bbox_center = None
+    last_bbox_center = getattr(robot, "_last_yoloe_bbox_center", None)
     miss_streak = 0              # consecutive frames without detection
     MAX_MISS_STREAK = 5          # tolerate brief detection losses (motion blur, centering jitter)
     WARMUP_FRAMES = 3            # do not bail if the first frames miss — re-check
@@ -2369,6 +2401,7 @@ def close_approach_after_detection(
             if ann_rgb is not None:
                 last_positive_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
             last_bbox_center = bbox_center
+            setattr(robot, "_last_yoloe_bbox_center", bbox_center)
         else:
             miss_streak += 1
             if miss_streak >= MAX_MISS_STREAK:
@@ -2580,10 +2613,11 @@ def _approach_and_confirm_detection(
     if _final_confirmation("acercamiento visual"):
         return True
 
-    # Only now use map-based planning, and only as a fallback. For visual
-    # detections, a projected target cell is approximate; using it before the
-    # visual servo causes the robot to rotate away from the seen object.
-    if not advanced_visually:
+    # Only now use map-based planning, and only as a fallback. If the visual
+    # servo moved but still did not reach the high confirmation threshold, keep
+    # trying from the nearest viable standoff to the projected object instead of
+    # abandoning the detection and returning to the circuit.
+    if target_cell is not None or surrogate_cat:
         fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
         if fresh_target_cell is not None:
             try:
@@ -2593,6 +2627,8 @@ def _approach_and_confirm_detection(
                     rgb_map_2d=rgb_map_2d,
                     heatmap=heatmap,
                     room_mask=room_mask,
+                    min_dist_cells=2.5,
+                    max_dist_cells=12.0,
                 )
             except Exception as exc:
                 print(f"  [confirm-approach] target-cell approach skipped: {exc}")
@@ -3203,6 +3239,7 @@ def find_safe_candidate_approach_goals(
     min_clearance: float = 2.0,
     n_angles: int = 16,
     top_k: int = 5,
+    rank_mode: str = "clearance",
 ) -> list:
     """Generate safe approach positions around a heatmap component centroid.
 
@@ -3268,7 +3305,9 @@ def find_safe_candidate_approach_goals(
         if key not in best_by_cell or cl > best_by_cell[key]:
             best_by_cell[key] = cl
 
-    # Sort: clearance DESC, then proximity to robot ASC
+    # Sort: by default keep legacy clearance-first behavior. For visual
+    # detections we need the closest reachable cell to the projected object,
+    # otherwise the fallback may arc around and rotate away from the target.
     def _sort_key(item):
         (row, col), cl = item
         prox = 0.0
@@ -3276,6 +3315,9 @@ def find_safe_candidate_approach_goals(
             dr = row - robot_pos[0]
             dc = col - robot_pos[1]
             prox = float(dr * dr + dc * dc)
+        target_dist = float((row - cr) ** 2 + (col - cc) ** 2)
+        if rank_mode == "target_proximity":
+            return (target_dist, -cl, prox)
         return (-cl, prox)
 
     sorted_cells = sorted(best_by_cell.items(), key=_sort_key)
@@ -3599,18 +3641,13 @@ def _scaled_room_exploration_point_count(
             shape_factor += min(0.25, (aspect - 2.0) * 0.08)
 
     area_m2 = float(navigable_area) * cell_size * cell_size
-    ref_area_m2_raw = os.environ.get(_ROOM_EXPLORE_REFERENCE_AREA_M2_ENV)
-    if ref_area_m2_raw is not None and ref_area_m2_raw.strip():
-        ref_area_m2 = _env_float(
-            _ROOM_EXPLORE_REFERENCE_AREA_M2_ENV,
-            _DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2,
-            0.1,
-        )
-        reference_units = max(1.0, ref_area_m2 / (cell_size * cell_size))
-        reference_desc = f"ref={ref_area_m2:.1f}m2"
-    else:
-        reference_units = max(1.0, float(ref_area))
-        reference_desc = f"ref={reference_units:.0f}cel"
+    ref_area_m2 = _env_float(
+        _ROOM_EXPLORE_REFERENCE_AREA_M2_ENV,
+        _DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2,
+        0.1,
+    )
+    reference_units = max(1.0, ref_area_m2 / (cell_size * cell_size))
+    reference_desc = f"ref={ref_area_m2:.1f}m2"
 
     raw_points = (float(navigable_area) / reference_units) * float(points_per_ref) * shape_factor
     target = int(round(raw_points))
