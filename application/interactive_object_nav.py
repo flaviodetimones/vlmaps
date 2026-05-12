@@ -65,6 +65,7 @@ _frozen_target_cell = None    # last confirmed map target marker
 
 _HEATMAP_MODE_ENV = "VLMAPS_HEATMAP_MODE"
 _HEADLESS_EVAL_ENV = "VLMAPS_EVAL_HEADLESS"
+_EVAL_SUMMARY_JSON_ENV = "VLMAPS_EVAL_SUMMARY_JSON"
 
 _SURROGATE_PITCH_DEG = {}
 _DEFAULT_PITCH_DEG = [-15.0]
@@ -637,7 +638,25 @@ def emit_instruction_eval_summary(
         robot,
         room_provider,
     )
-    print(f"[eval-summary] {json.dumps(payload, sort_keys=True)}")
+    if _env_flag(_EVAL_SUMMARY_JSON_ENV, is_eval_headless()):
+        print(f"[eval-summary] {json.dumps(payload, sort_keys=True)}")
+        return
+
+    print("\nResumen de la instrucción")
+    print(f"  Instrucción : {payload.get('instruction')}")
+    print(f"  Objetivos   : {', '.join(payload.get('targets') or [])}")
+    print(f"  Habitación final: {payload.get('final_room') or 'unknown'}")
+    print(f"  Heatmap     : {payload.get('heatmap_mode')}")
+    for target, summary in (payload.get("target_summaries") or {}).items():
+        points = summary.get("n_exploration_points_planned", 0)
+        visited = summary.get("n_exploration_points_visited", 0)
+        found = "sí" if summary.get("found") else "no"
+        print(
+            f"  - {target}: encontrado={found}, habitación={summary.get('current_room') or 'unknown'}, "
+            f"exploración={visited}/{points}, detecciones bajas={summary.get('n_low_conf_detections', 0)}, "
+            f"acercamientos={summary.get('n_approach_attempts', 0)}, "
+            f"falsas alarmas={summary.get('n_false_positive_zones', 0)}"
+        )
 
 
 def show_map(robot, rgb_map_2d: np.ndarray, heatmap_2d: np.ndarray = None,
@@ -1114,7 +1133,9 @@ def face_toward_pos(robot, target_row: float, target_col: float,
 
     Uses the same map-angle convention as ``Map.get_delta_angle_to``:
     0 degrees faces north/up in the map, positive angles turn right/east.
-    A positive delta therefore maps to Habitat's ``turn_right`` action.
+    In this Habitat wrapper, ``turn_left`` increases the stored map angle and
+    ``turn_right`` decreases it.  This is the opposite of the old assumption
+    and is visible in the pose logs after each discrete turn.
     Each step is shown individually for smooth demo visualisation.
 
     If *smooth* is True, the per-step UI wait uses ``_SCAN_STEP_DELAY_MS``
@@ -1130,7 +1151,7 @@ def face_toward_pos(robot, target_row: float, target_col: float,
     n_turns = int(np.floor(abs(turn) / turn_step + 0.5))
     if n_turns == 0:
         return
-    action = "turn_right" if turn > 0 else "turn_left"
+    action = "turn_left" if turn > 0 else "turn_right"
     delay = _SCAN_STEP_DELAY_MS if smooth else _NAV_STEP_DELAY_MS
     print(
         f"  [face] current={float(robot.curr_ang_deg_on_map):.1f}° "
@@ -2280,16 +2301,17 @@ def close_approach_after_detection(
         target_bbox_frac = max(target_bbox_frac, 0.30)
         max_steps = max(max_steps, 24)
         min_clearance_cells = min(min_clearance_cells, 1.0)
-        # Path-planned approach (clearance-aware) to a closer standoff
-        # before the legacy forward-step fine-tune. Avoids straight-line
-        # collisions with the host furniture.
+        # Keep the visual approach dominant. Preplanning toward a surrogate can
+        # rotate away from the actual YOLOE detection and make the robot lock
+        # onto another similar object. It is now an explicit opt-in fallback.
         try:
-            _planned_approach_to_surrogate(
-                robot, surrogate_cat,
-                rgb_map_2d=rgb_map_2d, heatmap=heatmap, path_cells=path_cells,
-                standoff_m=0.5,
-                room_mask=room_mask,
-            )
+            if surrogate_cat and _env_flag("VLMAPS_DEEP_APPROACH_SURROGATE_PREPLAN", False):
+                _planned_approach_to_surrogate(
+                    robot, surrogate_cat,
+                    rgb_map_2d=rgb_map_2d, heatmap=heatmap, path_cells=path_cells,
+                    standoff_m=0.5,
+                    room_mask=room_mask,
+                )
         except Exception as exc:
             print(f"  [planned-approach] aborted: {exc}")
     """After a positive YOLOE detection, walk forward to bring the
@@ -2462,17 +2484,38 @@ def _approach_and_confirm_detection(
         f"  [confirm-approach] source={source} target='{target}' "
         f"label='{label}' surrogate='{surrogate_cat or 'none'}'"
     )
-    if target_cell is not None:
+
+    def _final_confirmation(stage: str) -> bool:
         try:
-            face_toward_pos(
-                robot,
-                float(target_cell[0]),
-                float(target_cell[1]),
-                smooth=True,
-                label=f"Acercamiento: orientar {target}",
-            )
+            fine_visual_center(robot, confirm_session, label)
+        except Exception:
+            pass
+        obs = robot.sim.get_sensor_observations(0)
+        if "color_sensor" not in obs:
+            return False
+        frame = obs["color_sensor"][:, :, :3]
+        try:
+            detected, ann_rgb, _bbox = confirm_session.check(frame)
         except Exception as exc:
-            print(f"  [confirm-approach] face target failed: {exc}")
+            print(f"  [confirm-approach] final confirmation retry after YOLOE error: {exc}")
+            retry_confirm = get_session(label, conf_thresh=_confirm_conf_thresh())
+            if retry_confirm is None:
+                return False
+            detected, ann_rgb, _bbox = retry_confirm.check(frame)
+        if ann_rgb is not None:
+            show_obs(
+                robot,
+                f"Confirmación final cercana: {target}",
+                yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
+            )
+        else:
+            show_obs(robot, f"Confirmación final cercana: {target}")
+        if detected:
+            freeze_found_target(target, ann_rgb, target_cell)
+            print(f"  [confirm-approach] ✓ Confirmado desde cerca: '{target}' ({stage}).")
+            return True
+        print(f"  [confirm-approach] Aún no confirmado tras {stage}.")
+        return False
 
     try:
         fine_visual_center(robot, approach_session, label)
@@ -2486,34 +2529,9 @@ def _approach_and_confirm_detection(
             except Exception as retry_exc:
                 print(f"  [confirm-approach] visual centering retry skipped: {retry_exc}")
 
-    if target_cell is not None:
-        try:
-            _planned_approach_to_target_cell(
-                robot,
-                target_cell,
-                rgb_map_2d=rgb_map_2d,
-                heatmap=heatmap,
-                room_mask=room_mask,
-            )
-        except Exception as exc:
-            print(f"  [confirm-approach] target-cell approach skipped: {exc}")
-
-    if surrogate_cat:
-        try:
-            _planned_approach_to_surrogate(
-                robot,
-                surrogate_cat,
-                rgb_map_2d=rgb_map_2d,
-                heatmap=heatmap,
-                path_cells=path_cells,
-                standoff_m=0.35,
-                room_mask=room_mask,
-            )
-        except Exception as exc:
-            print(f"  [confirm-approach] planned approach skipped: {exc}")
-
+    advanced_visually = False
     try:
-        close_approach_after_detection(
+        advanced_visually = close_approach_after_detection(
             robot,
             approach_session,
             label,
@@ -2542,36 +2560,56 @@ def _approach_and_confirm_detection(
             except Exception as retry_exc:
                 print(f"  [confirm-approach] close approach retry skipped: {retry_exc}")
 
-    try:
-        fine_visual_center(robot, confirm_session, label)
-    except Exception:
-        pass
-
-    obs = robot.sim.get_sensor_observations(0)
-    if "color_sensor" not in obs:
-        return False
-    frame = obs["color_sensor"][:, :, :3]
-    try:
-        detected, ann_rgb, _bbox = confirm_session.check(frame)
-    except Exception as exc:
-        print(f"  [confirm-approach] final confirmation retry after YOLOE error: {exc}")
-        confirm_session = get_session(label, conf_thresh=_confirm_conf_thresh())
-        if confirm_session is None:
-            return False
-        detected, ann_rgb, _bbox = confirm_session.check(frame)
-    if ann_rgb is not None:
-        show_obs(
-            robot,
-            f"Confirmación final cercana: {target}",
-            yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
-        )
-    else:
-        show_obs(robot, f"Confirmación final cercana: {target}")
-
-    if detected:
-        freeze_found_target(target, ann_rgb, target_cell)
-        print(f"  [confirm-approach] ✓ Confirmado desde cerca: '{target}'.")
+    if _final_confirmation("acercamiento visual"):
         return True
+
+    # Only now use map-based planning, and only as a fallback. For visual
+    # detections, a projected target cell is approximate; using it before the
+    # visual servo causes the robot to rotate away from the seen object.
+    if not advanced_visually:
+        fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
+        if fresh_target_cell is not None:
+            try:
+                _planned_approach_to_target_cell(
+                    robot,
+                    fresh_target_cell,
+                    rgb_map_2d=rgb_map_2d,
+                    heatmap=heatmap,
+                    room_mask=room_mask,
+                )
+            except Exception as exc:
+                print(f"  [confirm-approach] target-cell approach skipped: {exc}")
+        elif surrogate_cat:
+            try:
+                _planned_approach_to_surrogate(
+                    robot,
+                    surrogate_cat,
+                    rgb_map_2d=rgb_map_2d,
+                    heatmap=heatmap,
+                    path_cells=path_cells,
+                    standoff_m=0.35,
+                    room_mask=room_mask,
+                )
+            except Exception as exc:
+                print(f"  [confirm-approach] planned approach skipped: {exc}")
+
+        try:
+            fine_visual_center(robot, approach_session, label)
+            close_approach_after_detection(
+                robot,
+                approach_session,
+                label,
+                surrogate_cat=surrogate_cat,
+                rgb_map_2d=rgb_map_2d,
+                heatmap=heatmap,
+                path_cells=path_cells,
+                room_mask=room_mask,
+            )
+        except Exception as exc:
+            print(f"  [confirm-approach] fallback visual approach skipped: {exc}")
+        if _final_confirmation("respaldo planificado"):
+            return True
+
     print(f"  [confirm-approach] ✗ No confirmado desde cerca: '{target}'.")
     return False
 
