@@ -92,6 +92,54 @@ _MANUAL_TABLE: Dict[str, Dict[str, float]] = {
     "appliances":   {"kitchen": 0.7, "laundry": 0.5},
     "window":       {"living": 0.4, "bedroom": 0.4, "kitchen": 0.3},
     "furniture":    {"living": 0.4, "bedroom": 0.4, "office": 0.3},
+    # ── level-3 small objects (added for open-vocab evaluation) ──────────
+    # kitchen appliances
+    "kettle":       {"kitchen": 1.0},
+    "toaster":      {"kitchen": 1.0},
+    "coffee maker": {"kitchen": 1.0},
+    "coffee machine": {"kitchen": 1.0},
+    "blender":      {"kitchen": 1.0},
+    "mug":          {"kitchen": 0.8, "dining": 0.5, "living": 0.3, "office": 0.3},
+    "cup":          {"kitchen": 0.8, "dining": 0.5, "living": 0.3},
+    "plate":        {"kitchen": 0.8, "dining": 0.7},
+    "bowl":         {"kitchen": 0.8, "dining": 0.6},
+    # office equipment
+    "printer":      {"office": 1.0, "bedroom": 0.2},
+    "keyboard":     {"office": 1.0, "bedroom": 0.3},
+    "mouse":        {"office": 1.0, "bedroom": 0.3},
+    "book":         {"office": 0.7, "bedroom": 0.6, "living": 0.5},
+    "notebook":     {"office": 0.8, "bedroom": 0.4},
+    "ipad":         {"office": 0.7, "living": 0.6, "bedroom": 0.5},
+    "iphone":       {"bedroom": 0.6, "living": 0.5, "office": 0.4},
+    "phone":        {"bedroom": 0.5, "living": 0.5, "office": 0.4},
+    # bathroom / hygiene
+    "soap":         {"bathroom": 1.0, "kitchen": 0.3},
+    "towel":        {"bathroom": 1.0, "laundry": 0.3},
+    "toothbrush":   {"bathroom": 1.0},
+    "shampoo":      {"bathroom": 1.0},
+    # bedroom / living
+    "blanket":      {"bedroom": 0.9, "living": 0.5},
+    "pillow":       {"bedroom": 0.9, "living": 0.4},
+    "shoes":        {"bedroom": 0.8, "hallway": 0.7, "closet": 0.9},
+    "basketball":   {"living": 0.8, "bedroom": 0.5, "hallway": 0.3},
+    "ball":         {"living": 0.8, "bedroom": 0.5, "hallway": 0.3},
+    "guitar":       {"living": 0.7, "bedroom": 0.6, "office": 0.3},
+    "bicycle":      {"hallway": 0.7, "garage": 0.9, "living": 0.3},
+    # waste / utility
+    "trash bin":    {"kitchen": 0.8, "bathroom": 0.6, "bedroom": 0.3, "office": 0.3},
+    "trash can":    {"kitchen": 0.8, "bathroom": 0.6, "bedroom": 0.3},
+    "waste bin":    {"bathroom": 0.8, "bedroom": 0.5, "kitchen": 0.6, "office": 0.4},
+    "bin":          {"kitchen": 0.7, "bathroom": 0.6},
+    # misc functional
+    "umbrella":     {"hallway": 0.9, "entry": 0.9, "bedroom": 0.3},
+    "clock":        {"bedroom": 0.8, "living": 0.6, "office": 0.5},
+    "magazine":     {"living": 0.8, "bedroom": 0.4, "office": 0.3},
+    "newspaper":    {"living": 0.7, "kitchen": 0.5},
+    "suitcase":     {"bedroom": 0.8, "hallway": 0.5, "closet": 0.7},
+    "backpack":     {"hallway": 0.7, "bedroom": 0.6, "office": 0.5},
+    "bag":          {"hallway": 0.6, "bedroom": 0.5, "living": 0.4},
+    "toy":          {"bedroom": 0.8, "living": 0.5},
+    "drill":        {"storage": 1.0, "garage": 0.9, "utility": 0.8, "office": 0.4, "laundry": 0.3},
 }
 
 # ── Semantic room alias table ────────────────────────────────────────────────
@@ -148,6 +196,19 @@ _CO_OCCURRENCE: Dict[str, Dict[str, float]] = {
     "laptop":       {"office": 0.6, "bedroom": 0.3},
     "washer":       {"laundry": 0.8},
     "dryer":        {"laundry": 0.8},
+    # level-3 object co-occurrence signals
+    "printer":      {"office": 0.8},
+    "keyboard":     {"office": 0.8},
+    "toaster":      {"kitchen": 0.8},
+    "kettle":       {"kitchen": 0.8},
+    "coffee maker": {"kitchen": 0.8},
+    "blender":      {"kitchen": 0.7},
+    "mug":          {"kitchen": 0.6, "office": 0.3},
+    "trash bin":    {"kitchen": 0.6, "bathroom": 0.5},
+    "shoes":        {"bedroom": 0.6, "hallway": 0.7},
+    "basketball":   {"living": 0.7},
+    "ball":         {"living": 0.6},
+    "drill":        {"storage": 0.9, "garage": 0.8, "utility": 0.7},
 }
 
 

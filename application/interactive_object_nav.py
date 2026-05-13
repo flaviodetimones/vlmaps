@@ -65,11 +65,10 @@ _frozen_target_cell = None    # last confirmed map target marker
 _ORIGINAL_CV2_IMSHOW = cv2.imshow
 _UI_COMPACT_ENV = "VLMAPS_UI_COMPACT"
 _UI_TILE_ENV = "VLMAPS_UI_TILE"
-_UI_ALLOWED_WINDOWS = {"Room debug overlay", "Semantic Map", "1st person"}
+_UI_ALLOWED_WINDOWS = {"Semantic Map", "1st person"}
 _UI_WINDOW_POSITIONS = {
-    "Room debug overlay": (20, 40),
+    "1st person": (20, 40),
     "Semantic Map": (760, 40),
-    "1st person": (20, 610),
 }
 
 
@@ -119,6 +118,7 @@ _ROOM_EXPLORE_POINTS_PER_REFERENCE_ENV = "VLMAPS_EXPLORE_POINTS_PER_REFERENCE"
 _ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
 _ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
 _ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
+_ROOM_EXPLORE_FOCUS_RADIUS_ENV = "VLMAPS_EXPLORE_FOCUS_RADIUS_M"
 _APPROACH_MIN_CLEARANCE_ENV = "VLMAPS_APPROACH_MIN_CLEARANCE_CELLS"
 _APPROACH_RAW_FALLBACK_ENV = "VLMAPS_APPROACH_RAW_FALLBACK"
 
@@ -128,10 +128,10 @@ _DEFAULT_SCAN_DEDUP_RADIUS_M = 1.5
 _DEFAULT_YOLOE_LOW_THRESH = 0.40
 _DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
-_DEFAULT_ROOM_EXPLORE_MIN_POINTS = 3
-_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 12
-_DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 10.0
-_DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 6
+_DEFAULT_ROOM_EXPLORE_MIN_POINTS = 4
+_DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 9
+_DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 12.0
+_DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 4
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
 
@@ -1044,19 +1044,6 @@ def validate_and_show_room_layers(scene_dir: Path, dataset_type: str, room_provi
         out_path = debug_dir / "room_debug_overlay.png"
         cv2.imwrite(str(out_path), overlay)
         print(f"[room-debug] Overlay guardado: {out_path}")
-        if not is_eval_headless():
-            view = overlay
-            max_side = max(view.shape[:2])
-            max_display_side = 720 if _compact_ui_enabled() else 1000
-            if max_side > max_display_side:
-                scale = float(max_display_side) / float(max_side)
-                view = cv2.resize(
-                    view,
-                    (max(1, int(view.shape[1] * scale)), max(1, int(view.shape[0] * scale))),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            safe_imshow("Room debug overlay", view)
-            ui_wait(500)
 
 
 # ── Navigation helpers ────────────────────────────────────────────────────────
@@ -2615,19 +2602,28 @@ def _approach_and_confirm_detection(
             if retry_confirm is None:
                 return False
             detected, ann_rgb, _bbox = retry_confirm.check(frame)
-        if ann_rgb is not None:
+        if detected and ann_rgb is not None:
             show_obs(
                 robot,
-                f"Confirmación final cercana: {target}",
+                f"Confirmado cerca ({_confirm_conf_thresh():.2f}+): {target}",
+                yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
+            )
+        elif ann_rgb is not None:
+            show_obs(
+                robot,
+                f"Verificación cercana sin confirmar: {target}",
                 yoloe_frame_bgr=cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR),
             )
         else:
-            show_obs(robot, f"Confirmación final cercana: {target}")
+            show_obs(robot, f"Verificación cercana sin confirmar: {target}")
         if detected:
             freeze_found_target(target, ann_rgb, target_cell)
             print(f"  [confirm-approach] ✓ Confirmado desde cerca: '{target}' ({stage}).")
             return True
-        print(f"  [confirm-approach] Aún no confirmado tras {stage}.")
+        print(
+            f"  [confirm-approach] Aún no confirmado tras {stage} "
+            f"(requiere YOLOE >= {_confirm_conf_thresh():.2f})."
+        )
         return False
 
     try:
@@ -2642,62 +2638,25 @@ def _approach_and_confirm_detection(
             except Exception as retry_exc:
                 print(f"  [confirm-approach] visual centering retry skipped: {retry_exc}")
 
-    advanced_visually = False
-    try:
-        advanced_visually = close_approach_after_detection(
-            robot,
-            approach_session,
-            label,
-            surrogate_cat=surrogate_cat,
-            rgb_map_2d=rgb_map_2d,
-            heatmap=heatmap,
-            path_cells=path_cells,
-            room_mask=room_mask,
-        )
-    except Exception as exc:
-        print(f"  [confirm-approach] close approach skipped: {exc}")
-        retry_session = get_session(label, conf_thresh=approach_retry_thresh)
-        if retry_session is not None:
-            approach_session = retry_session
-            try:
-                close_approach_after_detection(
-                    robot,
-                    approach_session,
-                    label,
-                    surrogate_cat=surrogate_cat,
-                    rgb_map_2d=rgb_map_2d,
-                    heatmap=heatmap,
-                    path_cells=path_cells,
-                    room_mask=room_mask,
-                )
-            except Exception as retry_exc:
-                print(f"  [confirm-approach] close approach retry skipped: {retry_exc}")
-
-    if _final_confirmation("acercamiento visual"):
-        return True
-
-    # Only now use map-based planning, and only as a fallback. If the visual
-    # servo moved but still did not reach the high confirmation threshold, keep
-    # trying from the nearest viable standoff to the projected object instead of
-    # abandoning the detection and returning to the circuit.
+    planned_first = False
     if target_cell is not None or surrogate_cat:
         fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
         if fresh_target_cell is not None:
             try:
-                _planned_approach_to_target_cell(
+                planned_first = _planned_approach_to_target_cell(
                     robot,
                     fresh_target_cell,
                     rgb_map_2d=rgb_map_2d,
                     heatmap=heatmap,
                     room_mask=room_mask,
-                    min_dist_cells=2.5,
-                    max_dist_cells=12.0,
+                    min_dist_cells=2.0,
+                    max_dist_cells=14.0,
                 )
             except Exception as exc:
                 print(f"  [confirm-approach] target-cell approach skipped: {exc}")
         elif surrogate_cat:
             try:
-                _planned_approach_to_surrogate(
+                planned_first = _planned_approach_to_surrogate(
                     robot,
                     surrogate_cat,
                     rgb_map_2d=rgb_map_2d,
@@ -2709,21 +2668,60 @@ def _approach_and_confirm_detection(
             except Exception as exc:
                 print(f"  [confirm-approach] planned approach skipped: {exc}")
 
+        if planned_first and _final_confirmation("aproximación planificada"):
+            return True
+
+    try:
+        advanced_visually = close_approach_after_detection(
+            robot,
+            approach_session,
+            label,
+            surrogate_cat=surrogate_cat,
+            rgb_map_2d=rgb_map_2d,
+            heatmap=heatmap,
+            path_cells=path_cells,
+            room_mask=room_mask,
+            max_steps=4,
+            min_clearance_cells=_approach_min_clearance_cells(),
+        )
+    except Exception as exc:
+        print(f"  [confirm-approach] close approach skipped: {exc}")
+        retry_session = get_session(label, conf_thresh=approach_retry_thresh)
+        if retry_session is not None:
+            approach_session = retry_session
+            try:
+                advanced_visually = close_approach_after_detection(
+                    robot,
+                    approach_session,
+                    label,
+                    surrogate_cat=surrogate_cat,
+                    rgb_map_2d=rgb_map_2d,
+                    heatmap=heatmap,
+                    path_cells=path_cells,
+                    room_mask=room_mask,
+                    max_steps=4,
+                    min_clearance_cells=_approach_min_clearance_cells(),
+                )
+            except Exception as retry_exc:
+                print(f"  [confirm-approach] close approach retry skipped: {retry_exc}")
+
+    if _final_confirmation("acercamiento visual corto"):
+        return True
+
+    if not planned_first and surrogate_cat:
         try:
-            fine_visual_center(robot, approach_session, label)
-            close_approach_after_detection(
+            planned_first = _planned_approach_to_surrogate(
                 robot,
-                approach_session,
-                label,
-                surrogate_cat=surrogate_cat,
+                surrogate_cat,
                 rgb_map_2d=rgb_map_2d,
                 heatmap=heatmap,
                 path_cells=path_cells,
+                standoff_m=0.45,
                 room_mask=room_mask,
             )
         except Exception as exc:
-            print(f"  [confirm-approach] fallback visual approach skipped: {exc}")
-        if _final_confirmation("respaldo planificado"):
+            print(f"  [confirm-approach] surrogate fallback skipped: {exc}")
+        if planned_first and _final_confirmation("respaldo por mueble"):
             return True
 
     print(f"  [confirm-approach] ✗ No confirmado desde cerca: '{target}'.")
@@ -3961,6 +3959,44 @@ def _cluster_room_candidates(
     return chosen[:k]
 
 
+def _focused_navigable_from_heatmap(
+    heatmap: Optional[np.ndarray],
+    room_mask: np.ndarray,
+    navigable: np.ndarray,
+    cell_size: float,
+) -> Tuple[Optional[np.ndarray], str]:
+    """Return navigable cells near semantic support evidence, if useful."""
+    if heatmap is None or heatmap.shape[:2] != room_mask.shape[:2]:
+        return None, ""
+    heat = np.asarray(heatmap, dtype=np.float32)
+    finite_room = room_mask & np.isfinite(heat)
+    vals = heat[finite_room]
+    vals = vals[vals > 0]
+    if vals.size < 5:
+        return None, ""
+
+    threshold = max(float(np.percentile(vals, 85)), float(vals.max()) * 0.55)
+    hot = finite_room & (heat >= threshold)
+    if int(hot.sum()) < 3:
+        return None, ""
+
+    radius_m = _env_float(_ROOM_EXPLORE_FOCUS_RADIUS_ENV, 1.15, 0.1)
+    radius_cells = max(1, int(round(radius_m / max(cell_size, 1e-6))))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (radius_cells * 2 + 1, radius_cells * 2 + 1),
+    )
+    focus = cv2.dilate(hot.astype(np.uint8), kernel, iterations=1).astype(bool)
+    focus_nav = navigable & focus
+    if int(focus_nav.sum()) < 30:
+        return None, ""
+    desc = (
+        f"foco semántico: hot={int(hot.sum())} nav={int(focus_nav.sum())} "
+        f"radio={radius_m:.2f}m umbral={threshold:.3f}"
+    )
+    return focus_nav, desc
+
+
 def _generate_room_exploration_points(
     robot,
     room_name: str,
@@ -3971,6 +4007,7 @@ def _generate_room_exploration_points(
     max_points: int,
     min_clearance_cells: float = 2.0,
     target: str = "",
+    focus_heatmap: Optional[np.ndarray] = None,
 ) -> List[Tuple[int, int]]:
     """Generate a distributed circuit of viewpoints over the navigable room."""
     if obs_map is None:
@@ -3986,18 +4023,28 @@ def _generate_room_exploration_points(
 
     navigable_area = int(navigable.sum())
     cell_size = max(float(getattr(robot, "cs", 0.05) or 0.05), 1e-6)
+    focus_navigable, focus_desc = _focused_navigable_from_heatmap(
+        focus_heatmap,
+        room_mask,
+        navigable,
+        cell_size,
+    )
+    count_mask = focus_navigable if focus_navigable is not None else navigable
+    count_area = int(count_mask.sum())
     target_points, ref_area, point_mode = _scaled_room_exploration_point_count(
         room_name,
         room_provider,
         obs_map,
-        navigable,
-        navigable_area,
+        count_mask,
+        count_area,
         max_points,
         cell_size,
     )
+    focus_suffix = f"; {focus_desc}" if focus_desc else ""
     print(
         f"  [zone-explore] Área navegable '{room_name}': {navigable_area} celdas; "
         f"referencia n={ref_area:.0f}; puntos={target_points} ({point_mode})"
+        f"{focus_suffix}"
     )
 
     dist_obs = distance_transform_edt(free_map)
@@ -4027,10 +4074,11 @@ def _generate_room_exploration_points(
         )
     exclusion = exclusion_u8.astype(bool)
 
+    selection_domain = focus_navigable if focus_navigable is not None else navigable
     levels = [
-        ("A", float(min_clearance_cells), navigable & (dist_obs >= float(min_clearance_cells)) & ~exclusion),
-        ("B", 2.0, navigable & (dist_obs >= 2.0) & ~exclusion),
-        ("C", 0.0, navigable & ~exclusion),
+        ("A", float(min_clearance_cells), selection_domain & (dist_obs >= float(min_clearance_cells)) & ~exclusion),
+        ("B", 2.0, selection_domain & (dist_obs >= 2.0) & ~exclusion),
+        ("C", 0.0, selection_domain & ~exclusion),
     ]
     level_counts = {name: int(mask.sum()) for name, _clearance, mask in levels}
     print(
@@ -4048,7 +4096,7 @@ def _generate_room_exploration_points(
             continue
         points = _cluster_room_candidates(
             level_mask,
-            navigable,
+            selection_domain,
             dist_obs,
             target_points,
             requested_sep_cells,
@@ -4056,7 +4104,7 @@ def _generate_room_exploration_points(
         )
         if not points:
             continue
-        coverage = _coverage_ratio(navigable, points, coverage_radius_cells)
+        coverage = _coverage_ratio(selection_domain, points, coverage_radius_cells)
         mean_clearance = float(np.mean([dist_obs[row, col] for row, col in points])) if points else 0.0
         score = coverage * 100.0 + min(len(points), target_points) * 2.0 + mean_clearance * 0.05 - level_idx * 1.5
         if score > best_score:
@@ -4071,7 +4119,7 @@ def _generate_room_exploration_points(
         return []
 
     ordered = _nearest_neighbor_circuit(best_points[:target_points], current)
-    final_coverage = _coverage_ratio(navigable, ordered, coverage_radius_cells)
+    final_coverage = _coverage_ratio(selection_domain, ordered, coverage_radius_cells)
     print(
         f"  [zone-explore] Nivel elegido={best_level}; cobertura≈{final_coverage * 100:.1f}% "
         f"a {coverage_radius_cells * cell_size:.2f} m; separación objetivo={min_sep_m:.2f} m"
@@ -4357,6 +4405,7 @@ def explore_room_zone_with_yoloe(
         max_points=max_points,
         min_clearance_cells=min_clearance_cells,
         target=target,
+        focus_heatmap=heatmap,
     )
     if search_state is not None:
         search_state.record_zone_exploration(points)
@@ -4912,7 +4961,7 @@ def main(config: DictConfig) -> None:
             _candidate = re.sub(r"[\.,!?]+$", "", _candidate).strip()
             if _candidate and _candidate in (
                 _STRICT_LIKELY_ROOM_TARGETS | {"book", "bottle", "mug", "cup",
-                "teapot", "kettle", "toaster", "coffee maker", "laptop"}
+                "teapot", "kettle", "toaster", "coffee maker", "laptop", "drill"}
             ):
                 print(f"  [parser-fallback] Empty parse — using '{_candidate}' from instruction")
                 categories = [_candidate]

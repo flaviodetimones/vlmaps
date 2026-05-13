@@ -58,6 +58,28 @@ _OBJECT_TO_SURROGATES: Dict[str, List[str]] = {
     "towel":      ["bathtub", "shower", "sink"],
     "candle":     ["table", "shelf", "counter"],
     "plant":      ["table", "shelf", "floor"],
+    "basket":     ["shelf", "cabinet", "counter", "table", "floor"],
+    "printer":        ["desk", "table", "cabinet"],
+    "teapot":         ["table", "counter", "shelf"],
+    # level-3 kitchen appliances (added for open-vocab evaluation)
+    "toaster":        ["counter", "table"],
+    "coffee maker":   ["counter", "table"],
+    "coffee machine": ["counter", "table"],
+    "blender":        ["counter", "table"],
+    "trash bin":      ["floor", "counter", "cabinet"],
+    "trash can":      ["floor", "counter", "cabinet"],
+    "waste bin":      ["floor", "counter", "cabinet"],
+    # level-3 tech / misc
+    "basketball":     ["floor", "sofa", "chair"],
+    "shoes":          ["floor", "shelf", "cabinet"],
+    "umbrella":       ["floor", "cabinet", "shelf"],
+    "suitcase":       ["floor", "shelf"],
+    "blanket":        ["sofa", "bed", "chair"],
+    "magazine":       ["table", "sofa", "shelf"],
+    "newspaper":      ["table", "sofa", "counter"],
+    "ipad":           ["table", "desk", "sofa", "bed"],
+    "iphone":         ["table", "desk", "sofa", "bed"],
+    "drill":          ["shelf", "cabinet", "table", "desk", "counter"],
 }
 
 
