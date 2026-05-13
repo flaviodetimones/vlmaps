@@ -120,6 +120,7 @@ _ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
 _ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
 _ROOM_EXPLORE_FOCUS_RADIUS_ENV = "VLMAPS_EXPLORE_FOCUS_RADIUS_M"
 _APPROACH_MIN_CLEARANCE_ENV = "VLMAPS_APPROACH_MIN_CLEARANCE_CELLS"
+_APPROACH_MAX_STEPS_ENV = "VLMAPS_APPROACH_MAX_STEPS"
 _APPROACH_RAW_FALLBACK_ENV = "VLMAPS_APPROACH_RAW_FALLBACK"
 
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 6
@@ -134,6 +135,7 @@ _DEFAULT_ROOM_EXPLORE_REFERENCE_AREA_M2 = 12.0
 _DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 4
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
+_DEFAULT_APPROACH_MAX_STEPS = 18
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -196,6 +198,14 @@ def _approach_min_clearance_cells() -> float:
         _APPROACH_MIN_CLEARANCE_ENV,
         _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS,
         0.0,
+    )
+
+
+def _approach_max_steps() -> int:
+    return _env_int(
+        _APPROACH_MAX_STEPS_ENV,
+        _DEFAULT_APPROACH_MAX_STEPS,
+        1,
     )
 
 
@@ -2639,39 +2649,11 @@ def _approach_and_confirm_detection(
                 print(f"  [confirm-approach] visual centering retry skipped: {retry_exc}")
 
     planned_first = False
-    if target_cell is not None or surrogate_cat:
-        fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
-        if fresh_target_cell is not None:
-            try:
-                planned_first = _planned_approach_to_target_cell(
-                    robot,
-                    fresh_target_cell,
-                    rgb_map_2d=rgb_map_2d,
-                    heatmap=heatmap,
-                    room_mask=room_mask,
-                    min_dist_cells=2.0,
-                    max_dist_cells=14.0,
-                )
-            except Exception as exc:
-                print(f"  [confirm-approach] target-cell approach skipped: {exc}")
-        elif surrogate_cat:
-            try:
-                planned_first = _planned_approach_to_surrogate(
-                    robot,
-                    surrogate_cat,
-                    rgb_map_2d=rgb_map_2d,
-                    heatmap=heatmap,
-                    path_cells=path_cells,
-                    standoff_m=0.35,
-                    room_mask=room_mask,
-                )
-            except Exception as exc:
-                print(f"  [confirm-approach] planned approach skipped: {exc}")
-
-        if planned_first and _final_confirmation("aproximación planificada"):
-            return True
-
     try:
+        print(
+            f"  [confirm-approach] Acercamiento visual máximo: "
+            f"hasta {_approach_max_steps()} paso(s) seguros antes de decidir."
+        )
         advanced_visually = close_approach_after_detection(
             robot,
             approach_session,
@@ -2681,7 +2663,7 @@ def _approach_and_confirm_detection(
             heatmap=heatmap,
             path_cells=path_cells,
             room_mask=room_mask,
-            max_steps=4,
+            max_steps=_approach_max_steps(),
             min_clearance_cells=_approach_min_clearance_cells(),
         )
     except Exception as exc:
@@ -2699,14 +2681,49 @@ def _approach_and_confirm_detection(
                     heatmap=heatmap,
                     path_cells=path_cells,
                     room_mask=room_mask,
-                    max_steps=4,
+                    max_steps=_approach_max_steps(),
                     min_clearance_cells=_approach_min_clearance_cells(),
                 )
             except Exception as retry_exc:
                 print(f"  [confirm-approach] close approach retry skipped: {retry_exc}")
 
-    if _final_confirmation("acercamiento visual corto"):
+    if _final_confirmation("acercamiento visual máximo"):
         return True
+
+    fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
+    if fresh_target_cell is not None:
+        try:
+            planned_first = _planned_approach_to_target_cell(
+                robot,
+                fresh_target_cell,
+                rgb_map_2d=rgb_map_2d,
+                heatmap=heatmap,
+                room_mask=room_mask,
+                min_dist_cells=1.0,
+                max_dist_cells=18.0,
+            )
+        except Exception as exc:
+            print(f"  [confirm-approach] target-cell fallback skipped: {exc}")
+        if planned_first and _final_confirmation("respaldo planificado al objeto"):
+            return True
+        if planned_first:
+            try:
+                advanced_visually = close_approach_after_detection(
+                    robot,
+                    approach_session,
+                    label,
+                    surrogate_cat=surrogate_cat,
+                    rgb_map_2d=rgb_map_2d,
+                    heatmap=heatmap,
+                    path_cells=path_cells,
+                    room_mask=room_mask,
+                    max_steps=max(6, _approach_max_steps() // 2),
+                    min_clearance_cells=_approach_min_clearance_cells(),
+                )
+            except Exception as exc:
+                print(f"  [confirm-approach] fallback close approach skipped: {exc}")
+            if _final_confirmation("respaldo planificado + acercamiento"):
+                return True
 
     if not planned_first and surrogate_cat:
         try:
@@ -4668,10 +4685,11 @@ def explore_room_zone_with_yoloe(
             )
             if search_state is not None:
                 search_state.record_false_positive_zone(false_cell[0], false_cell[1])
-            print(f"  [zone-explore] Falsa alarma en {false_cell}; se continúa.")
-            session_ref["low"] = get_session(target, conf_thresh=low_thresh)
-            if session_ref["low"] is None:
-                break
+            print(
+                f"  [zone-explore] Detección visual no confirmada en {false_cell}; "
+                "se detiene el circuito para no seguir explorando tras ver el objetivo."
+            )
+            return False, None
 
     print(f"  [zone-explore] Finalizada sin confirmar '{target}'.")
     return False, None
