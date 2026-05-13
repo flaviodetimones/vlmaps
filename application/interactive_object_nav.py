@@ -65,21 +65,12 @@ _frozen_target_cell = None    # last confirmed map target marker
 _ORIGINAL_CV2_IMSHOW = cv2.imshow
 _UI_COMPACT_ENV = "VLMAPS_UI_COMPACT"
 _UI_TILE_ENV = "VLMAPS_UI_TILE"
-_UI_DASHBOARD_ENV = "VLMAPS_UI_DASHBOARD"
-_UI_DASHBOARD_WINDOW = "VLMaps Dashboard"
 _UI_ALLOWED_WINDOWS = {"Room debug overlay", "Semantic Map", "1st person"}
 _UI_WINDOW_POSITIONS = {
     "Room debug overlay": (20, 40),
     "Semantic Map": (760, 40),
     "1st person": (20, 610),
 }
-_UI_DASHBOARD_SIZE = (1500, 900)  # width, height
-_UI_DASHBOARD_PANELS = {
-    "Room debug overlay": (0, 0, 750, 420),
-    "Semantic Map": (750, 0, 750, 420),
-    "1st person": (0, 420, 1500, 480),
-}
-_UI_DASHBOARD_FRAMES: Dict[str, np.ndarray] = {}
 
 
 def _raw_env_flag(name: str, default: bool = False) -> bool:
@@ -97,13 +88,7 @@ def _tile_ui_enabled() -> bool:
     return _raw_env_flag(_UI_TILE_ENV, False)
 
 
-def _dashboard_ui_enabled() -> bool:
-    return _raw_env_flag(_UI_DASHBOARD_ENV, False)
-
-
 def _filtered_cv2_imshow(name: str, img: np.ndarray) -> None:
-    if _dashboard_ui_enabled() and str(name) != _UI_DASHBOARD_WINDOW:
-        return
     if _compact_ui_enabled() and str(name) not in _UI_ALLOWED_WINDOWS:
         return
     _ORIGINAL_CV2_IMSHOW(name, img)
@@ -299,95 +284,9 @@ def ui_wait(delay_ms: int) -> int:
     return cv2.waitKey(delay_ms)
 
 
-def _letterbox_panel(img: Optional[np.ndarray], title: str, width: int, height: int) -> np.ndarray:
-    panel = np.full((max(1, int(height)), max(1, int(width)), 3), (20, 24, 30), dtype=np.uint8)
-    title_h = 28
-    cv2.rectangle(panel, (0, 0), (panel.shape[1] - 1, title_h), (36, 44, 56), -1)
-    cv2.putText(
-        panel,
-        title,
-        (10, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (235, 240, 245),
-        1,
-        cv2.LINE_AA,
-    )
-    if img is None:
-        cv2.putText(
-            panel,
-            "waiting for frame",
-            (max(10, width // 2 - 95), max(title_h + 40, height // 2)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (150, 160, 170),
-            1,
-            cv2.LINE_AA,
-        )
-        return panel
-
-    frame = img
-    if frame.ndim == 2:
-        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    elif frame.shape[2] == 4:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-    frame = np.ascontiguousarray(frame)
-
-    body_h = max(1, height - title_h)
-    scale = min(float(width) / max(1, frame.shape[1]), float(body_h) / max(1, frame.shape[0]))
-    out_w = max(1, int(round(frame.shape[1] * scale)))
-    out_h = max(1, int(round(frame.shape[0] * scale)))
-    resized = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-    x0 = max(0, (width - out_w) // 2)
-    y0 = title_h + max(0, (body_h - out_h) // 2)
-    panel[y0:y0 + out_h, x0:x0 + out_w] = resized
-    return panel
-
-
-def _render_dashboard() -> np.ndarray:
-    width, height = _UI_DASHBOARD_SIZE
-    canvas = np.full((height, width, 3), (12, 14, 18), dtype=np.uint8)
-    for name, (x, y, w, h) in _UI_DASHBOARD_PANELS.items():
-        title = {
-            "Room debug overlay": "Room debug overlay: LabelMe + Voronoi",
-            "Semantic Map": "Semantic map",
-            "1st person": "First person",
-        }.get(name, name)
-        panel = _letterbox_panel(_UI_DASHBOARD_FRAMES.get(name), title, w, h)
-        canvas[y:y + h, x:x + w] = panel
-        cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), (90, 100, 115), 1)
-    return canvas
-
-
-def _show_dashboard_panel(name: str, img: np.ndarray) -> None:
-    if name not in _UI_ALLOWED_WINDOWS:
-        return
-    if _UI_DASHBOARD_WINDOW in _closed_windows:
-        return
-    _UI_DASHBOARD_FRAMES[name] = img.copy()
-    try:
-        if _UI_DASHBOARD_WINDOW in _shown_windows:
-            prop = cv2.getWindowProperty(_UI_DASHBOARD_WINDOW, cv2.WND_PROP_VISIBLE)
-            if prop < 1:
-                _closed_windows.add(_UI_DASHBOARD_WINDOW)
-                return
-        _ORIGINAL_CV2_IMSHOW(_UI_DASHBOARD_WINDOW, _render_dashboard())
-        _shown_windows.add(_UI_DASHBOARD_WINDOW)
-        if _tile_ui_enabled():
-            try:
-                cv2.moveWindow(_UI_DASHBOARD_WINDOW, 20, 40)
-            except Exception:
-                pass
-    except Exception:
-        _closed_windows.add(_UI_DASHBOARD_WINDOW)
-
-
 def safe_imshow(name: str, img: np.ndarray) -> None:
     """Show img in a named window. If the user closed it, skip silently."""
     if is_eval_headless():
-        return
-    if _dashboard_ui_enabled():
-        _show_dashboard_panel(name, img)
         return
     if _compact_ui_enabled() and name not in _UI_ALLOWED_WINDOWS:
         return
