@@ -126,7 +126,7 @@ _DEFAULT_ROOM_EXPLORE_MAX_POINTS = 6
 _DEFAULT_ROOM_EXPLORE_TIMEOUT_S = 60.0
 _DEFAULT_SCAN_DEDUP_RADIUS_M = 1.5
 _DEFAULT_YOLOE_LOW_THRESH = 0.40
-_DEFAULT_YOLOE_CONFIRM_THRESH = 0.80
+_DEFAULT_YOLOE_CONFIRM_THRESH = 0.75
 _DEFAULT_MAX_APPROACH_ATTEMPTS = 3
 _DEFAULT_ROOM_EXPLORE_MIN_POINTS = 4
 _DEFAULT_ROOM_EXPLORE_MAX_POINTS_CAP = 9
@@ -4156,6 +4156,59 @@ def _best_heatmap_cell_in_mask(
     return int(row), int(col)
 
 
+def _nearest_heatmap_evidence_cell(
+    heatmap: Optional[np.ndarray],
+    room_mask: Optional[np.ndarray],
+    anchor_cell: Optional[Tuple[int, int]],
+) -> Optional[Tuple[int, int]]:
+    """Nearest strong semantic support cell inside the active room."""
+    if heatmap is None or room_mask is None or anchor_cell is None:
+        return None
+    if heatmap.shape[:2] != room_mask.shape[:2]:
+        return None
+
+    valid = room_mask & np.isfinite(heatmap)
+    values = heatmap[valid]
+    values = values[values > 0]
+    if values.size == 0:
+        return None
+
+    # Keep only strong local evidence. Falling back to the absolute best cell
+    # avoids returning arbitrary low heatmap noise when the room has sparse data.
+    threshold = max(float(np.percentile(values, 80.0)), float(values.max()) * 0.50)
+    hot = valid & (heatmap >= threshold)
+    if not bool(hot.any()):
+        return _best_heatmap_cell_in_mask(heatmap, room_mask)
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        hot.astype(np.uint8), connectivity=8
+    )
+    if n_labels <= 1:
+        return _best_heatmap_cell_in_mask(heatmap, room_mask)
+
+    anchor = np.asarray(anchor_cell, dtype=np.float32)
+    best_cell = None
+    best_score = float("inf")
+    for label_idx in range(1, n_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        cols_rows = centroids[label_idx]
+        centroid = np.asarray([cols_rows[1], cols_rows[0]], dtype=np.float32)
+        component_mask = labels == label_idx
+        component_values = heatmap[component_mask]
+        quality = float(np.nanmax(component_values)) if component_values.size else 0.0
+        distance = float(np.linalg.norm(centroid - anchor))
+        score = distance - 2.0 * quality
+        if score < best_score:
+            rr, cc = np.argwhere(component_mask)[
+                int(np.nanargmax(component_values)) if component_values.size else 0
+            ]
+            best_cell = (int(rr), int(cc))
+            best_score = score
+    return best_cell or _best_heatmap_cell_in_mask(heatmap, room_mask)
+
+
 def _forward_target_cell_from_view(
     robot,
     room_mask: Optional[np.ndarray],
@@ -4537,6 +4590,35 @@ def explore_room_zone_with_yoloe(
 
         trigger_hit = bool(trigger["hit"])
         trigger_cell = trigger["cell"]
+        local_heatmap_cell = _nearest_heatmap_evidence_cell(
+            heatmap,
+            room_mask,
+            trigger_cell or visited_cell or point,
+        ) or room_heatmap_cell
+        if not trigger_hit and local_heatmap_cell is not None:
+            print(
+                f"  [zone-explore] Orientando punto {idx}/{len(points)} "
+                f"hacia evidencia VLMaps cercana: {list(local_heatmap_cell)}"
+            )
+            face_toward_pos(
+                robot,
+                local_heatmap_cell[0],
+                local_heatmap_cell[1],
+                smooth=True,
+                label=f"Exploración {idx}/{len(points)}: mirando soporte",
+            )
+            show_map(
+                robot,
+                rgb_map_2d,
+                heatmap_2d=heatmap,
+                label=f"Exploración {idx}/{len(points)}: soporte VLMaps",
+                target_cell=list(local_heatmap_cell),
+                room_mask=room_mask,
+                exploration_points=points,
+                visited_points=visited_points,
+                current_exploration_point=point,
+            )
+
         if not trigger_hit and _scan_room_exploration_yaws(
                 robot,
                 session_ref["low"],
@@ -4574,7 +4656,7 @@ def explore_room_zone_with_yoloe(
                 path_cells=dense or path_cells,
                 search_state=search_state,
                 room_mask=room_mask,
-                target_cell=room_heatmap_cell,
+                target_cell=local_heatmap_cell,
             )
             if confirmed:
                 print(f"  [zone-explore] ✓ Confirmado '{target}' durante exploración.")
@@ -5050,6 +5132,11 @@ def main(config: DictConfig) -> None:
                 print(
                     f"  [room-hint] Room command '{_context_room}' will constrain "
                     f"object search target(s): {list(_implicit_room_pins.keys())}"
+                )
+                target_plans = [p for p in target_plans if p.room_goal is None]
+                print(
+                    "  [room-hint] Standalone room goal removed; object search "
+                    "will stage into the pinned room using the normal search flow."
                 )
 
         # Apply explicit room pins by replacing likely_rooms on matching plans.
