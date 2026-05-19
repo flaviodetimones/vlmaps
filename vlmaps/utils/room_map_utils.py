@@ -142,8 +142,8 @@ def render_room_map(
     scale: int = 1,
 ) -> np.ndarray:
     """Render the room segmentation as a labeled BGR image."""
-    gs = room_map.shape[0]
-    canvas = np.zeros((gs, gs, 3), dtype=np.uint8)
+    h, w = room_map.shape[:2]
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
     if rgb_bg is not None:
         canvas = (rgb_bg[:, :, ::-1] * 0.35).astype(np.uint8)  # dim RGB bg
@@ -164,7 +164,7 @@ def render_room_map(
                         cv2.LINE_AA)
 
     if scale > 1:
-        canvas = cv2.resize(canvas, (gs * scale, gs * scale),
+        canvas = cv2.resize(canvas, (w * scale, h * scale),
                             interpolation=cv2.INTER_NEAREST)
     return canvas
 

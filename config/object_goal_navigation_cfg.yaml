@@ -18,3 +18,9 @@ dataset_type: "mp3d"
 # Required only for HSSD — path to hssd-hab.scene_dataset_config.json
 # Override: scene_dataset_config_file=/workspace/data/hssd-hab/hssd-hab.scene_dataset_config.json
 scene_dataset_config_file: ""
+
+# Fuente de habitaciones:
+#   auto     -> prioriza room_map manual si existe; si no, usa HSSD en HSSD
+#   labelme  -> exige room_map manual
+#   semantic -> fuerza habitaciones automáticas de HSSD
+room_labels_source: "auto"

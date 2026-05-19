@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import re
+import unicodedata
 
 
 _NUMBER_WORDS = {
@@ -37,12 +38,41 @@ _NUMBER_WORDS = {
 }
 
 
+_ROOM_BASE_ALIASES = {
+    "cocina": "kitchen",
+    "salon": "living room",
+    "sala": "living room",
+    "sala de estar": "living room",
+    "comedor": "dining room",
+    "dormitorio": "bedroom",
+    "habitacion": "bedroom",
+    "cuarto": "bedroom",
+    "bano": "bathroom",
+    "aseo": "bathroom",
+    "lavanderia": "laundry room",
+    "oficina": "office",
+    "entrada": "entryway",
+    "recibidor": "entryway",
+    "trastero": "storage room",
+    "almacen": "storage room",
+    "despensa": "storage room",
+    "pasillo": "hallway",
+    "armario": "closet",
+}
+
+
 def _normalize_room_text(text: str) -> str:
     text = str(text or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = text.replace("_", " ").replace("-", " ")
     text = re.sub(r"\s*\.\s*", ".", text)
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def _canonical_room_base_alias(base: str) -> str:
+    return _ROOM_BASE_ALIASES.get(_normalize_room_text(base), _normalize_room_text(base))
 
 
 def _parse_room_instance(text: str) -> Tuple[str, Optional[int]]:
@@ -57,19 +87,26 @@ def _parse_room_instance(text: str) -> Tuple[str, Optional[int]]:
     q = _normalize_room_text(text)
     m = re.fullmatch(r"(.+?)\.(\d+)$", q)
     if m:
-        return m.group(1).strip(), int(m.group(2))
+        return _canonical_room_base_alias(m.group(1).strip()), int(m.group(2))
     m = re.fullmatch(r"(.+?)\s+(\d+)$", q)
     if m:
-        return m.group(1).strip(), int(m.group(2))
+        return _canonical_room_base_alias(m.group(1).strip()), int(m.group(2))
     m = re.fullmatch(r"(.+?)\s+([a-z]+)$", q)
     if m and m.group(2) in _NUMBER_WORDS:
-        return m.group(1).strip(), _NUMBER_WORDS[m.group(2)]
-    return q, None
+        return _canonical_room_base_alias(m.group(1).strip()), _NUMBER_WORDS[m.group(2)]
+    return _canonical_room_base_alias(q), None
 
 
 def _room_aliases(room_name: str) -> set:
     aliases = {_normalize_room_text(room_name)}
     base, idx = _parse_room_instance(room_name)
+    aliases.add(base)
+    for alias, canonical in _ROOM_BASE_ALIASES.items():
+        if canonical == base:
+            aliases.add(alias)
+            if idx is not None:
+                aliases.add(f"{alias} {idx}")
+                aliases.add(f"{alias}.{idx}")
     if idx is not None:
         aliases.add(f"{base} {idx}")
         aliases.add(f"{base}.{idx}")

@@ -71,7 +71,7 @@ def _ensure_yoloe_session(ctx: ExecutorContext):
     if ctx.yoloe_session is None:
         from vlmaps.utils.yoloe_utils import get_session, runtime_conf_thresh
 
-        ctx.yoloe_session = get_session(ctx.target, conf_thresh=runtime_conf_thresh(0.3))
+        ctx.yoloe_session = get_session(ctx.target, conf_thresh=runtime_conf_thresh(0.65))
     return ctx.yoloe_session
 
 

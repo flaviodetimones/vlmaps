@@ -37,8 +37,8 @@ class SceneConfig:
     # Directory containing collected RGB-D data and the built VLMap
     vlmap_data_dir: str = ""
 
-    # "labelme" (manual LabelMe annotation) or "semantic_scene_api" (automatic)
-    room_labels_source: str = "labelme"
+    # "auto" (prefer room_map manual), "labelme" or "semantic"
+    room_labels_source: str = "auto"
 
     # Path to placements.json for custom object placement — empty = disabled
     placements_json: str = ""
@@ -55,10 +55,12 @@ def from_hydra_config(cfg: DictConfig) -> SceneConfig:
         scene_dataset_config_file = str(scene_dataset_config_file)
 
     category_mode = dataset_type if dataset_type in ("mp3d", "hssd", "hm3d") else "mp3d"
+    room_labels_source = str(getattr(cfg, "room_labels_source", "auto"))
 
     return SceneConfig(
         dataset_type=dataset_type,
         scene_id=int(cfg.scene_id),
         scene_dataset_config_file=scene_dataset_config_file,
+        room_labels_source=room_labels_source,
         category_mode=category_mode,
     )

@@ -273,7 +273,14 @@ def main(config: DictConfig) -> None:
             instruction, categories, room_provider
         )
 
-        print(f"Targets: {categories}")
+        target_plans = base.build_resolved_target_plans(
+            categories,
+            room_provider=room_provider,
+            room_regions=room_regions,
+            available_categories=scene_categories,
+            present_categories=present_categories,
+        )
+        base.log_resolved_target_plans(target_plans)
 
         robot.set_agent_state(start_tf)
         robot._set_nav_curr_pose()
@@ -282,19 +289,28 @@ def main(config: DictConfig) -> None:
         base.show_map(robot, rgb_map_2d, label="Start")
 
         search_states = {}
-        for cat in categories:
-            target = cat.strip()
-            ss = SearchState(target, room_provider, robot.map.obstacles_map)
+        for plan in target_plans:
+            target = plan.canonical_target.strip()
+            ss = SearchState(
+                target,
+                room_provider,
+                robot.map.obstacles_map,
+                original_target=plan.original_target,
+                effective_target=plan.effective_target,
+                surrogate_categories=plan.surrogate_categories,
+                likely_rooms=plan.likely_rooms,
+                resolution_source=plan.resolution_source,
+            )
             if ss.rooms:
                 priors = ss.compute_priors()
                 if priors:
                     sorted_priors = sorted(priors.items(), key=lambda x: x[1], reverse=True)
                     prior_str = ", ".join(f"{r}={v:.2f}" for r, v in sorted_priors if v > 0.01)
                     print(f"  Room priors for '{target}': {prior_str}")
-            search_states[target] = ss
+            search_states[plan.original_target] = ss
 
-        for cat in categories:
-            target = cat.strip()
+        for plan in target_plans:
+            target = plan.canonical_target.strip()
             if not target:
                 continue
 
@@ -305,23 +321,34 @@ def main(config: DictConfig) -> None:
                 robot=robot,
                 rgb_map_2d=rgb_map_2d,
                 target=target,
+                original_target=plan.original_target,
+                effective_target=plan.effective_target,
+                surrogate_categories=list(plan.surrogate_categories),
+                likely_rooms=list(plan.likely_rooms),
+                resolution_source=plan.resolution_source,
                 room_provider=room_provider,
-                search_state=search_states.get(target),
+                search_state=search_states.get(plan.original_target),
             )
             sync_pose_state(ctx)
 
-            print(f"\nPlanning actions for: {target}")
+            print(f"\nPlanning actions for: {plan.original_target}")
+            if (
+                plan.original_target != plan.canonical_target
+                or plan.effective_target != plan.canonical_target
+                or plan.surrogate_categories
+            ):
+                print(
+                    f"  [open-vocab] original='{plan.original_target}' "
+                    f"canonical='{plan.canonical_target}' heatmap='{plan.effective_target}' "
+                    f"source={plan.resolution_source}"
+                )
 
-            room_goal = None
-            if room_provider and room_provider.is_available():
-                room_goal = room_provider.get_room_centroid(target)
-            if room_goal is None and room_regions:
-                room_goal = find_room_goal(target, room_regions)
+            room_goal = list(plan.room_goal) if plan.room_goal is not None else None
 
             if room_goal is not None:
-                print(f"  [executor-policy] Room command detected for '{target}'")
+                print(f"  [executor-policy] Room command detected for '{plan.original_target}'")
                 actions = [
-                    Action(type=ActionType.GO_TO_ROOM, room=target),
+                    Action(type=ActionType.GO_TO_ROOM, room=plan.original_target),
                     Action(type=ActionType.DONE, reason="room command handled"),
                 ]
                 print("  [executor-policy] Planned actions:")
@@ -347,7 +374,7 @@ def main(config: DictConfig) -> None:
                 for step_idx in range(1, _MAX_STRATEGIC_STEPS + 1):
                     action, snapshot = choose_next_action(
                         ctx,
-                        categories,
+                        [entry.canonical_target for entry in target_plans],
                         present_categories,
                         policy_mode=_POLICY_MODE,
                     )
@@ -397,7 +424,7 @@ def main(config: DictConfig) -> None:
 
         base.emit_instruction_eval_summary(
             instruction,
-            categories,
+            [plan.original_target for plan in target_plans],
             search_states,
             robot,
             room_provider,

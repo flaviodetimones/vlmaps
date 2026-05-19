@@ -113,6 +113,10 @@ def main():
     parser.add_argument("--scene_id", default="102344280")
     parser.add_argument("--scene_number", type=int, default=None,
                         help="Scene number for the output directory name (auto-detected if omitted)")
+    parser.add_argument("--start-pos", nargs=2, type=float, metavar=("X", "Z"),
+                        default=None,
+                        help="Fixed XZ spawn position (Y is set to navmesh height). "
+                             "If omitted, a random navigable point is used.")
     parser.add_argument("--output_dir", default=None,
                         help="Override output directory (default: derived from scene_id and scene_number)")
     args = parser.parse_args()
@@ -168,7 +172,15 @@ def main():
     assert sim.pathfinder.is_loaded, "NavMesh failed to load"
 
     state = habitat_sim.AgentState()
-    state.position = sim.pathfinder.get_random_navigable_point()
+    if args.start_pos is not None:
+        sx, sz = args.start_pos
+        candidate = np.array([sx, 0.0, sz], dtype=np.float32)
+        snapped = sim.pathfinder.snap_point(candidate)
+        state.position = snapped
+        print(f"Spawn : fixed ({sx:.2f}, {snapped[1]:.3f}, {sz:.2f})")
+    else:
+        state.position = sim.pathfinder.get_random_navigable_point()
+        print(f"Spawn : random {state.position}")
     agent.set_state(state)
 
     poses_list = []

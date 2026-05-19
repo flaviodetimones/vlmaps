@@ -1,5 +1,320 @@
+import json
 import os
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence
+
 import openai
+
+
+@dataclass(frozen=True)
+class OpenVocabTargetResolution:
+    """Resolved navigation-side representation of an open-vocabulary target."""
+
+    original_target: str
+    canonical_target: str
+    effective_target: str
+    surrogate_categories: List[str] = field(default_factory=list)
+    likely_rooms: List[str] = field(default_factory=list)
+    source: str = "fallback"
+
+
+_TARGET_ALIASES: Dict[str, str] = {
+    "botella": "bottle",
+    "botellas": "bottle",
+    "taladro": "drill",
+    "taladros": "drill",
+    "taza": "mug",
+    "tazas": "mug",
+    "vaso": "cup",
+    "vasos": "cup",
+    "libro": "book",
+    "libros": "book",
+    "portatil": "laptop",
+    "ordenador": "laptop",
+    "computadora": "laptop",
+    "tostadora": "toaster",
+    "tetera": "teapot",
+    "hervidor": "kettle",
+    "cafetera": "coffee maker",
+    "papelera": "trash bin",
+    "cubo de basura": "trash bin",
+    "basura": "trash bin",
+    "jarron": "vase",
+    "florero": "vase",
+    "vela": "candle",
+    "velas": "candle",
+    "cesta": "basket",
+    "pelota": "ball",
+    "computer": "laptop",
+    "computers": "laptop",
+    "notebook computer": "laptop",
+    "notebook": "laptop",
+    "basketball": "ball",
+    "sports ball": "ball",
+    "books": "book",
+    "novel": "book",
+    "soap dispenser": "soap",
+    "hand soap": "soap",
+    "dish soap": "soap",
+    "flower vase": "vase",
+    "candles": "candle",
+    "wicker basket": "basket",
+    "storage basket": "basket",
+    "tea pot": "teapot",
+    "tea kettle": "teapot",
+}
+
+
+def _normalize_alias_key(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def canonicalize_open_vocab_target(target: str) -> str:
+    """Normalize *target* to a stable canonical label for downstream use."""
+    cleaned = _normalize_alias_key(target)
+    if not cleaned:
+        return ""
+    return _TARGET_ALIASES.get(cleaned, cleaned)
+
+
+def _validate_category_candidates(
+    candidates: Sequence[str],
+    available_categories: Sequence[str],
+) -> List[str]:
+    """Keep only candidates present in the VLMaps category vocabulary."""
+    available_map = {
+        str(cat).strip().lower(): str(cat).strip()
+        for cat in available_categories
+        if str(cat).strip()
+    }
+    validated: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        key = canonicalize_open_vocab_target(candidate)
+        if not key:
+            continue
+        value = available_map.get(key)
+        if value is None or key in seen:
+            continue
+        validated.append(value)
+        seen.add(key)
+    return validated
+
+
+def _validate_room_candidates(
+    candidates: Sequence[str],
+    known_rooms: Optional[Sequence[str]],
+) -> List[str]:
+    if not known_rooms:
+        return []
+    room_map = {
+        str(room).strip().lower(): str(room).strip()
+        for room in known_rooms
+        if str(room).strip()
+    }
+    validated: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate or "").strip().lower()
+        if not key or key not in room_map or key in seen:
+            continue
+        validated.append(room_map[key])
+        seen.add(key)
+    return validated
+
+
+def _fallback_likely_rooms(
+    canonical_target: str,
+    known_rooms: Optional[Sequence[str]],
+) -> List[str]:
+    if not canonical_target or not known_rooms:
+        return []
+    try:
+        from vlmaps.utils.room_priors import compute_room_priors
+
+        priors = compute_room_priors(
+            canonical_target,
+            list(known_rooms),
+            objects_seen_by_room={},
+            llm_output={},
+            heatmap_evidence={},
+            query_type="indirect",
+        )
+        ranked = sorted(priors.items(), key=lambda item: item[1], reverse=True)
+        return [room for room, score in ranked if score > 0.05][:3]
+    except Exception:
+        return []
+
+
+def _query_open_vocab_target_resolution(
+    target: str,
+    available_categories: Sequence[str],
+    known_rooms: Optional[Sequence[str]] = None,
+    model: str = "gpt-4o-mini",
+) -> Optional[dict]:
+    """Ask the LLM for a canonical object label + surrogate furniture targets."""
+    key = os.environ.get("OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return None
+
+    try:
+        client = openai.OpenAI(api_key=key)
+        rooms_line = ", ".join(str(r) for r in (known_rooms or [])) or "(none)"
+        categories_line = ", ".join(str(c) for c in available_categories)
+        system_prompt = (
+            "You help a home robot search for objects that may not exist in the "
+            "VLMaps category vocabulary.\n"
+            "Return ONLY a JSON object with keys:\n"
+            "  canonical_target: string\n"
+            "  surrogate_categories: array[string]\n"
+            "  likely_rooms: array[string]\n"
+            "Rules:\n"
+            "1. canonical_target must be the plain object label YOLOE should verify.\n"
+            "2. surrogate_categories must contain only furniture/place categories from the provided list.\n"
+            "3. likely_rooms must contain only room names from the provided room list.\n"
+            "4. Keep surrogate_categories ordered from most to least useful.\n"
+            "5. If unsure, prefer a short conservative list.\n"
+            "Example:\n"
+            '{"canonical_target":"laptop","surrogate_categories":["desk","table","bed"],'
+            '"likely_rooms":["office","bedroom"]}'
+        )
+        user_prompt = (
+            f"Target: {target}\n"
+            f"Available categories: {categories_line}\n"
+            f"Known rooms: {rooms_line}"
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=220,
+            temperature=0.0,
+        )
+        text = response.choices[0].message.content.strip()
+        text = text.strip("`").replace("```json", "").replace("```", "").strip()
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            return None
+        return payload
+    except Exception as exc:
+        print(f"  [open-vocab] LLM target resolution failed: {exc}")
+        return None
+
+
+def resolve_open_vocab_target(
+    target: str,
+    available_categories: Sequence[str],
+    *,
+    known_rooms: Optional[Sequence[str]] = None,
+    present_categories: Optional[Sequence[str]] = None,
+    model: str = "gpt-4o-mini",
+    enable_llm: bool = True,
+) -> OpenVocabTargetResolution:
+    """Resolve a free-form target into canonical YOLOE + executable VLMaps search labels."""
+    original_target = str(target or "").strip()
+    canonical_target = canonicalize_open_vocab_target(original_target)
+    available_map = {
+        str(cat).strip().lower(): str(cat).strip()
+        for cat in available_categories
+        if str(cat).strip()
+    }
+    present_map = {
+        str(cat).strip().lower(): str(cat).strip()
+        for cat in (present_categories or [])
+        if str(cat).strip()
+    }
+
+    if canonical_target in available_map:
+        effective_target = present_map.get(canonical_target, available_map[canonical_target])
+        return OpenVocabTargetResolution(
+            original_target=original_target,
+            canonical_target=canonical_target,
+            effective_target=effective_target,
+            surrogate_categories=[],
+            likely_rooms=_fallback_likely_rooms(canonical_target, known_rooms),
+            source="direct",
+        )
+
+    llm_payload = None
+    if enable_llm:
+        llm_payload = _query_open_vocab_target_resolution(
+            canonical_target or original_target,
+            list(available_categories),
+            known_rooms=known_rooms,
+            model=model,
+        )
+    source = "fallback"
+    if llm_payload is not None:
+        llm_canonical = canonicalize_open_vocab_target(
+            llm_payload.get("canonical_target", canonical_target or original_target)
+        )
+        if llm_canonical:
+            canonical_target = llm_canonical
+        validated_surrogates = _validate_category_candidates(
+            llm_payload.get("surrogate_categories", []),
+            available_categories,
+        )
+        likely_rooms = _validate_room_candidates(
+            llm_payload.get("likely_rooms", []),
+            known_rooms,
+        )
+        if validated_surrogates or canonical_target in available_map:
+            source = "llm"
+        else:
+            likely_rooms = []
+    else:
+        validated_surrogates = []
+        likely_rooms = []
+
+    from vlmaps.utils.object_priors import get_surrogates
+
+    curated_surrogates = _validate_category_candidates(
+        get_surrogates(canonical_target),
+        available_categories,
+    )
+    if curated_surrogates:
+        # Keep the LLM for canonicalization and likely-room priors, but use the
+        # audited object->support map as the stable affordance ordering.
+        merged_surrogates = list(curated_surrogates)
+        for surrogate in validated_surrogates:
+            if surrogate not in merged_surrogates:
+                merged_surrogates.append(surrogate)
+        validated_surrogates = merged_surrogates
+
+    if not likely_rooms:
+        likely_rooms = _fallback_likely_rooms(canonical_target, known_rooms)
+
+    if canonical_target in available_map:
+        effective_target = present_map.get(canonical_target, available_map[canonical_target])
+    else:
+        effective_target = ""
+        for surrogate in validated_surrogates:
+            key = surrogate.strip().lower()
+            if key in present_map:
+                effective_target = present_map[key]
+                break
+        if not effective_target and validated_surrogates:
+            effective_target = validated_surrogates[0]
+        if not effective_target:
+            effective_target = canonical_target or original_target
+
+    return OpenVocabTargetResolution(
+        original_target=original_target,
+        canonical_target=canonical_target or original_target,
+        effective_target=effective_target,
+        surrogate_categories=list(validated_surrogates),
+        likely_rooms=list(likely_rooms),
+        source=source,
+    )
 
 
 def parse_object_goal_instruction_deprecated(language_instr):

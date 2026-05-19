@@ -25,7 +25,7 @@ import numpy as np
 
 from vlmaps.policy.actions import ACTION_SCHEMA_PROMPT, Action, ActionType, parse_action_json
 from vlmaps.policy.frontier import find_frontier_in_room
-from vlmaps.utils.object_priors import has_surrogates, pick_surrogate
+from vlmaps.utils.llm_utils import resolve_open_vocab_target
 
 
 def _base_nav():
@@ -56,7 +56,10 @@ class StrategySnapshot:
     # is preserved for the YOLOE verification step at arrival.
     original_target: Optional[str] = None
     effective_target: Optional[str] = None
+    query_target: Optional[str] = None
     surrogates_considered: List[str] = field(default_factory=list)
+    likely_rooms: List[str] = field(default_factory=list)
+    resolution_source: Optional[str] = None
 
 
 @dataclass
@@ -186,33 +189,37 @@ def _select_search_proxies(ctx, categories: list, present_categories: list) -> T
     if not target:
         return None, None, []
 
-    map_categories = []
-    try:
-        map_categories = list(getattr(ctx.robot.map, "categories", []) or [])
-    except Exception:
-        map_categories = []
-    available = set(c.strip().lower() for c in (map_categories + list(present_categories)) if c)
+    explicit_effective = getattr(ctx, "effective_target", None)
+    explicit_surrogates = list(getattr(ctx, "surrogate_categories", []) or [])
+    if explicit_effective is not None:
+        return target, explicit_effective or target, explicit_surrogates
 
-    target_lower = target.lower()
-    if target_lower in available:
-        return target, target, []
-
-    if not has_surrogates(target):
-        return target, target, []
-
-    chosen, considered = pick_surrogate(target, list(available))
-    if not chosen:
-        print(
-            f"  [strategy] Target '{target}' not in VLMap and no surrogate from "
-            f"{considered} is available — falling back to raw heatmap query"
-        )
-        return target, target, considered
-
-    print(
-        f"  [strategy] Target '{target}' not in VLMap categories; using "
-        f"surrogate furniture '{chosen}' for heatmap (considered={considered})"
+    map_categories = list(getattr(ctx.robot.map, "categories", []) or [])
+    known_rooms = list(ctx.search_state.rooms.keys()) if ctx.search_state and ctx.search_state.rooms else []
+    resolution = resolve_open_vocab_target(
+        target,
+        map_categories,
+        known_rooms=known_rooms,
+        present_categories=present_categories,
+        enable_llm=False,
     )
-    return target, chosen, considered
+    considered = list(resolution.surrogate_categories)
+    if not considered and resolution.effective_target == resolution.canonical_target:
+        from vlmaps.utils.object_priors import get_surrogates
+
+        considered = get_surrogates(resolution.canonical_target)
+    if resolution.canonical_target != target:
+        print(
+            f"  [strategy] canonical target remapped: "
+            f"'{getattr(ctx, 'original_target', target)}' -> '{resolution.canonical_target}'"
+        )
+    if resolution.effective_target != resolution.canonical_target or resolution.surrogate_categories:
+        print(
+            f"  [strategy] Using heatmap target '{resolution.effective_target}' "
+            f"for canonical '{resolution.canonical_target}' "
+            f"(source={resolution.source}, surrogates={considered})"
+        )
+    return resolution.canonical_target, resolution.effective_target, considered
 
 
 def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -> StrategySnapshot:
@@ -315,6 +322,7 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
     frontier_rooms = _frontier_suggestions(ctx, selected_room, room_scores)
     return StrategySnapshot(
         target=cat,
+        query_target=getattr(ctx, "original_target", None) or original_target or ctx.target,
         current_room=ctx.current_room,
         direct_query_mode=direct_query_mode,
         heatmap_evidence=heatmap_ev,
@@ -327,6 +335,8 @@ def prepare_strategy_snapshot(ctx, categories: list, present_categories: list) -
         original_target=original_target or ctx.target,
         effective_target=cat,
         surrogates_considered=surrogates_considered,
+        likely_rooms=list(getattr(ctx, "likely_rooms", []) or []),
+        resolution_source=getattr(ctx, "resolution_source", None),
     )
 
 
@@ -397,7 +407,12 @@ def _build_llm_messages(ctx, snapshot: StrategySnapshot, heuristic_action: Actio
         + ACTION_SCHEMA_PROMPT
     )
     user_prompt = (
-        f"Task: find {snapshot.target}\n"
+        f"Task: find {snapshot.query_target or snapshot.original_target or snapshot.target}\n"
+        f"YOLOE target label: {snapshot.original_target or snapshot.target}\n"
+        f"Heatmap planning target: {snapshot.effective_target or snapshot.target}\n"
+        f"Open-vocab resolution source: {snapshot.resolution_source or 'n/a'}\n"
+        f"Validated surrogates: {snapshot.surrogates_considered or ['(none)']}\n"
+        f"Likely rooms from resolution: {snapshot.likely_rooms or ['(none)']}\n"
         f"Current room: {current_room}\n"
         f"Direct furniture query: {'yes' if snapshot.direct_query_mode else 'no'}\n"
         f"Suggested room by heuristic: {snapshot.selected_room or 'none'}\n"
