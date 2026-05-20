@@ -137,8 +137,10 @@ def main():
             x1, y1, x2, y2 = boxes.xyxy[best].tolist()
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
+            bw = max(0.0, float(x2 - x1))
+            bh = max(0.0, float(y2 - y1))
             conf_val = float(boxes.conf[best])
-            sys.stdout.write(f"1|{cx:.2f}|{cy:.2f}|{conf_val:.3f}\n")
+            sys.stdout.write(f"1|{cx:.2f}|{cy:.2f}|{conf_val:.3f}|{bw:.2f}|{bh:.2f}\n")
         else:
             sys.stdout.write("0\n")
         sys.stdout.flush()

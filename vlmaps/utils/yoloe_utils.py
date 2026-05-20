@@ -82,6 +82,8 @@ class YoloeSession:
         self.target = target
         self.conf_thresh = conf_thresh
         self.last_conf: Optional[float] = None
+        self.last_bbox_size: Optional[Tuple[float, float]] = None
+        self.last_bbox_area_frac: Optional[float] = None
         self._proc: Optional[subprocess.Popen] = None
         self._tmpdir = tempfile.TemporaryDirectory()
         self._in_path = Path(self._tmpdir.name) / "frame.png"
@@ -180,7 +182,8 @@ class YoloeSession:
                 self._ready = False
                 return False, frame_rgb.copy(), None
 
-        # Parse response: "0" or "1|cx|cy" or "1|cx|cy|conf"
+        # Parse response: "0", "1|cx|cy", "1|cx|cy|conf", or
+        # "1|cx|cy|conf|w|h" from newer persistent workers.
         parts = line.split("|")
         found = (parts[0] == "1")
         bbox_center: Optional[Tuple[float, float]] = None
@@ -190,13 +193,36 @@ class YoloeSession:
             except ValueError:
                 pass
         self.last_conf = None
+        self.last_bbox_size = None
+        self.last_bbox_area_frac = None
         if found and len(parts) >= 4:
             try:
                 _conf_val = float(parts[3])
                 self.last_conf = _conf_val
-                print(f"  [YOLOE-CONF] target={self.target} conf={_conf_val:.3f} bbox=({bbox_center[0]:.0f},{bbox_center[1]:.0f})", flush=True)
+                if bbox_center is not None:
+                    print(
+                        f"  [YOLOE-CONF] target={self.target} conf={_conf_val:.3f} "
+                        f"bbox=({bbox_center[0]:.0f},{bbox_center[1]:.0f})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  [YOLOE-CONF] target={self.target} conf={_conf_val:.3f} bbox=none",
+                        flush=True,
+                    )
             except (ValueError, TypeError):
                 pass
+        if found and len(parts) >= 6:
+            try:
+                _w = max(0.0, float(parts[4]))
+                _h = max(0.0, float(parts[5]))
+                self.last_bbox_size = (_w, _h)
+                frame_h, frame_w = frame_rgb.shape[:2]
+                denom = max(1.0, float(frame_w * frame_h))
+                self.last_bbox_area_frac = float((_w * _h) / denom)
+            except (ValueError, TypeError):
+                self.last_bbox_size = None
+                self.last_bbox_area_frac = None
 
         ann_rgb = frame_rgb.copy()
         if self._out_path.exists():
