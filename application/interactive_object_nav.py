@@ -124,7 +124,6 @@ _ROOM_EXPLORE_FOCUS_RADIUS_ENV = "VLMAPS_EXPLORE_FOCUS_RADIUS_M"
 _APPROACH_MIN_CLEARANCE_ENV = "VLMAPS_APPROACH_MIN_CLEARANCE_CELLS"
 _APPROACH_MAX_STEPS_ENV = "VLMAPS_APPROACH_MAX_STEPS"
 _APPROACH_RAW_FALLBACK_ENV = "VLMAPS_APPROACH_RAW_FALLBACK"
-_APPROACH_ALT_VIEWS_ENV = "VLMAPS_APPROACH_ALT_VIEWS"
 _VISUAL_EVIDENCE_WINDOW_ENV = "VLMAPS_VISUAL_EVIDENCE_WINDOW"
 _VISUAL_EVIDENCE_MIN_HITS_ENV = "VLMAPS_VISUAL_EVIDENCE_MIN_HITS"
 _SINGLE_PASS_OBJECT_SEARCH_ENV = "VLMAPS_SINGLE_PASS_OBJECT_SEARCH"
@@ -143,7 +142,6 @@ _DEFAULT_ROOM_EXPLORE_POINTS_PER_REFERENCE = 4
 _DEFAULT_ROOM_EXPLORE_POINT_MIN_SEP_M = 0.90
 _DEFAULT_APPROACH_MIN_CLEARANCE_CELLS = 2.0
 _DEFAULT_APPROACH_MAX_STEPS = 18
-_DEFAULT_APPROACH_ALT_VIEWS = 4
 _DEFAULT_VISUAL_EVIDENCE_WINDOW = 8
 _DEFAULT_VISUAL_EVIDENCE_MIN_HITS = 3
 
@@ -274,14 +272,6 @@ def _approach_max_steps() -> int:
     return _env_int(
         _APPROACH_MAX_STEPS_ENV,
         _DEFAULT_APPROACH_MAX_STEPS,
-        1,
-    )
-
-
-def _approach_alt_views() -> int:
-    return _env_int(
-        _APPROACH_ALT_VIEWS_ENV,
-        _DEFAULT_APPROACH_ALT_VIEWS,
         1,
     )
 
@@ -2822,222 +2812,6 @@ def _planned_approach_to_target_cell(
     return False
 
 
-def _select_diverse_approach_goals(
-    target_cell: Tuple[int, int],
-    goals: List[List[int]],
-    max_views: int,
-    *,
-    min_angle_deg: float = 35.0,
-) -> List[List[int]]:
-    """Pick approach goals from different angular sectors around target_cell."""
-    if not goals:
-        return []
-    tr, tc = float(target_cell[0]), float(target_cell[1])
-    selected: List[List[int]] = []
-    selected_angles: List[float] = []
-    for goal in goals:
-        gr, gc = float(goal[0]), float(goal[1])
-        angle = float(np.rad2deg(np.arctan2(gr - tr, gc - tc)))
-        if selected_angles:
-            diffs = [
-                abs(((angle - prev + 180.0) % 360.0) - 180.0)
-                for prev in selected_angles
-            ]
-            if min(diffs) < float(min_angle_deg) and len(selected) < max_views - 1:
-                continue
-        selected.append([int(goal[0]), int(goal[1])])
-        selected_angles.append(angle)
-        if len(selected) >= int(max_views):
-            break
-    for goal in goals:
-        if len(selected) >= int(max_views):
-            break
-        g = [int(goal[0]), int(goal[1])]
-        if g not in selected:
-            selected.append(g)
-    return selected
-
-
-def _planned_multiview_approach_to_target_cell(
-    robot,
-    target_cell: Optional[Tuple[int, int]],
-    *,
-    rgb_map_2d: Optional[np.ndarray] = None,
-    heatmap: Optional[np.ndarray] = None,
-    room_mask: Optional[np.ndarray] = None,
-    monitor_session=None,
-    monitor_label: Optional[str] = None,
-    confirm_fn=None,
-    min_dist_cells: float = 1.0,
-    max_dist_cells: float = 22.0,
-    min_clearance_cells: Optional[float] = None,
-) -> bool:
-    """Try several navigable viewpoints around the same visual hypothesis."""
-    if target_cell is None:
-        return False
-
-    max_views = max(1, _approach_alt_views())
-    safe_map = getattr(robot, "_safe_obs_map", robot.map.obstacles_map)
-    raw_map = robot.map.obstacles_map
-    clearance = (
-        float(min_clearance_cells)
-        if min_clearance_cells is not None
-        else _approach_min_clearance_cells()
-    )
-    robot._set_nav_curr_pose()
-    cur_r, cur_c = int(robot.curr_pos_on_map[0]), int(robot.curr_pos_on_map[1])
-    room_provider = getattr(robot, "room_provider", None)
-    required_room = None
-    if room_provider is not None and getattr(room_provider, "is_available", lambda: False)():
-        room_here = room_provider.get_room_at_cell(cur_r, cur_c)
-        if room_here and room_here != "unknown":
-            required_room = room_here
-
-    attempts = [("inflado", safe_map, clearance)]
-    if _env_flag(_APPROACH_RAW_FALLBACK_ENV, True) and raw_map is not safe_map:
-        attempts.append(("bruto", raw_map, min(clearance, 1.0)))
-
-    tried: List[Tuple[int, int]] = []
-    any_moved = False
-
-    def _approach_monitor(_step_idx: int, _action: str) -> bool:
-        if monitor_session is None:
-            return False
-        try:
-            obs = robot.sim.get_sensor_observations(0)
-            if "color_sensor" not in obs:
-                return False
-            frame = obs["color_sensor"][:, :, :3]
-            detected, ann_rgb, bbox_center = monitor_session.check(frame)
-            conf = float(getattr(monitor_session, "last_conf", 0.0) or 0.0)
-            if detected:
-                _record_visual_hypothesis(
-                    robot,
-                    monitor_label or "object",
-                    monitor_session,
-                    bbox_center,
-                    ann_rgb,
-                    room_mask=room_mask,
-                    source="multi-view-route",
-                )
-                if ann_rgb is not None:
-                    bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
-                    setattr(robot, "_last_yoloe_positive_bgr", bgr)
-                    show_obs(
-                        robot,
-                        f"Multi-view monitor ({conf:.2f}): {monitor_label or 'object'}",
-                        yoloe_frame_bgr=bgr,
-                    )
-                if bbox_center is not None:
-                    setattr(robot, "_last_yoloe_bbox_center", bbox_center)
-                if conf >= _final_conf_thresh():
-                    setattr(robot, "_last_detection_status", "confirmed")
-                    freeze_found_target(monitor_label or "object", ann_rgb, target_cell)
-                    print(
-                        f"  [multi-view] ✓ Confirmación durante ruta alternativa: "
-                        f"{monitor_label or 'object'} conf={conf:.3f}"
-                    )
-                    return True
-                if conf >= _confirm_conf_thresh():
-                    setattr(robot, "_last_detection_status", "high_probability")
-                    freeze_found_target(monitor_label or "object", ann_rgb, target_cell)
-                    print(
-                        f"  [multi-view] Alta probabilidad durante ruta alternativa: "
-                        f"{monitor_label or 'object'} conf={conf:.3f}"
-                    )
-                    return True
-            return False
-        except Exception as exc:
-            print(f"  [multi-view] monitor YOLOE error: {exc}")
-            return False
-
-    for map_name, approach_map, map_clearance in attempts:
-        goals = find_safe_candidate_approach_goals(
-            target_cell,
-            approach_map,
-            robot_pos=(cur_r, cur_c),
-            room_provider=room_provider,
-            required_room=required_room,
-            min_dist=min_dist_cells,
-            max_dist=max_dist_cells,
-            min_clearance=map_clearance,
-            n_angles=48,
-            top_k=max(24, max_views * 8),
-            rank_mode="target_proximity",
-            line_of_sight_margin_cells=2.0,
-        )
-        goals = _select_diverse_approach_goals(target_cell, goals, max_views)
-        if not goals:
-            print(
-                f"  [multi-view] sin standoff alternativo en mapa {map_name} "
-                f"(clearance>={map_clearance:.1f})"
-            )
-            continue
-
-        print(
-            f"  [multi-view] {len(goals)} vista(s) alternativa(s) alrededor de "
-            f"{tuple(int(v) for v in target_cell)} usando mapa {map_name}."
-        )
-        for view_idx, goal in enumerate(goals, start=1):
-            goal_key = (int(goal[0]), int(goal[1]))
-            if goal_key in tried:
-                continue
-            tried.append(goal_key)
-            try:
-                _, planned_actions = robot.plan_path_only(goal)
-            except Exception as exc:
-                print(f"  [multi-view] vista {view_idx}: sin ruta a {goal}: {exc}")
-                continue
-            planned_polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
-            planned_dense = densify_path_cells(planned_polyline)
-            if room_mask is not None and planned_dense and not _path_stays_inside_mask(planned_dense, room_mask):
-                print(f"  [multi-view] vista {view_idx}: descartada porque sale de la habitación.")
-                continue
-
-            if planned_actions:
-                print(f"  [multi-view] Vista {view_idx}/{len(goals)} -> {goal}")
-                ok = execute_nav_replay(
-                    robot,
-                    planned_actions,
-                    "approach_multiview",
-                    rgb_map_2d if rgb_map_2d is not None else np.zeros((1, 1, 3), dtype=np.uint8),
-                    heatmap if heatmap is not None else np.zeros((1, 1), dtype=np.float32),
-                    planned_polyline,
-                    display_path_cells=planned_dense,
-                    dist_map=distance_transform_edt(robot.map.obstacles_map),
-                    goal_reached_tol_cells=1.5,
-                    monitor_fn=_approach_monitor if monitor_session is not None else None,
-                    monitor_stride=1,
-                    stop_on_monitor=True,
-                    room_mask=room_mask,
-                )
-                any_moved = bool(any_moved or ok)
-            else:
-                print(f"  [multi-view] Vista {view_idx}/{len(goals)} ya alcanzada -> {goal}")
-                ok = True
-
-            try:
-                face_toward_pos(
-                    robot,
-                    float(target_cell[0]),
-                    float(target_cell[1]),
-                    smooth=True,
-                    label="multi-view: facing visual hypothesis",
-                )
-            except Exception:
-                pass
-
-            if getattr(robot, "_last_detection_status", None) == "confirmed":
-                return True
-            if confirm_fn is not None and bool(confirm_fn(f"vista alternativa {view_idx}/{len(goals)}")):
-                return True
-            # High-probability is useful evidence, but do not stop here: another
-            # nearby view may turn the same object into a final confirmation.
-
-    print("  [multi-view] no se pudo obtener una confirmación desde vistas alternativas")
-    return bool(any_moved)
-
-
 def close_approach_after_detection(
     robot,
     session,
@@ -3457,21 +3231,22 @@ def _approach_and_confirm_detection(
         return True
     if _final_confirmation("seguimiento visual persistente"):
         return True
+    if getattr(robot, "_last_detection_status", None) == "high_probability":
+        return False
 
     planned_first = False
     # If straight visual approach was blocked by furniture/obstacles before
     # confirmation, still try the best reachable standoff around the last view
     # ray. This is the robust alternative route: do not treat visual progress as
     # a reason to skip planning.
-    remembered_cell = _best_visual_hypothesis_cell(robot, label, room_mask)
-    fresh_target_cell = remembered_cell or _forward_target_cell_from_view(robot, room_mask) or target_cell
+    fresh_target_cell = _forward_target_cell_from_view(robot, room_mask) or target_cell
     if fresh_target_cell is not None:
         try:
             print(
-                "  [confirm-approach] Aproximación multivista: probar varias "
-                "rutas navegables alrededor de la última hipótesis visual."
+                "  [confirm-approach] Fallback planificado: buscar el punto navegable "
+                "más cercano alrededor de la última detección, con YOLOE activo."
             )
-            planned_first = _planned_multiview_approach_to_target_cell(
+            planned_first = _planned_approach_to_target_cell(
                 robot,
                 fresh_target_cell,
                 rgb_map_2d=rgb_map_2d,
@@ -3479,17 +3254,18 @@ def _approach_and_confirm_detection(
                 room_mask=room_mask,
                 monitor_session=approach_session,
                 monitor_label=label,
-                confirm_fn=_final_confirmation,
                 min_dist_cells=1.0,
-                max_dist_cells=22.0,
+                max_dist_cells=18.0,
             )
         except Exception as exc:
-            print(f"  [confirm-approach] multiview fallback skipped: {exc}")
+            print(f"  [confirm-approach] target-cell fallback skipped: {exc}")
         if planned_first and getattr(robot, "_last_detection_status", None) == "confirmed":
             print(
                 f"  [confirm-approach] ✓ Confirmado durante la aproximación navegable: '{target}'."
             )
             return True
+        if planned_first and getattr(robot, "_last_detection_status", None) == "high_probability":
+            return False
         if planned_first and _final_confirmation("aproximación planificada navegable"):
             return True
 
@@ -4524,48 +4300,6 @@ def _nearest_neighbor_circuit(points: List[Tuple[int, int]], current: Tuple[floa
     return ordered
 
 
-def _semantic_nearest_neighbor_circuit(
-    points: List[Tuple[int, int]],
-    current: Tuple[float, float],
-    heatmap: Optional[np.ndarray],
-    dist_obs: Optional[np.ndarray],
-) -> List[Tuple[int, int]]:
-    """Order viewpoints by travel cost while preferring semantic/clear views."""
-    if not points:
-        return []
-    if heatmap is None or heatmap.shape[:2] == (0, 0):
-        return _nearest_neighbor_circuit(points, current)
-    heat_values = []
-    for row, col in points:
-        if 0 <= int(row) < heatmap.shape[0] and 0 <= int(col) < heatmap.shape[1]:
-            value = float(heatmap[int(row), int(col)])
-            heat_values.append(value if np.isfinite(value) else 0.0)
-        else:
-            heat_values.append(0.0)
-    max_heat = max(max(heat_values), 1e-6)
-
-    remaining = set(points)
-    ordered: List[Tuple[int, int]] = []
-    cursor = current
-    while remaining:
-        def _score(cell):
-            travel = float((cell[0] - cursor[0]) ** 2 + (cell[1] - cursor[1]) ** 2)
-            heat_bonus = 0.0
-            if 0 <= int(cell[0]) < heatmap.shape[0] and 0 <= int(cell[1]) < heatmap.shape[1]:
-                raw = float(heatmap[int(cell[0]), int(cell[1])])
-                heat_bonus = (raw / max_heat) if np.isfinite(raw) else 0.0
-            clearance_bonus = 0.0
-            if dist_obs is not None and 0 <= int(cell[0]) < dist_obs.shape[0] and 0 <= int(cell[1]) < dist_obs.shape[1]:
-                clearance_bonus = min(float(dist_obs[int(cell[0]), int(cell[1])]), 20.0) / 20.0
-            return travel - heat_bonus * 220.0 - clearance_bonus * 45.0
-
-        nxt = min(remaining, key=_score)
-        ordered.append(nxt)
-        remaining.remove(nxt)
-        cursor = (float(nxt[0]), float(nxt[1]))
-    return ordered
-
-
 def _coverage_ratio(navigable: np.ndarray, points: List[Tuple[int, int]], radius_cells: float) -> float:
     if not points or navigable is None or not navigable.any():
         return 0.0
@@ -4679,7 +4413,6 @@ def _cluster_room_candidates(
     target_points: int,
     min_sep_cells: float,
     current: Tuple[float, float],
-    semantic_heatmap: Optional[np.ndarray] = None,
 ) -> List[Tuple[int, int]]:
     rows, cols = np.where(candidate_mask)
     if len(rows) == 0:
@@ -4692,42 +4425,6 @@ def _cluster_room_candidates(
     coords = coords_i.astype(np.float32)
     coord_tuples = [(int(r), int(c)) for r, c in coords_i]
     coord_set = set(coord_tuples)
-    heat_norm = None
-    if semantic_heatmap is not None and semantic_heatmap.shape[:2] == candidate_mask.shape[:2]:
-        raw_vals = np.asarray(
-            [float(semantic_heatmap[int(r), int(c)]) for r, c in coords_i],
-            dtype=np.float32,
-        )
-        finite = np.isfinite(raw_vals)
-        if finite.any():
-            valid_vals = raw_vals[finite]
-            lo = float(np.nanmin(valid_vals))
-            hi = float(np.nanmax(valid_vals))
-            if hi > lo:
-                heat_norm = np.zeros_like(raw_vals, dtype=np.float32)
-                heat_norm[finite] = np.clip((raw_vals[finite] - lo) / (hi - lo), 0.0, 1.0)
-            else:
-                heat_norm = np.ones_like(raw_vals, dtype=np.float32) * 0.5
-
-    def _semantic_bonus_for_index(idx: int) -> float:
-        if heat_norm is None:
-            return 0.0
-        return float(heat_norm[int(idx)])
-
-    def _semantic_bonus_for_cell(cell: Tuple[int, int]) -> float:
-        if semantic_heatmap is None or semantic_heatmap.shape[:2] != candidate_mask.shape[:2]:
-            return 0.0
-        value = float(semantic_heatmap[int(cell[0]), int(cell[1])])
-        if not np.isfinite(value):
-            return 0.0
-        if heat_norm is None:
-            return 0.0
-        vals = np.asarray(semantic_heatmap[candidate_mask], dtype=np.float32)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            return 0.0
-        denom = max(float(np.nanmax(vals)), 1e-6)
-        return max(0.0, min(1.0, value / denom))
 
     seeds = [cell for cell in _component_seed_cells(candidate_mask, dist_obs, k) if cell in coord_set]
     if not seeds:
@@ -4775,11 +4472,7 @@ def _cluster_room_candidates(
             [float(dist_obs[int(coords_i[j, 0]), int(coords_i[j, 1])]) for j in member_idx],
             dtype=np.float32,
         )
-        semantic_bonus = np.asarray(
-            [_semantic_bonus_for_index(int(j)) for j in member_idx],
-            dtype=np.float32,
-        )
-        best_local = int(np.argmin(center_d2 - clear_bonus * 0.50 - semantic_bonus * 18.0))
+        best_local = int(np.argmin(center_d2 - clear_bonus * 0.50))
         cell = (int(coords_i[member_idx[best_local], 0]), int(coords_i[member_idx[best_local], 1]))
         if cell not in medoids:
             medoids.append(cell)
@@ -4813,11 +4506,7 @@ def _cluster_room_candidates(
                     )
                 else:
                     nearest_sq = -float((cell[0] - current[0]) ** 2 + (cell[1] - current[1]) ** 2)
-                score = (
-                    nearest_sq
-                    + float(dist_obs[cell[0], cell[1]]) * 0.10
-                    + _semantic_bonus_for_cell(cell) * max(float(min_sep_cells) ** 2, 1.0) * 0.20
-                )
+                score = nearest_sq + float(dist_obs[cell[0], cell[1]]) * 0.10
                 if score > best_score:
                     best_score = score
                     best_cell = cell
@@ -4972,7 +4661,6 @@ def _generate_room_exploration_points(
             target_points,
             requested_sep_cells,
             current,
-            semantic_heatmap=focus_heatmap,
         )
         if not points:
             continue
@@ -4990,12 +4678,7 @@ def _generate_room_exploration_points(
     if not best_points:
         return []
 
-    ordered = _semantic_nearest_neighbor_circuit(
-        best_points[:target_points],
-        current,
-        focus_heatmap,
-        dist_obs,
-    )
+    ordered = _nearest_neighbor_circuit(best_points[:target_points], current)
     final_coverage = _coverage_ratio(selection_domain, ordered, coverage_radius_cells)
     print(
         f"  [zone-explore] Nivel elegido={best_level}; cobertura≈{final_coverage * 100:.1f}% "
@@ -5123,8 +4806,9 @@ def _forward_target_cell_from_view(
 
 
 def _reset_visual_hypotheses(robot, target: str) -> None:
-    setattr(robot, "_visual_hypotheses", [])
-    setattr(robot, "_visual_hypothesis_target", str(target or "").strip().lower())
+    # Kept as a compatibility hook; the simplified controller no longer uses
+    # projected visual memory to choose new navigation goals.
+    return None
 
 
 def _record_visual_hypothesis(
@@ -5136,57 +4820,13 @@ def _record_visual_hypothesis(
     room_mask: Optional[np.ndarray] = None,
     source: str = "visual",
 ) -> Optional[dict]:
-    """Persist a low/high YOLOE hit as a spatial hypothesis for later recovery."""
-    if bbox_center is None:
-        return None
-    try:
-        conf = float(getattr(session, "last_conf", 0.0) or 0.0)
-    except Exception:
-        conf = 0.0
-    if conf <= 0.0:
-        return None
-    try:
-        robot._set_nav_curr_pose()
-        pose_cell = (
-            int(robot.curr_pos_on_map[0]),
-            int(robot.curr_pos_on_map[1]),
-        )
-        angle = float(getattr(robot, "curr_ang_deg_on_map", 0.0))
-    except Exception:
-        pose_cell = None
-        angle = 0.0
-    target_cell = _forward_target_cell_from_view(robot, room_mask)
-    area_frac = float(getattr(session, "last_bbox_area_frac", 0.0) or 0.0)
-    cx, cy = float(bbox_center[0]), float(bbox_center[1])
-    centered_score = 1.0 - min(1.0, abs(cx - 320.0) / 320.0)
-    hypothesis = {
-        "target": str(target or "").strip().lower(),
-        "source": str(source or "visual"),
-        "pose_cell": pose_cell,
-        "target_cell": target_cell,
-        "angle": angle,
-        "bbox": (cx, cy),
-        "conf": conf,
-        "area": area_frac,
-        "centered": centered_score,
-        "time": time.monotonic(),
-    }
-    hyps = list(getattr(robot, "_visual_hypotheses", []) or [])
-    hyps.append(hypothesis)
-    hyps = hyps[-16:]
-    setattr(robot, "_visual_hypotheses", hyps)
+    """Compatibility no-op for the earlier visual-memory experiment."""
     if ann_rgb is not None:
         try:
             setattr(robot, "_last_yoloe_positive_bgr", cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
         except Exception:
             pass
-    if target_cell is not None:
-        setattr(robot, "_last_visual_hypothesis_cell", target_cell)
-    print(
-        f"  [visual-memory] {source}: '{target}' conf={conf:.3f} "
-        f"bbox=({cx:.0f},{cy:.0f}) target_cell={target_cell}"
-    )
-    return hypothesis
+    return None
 
 
 def _best_visual_hypothesis_cell(
@@ -5196,38 +4836,7 @@ def _best_visual_hypothesis_cell(
     *,
     max_age_s: float = 90.0,
 ) -> Optional[Tuple[int, int]]:
-    """Return the best remembered projected target cell for the current target."""
-    target_key = str(target or "").strip().lower()
-    now = time.monotonic()
-    best = None
-    best_score = -float("inf")
-    for hyp in list(getattr(robot, "_visual_hypotheses", []) or []):
-        if hyp.get("target") != target_key:
-            continue
-        cell = hyp.get("target_cell")
-        if cell is None:
-            continue
-        rr, cc = int(cell[0]), int(cell[1])
-        if room_mask is not None:
-            if not (0 <= rr < room_mask.shape[0] and 0 <= cc < room_mask.shape[1]):
-                continue
-            if not bool(room_mask[rr, cc]):
-                continue
-        age = max(0.0, now - float(hyp.get("time", now)))
-        if age > max_age_s:
-            continue
-        score = (
-            float(hyp.get("conf", 0.0)) * 2.0
-            + float(hyp.get("centered", 0.0)) * 0.4
-            + float(hyp.get("area", 0.0)) * 3.0
-            - age * 0.01
-        )
-        if score > best_score:
-            best_score = score
-            best = (rr, cc)
-    if best is not None:
-        print(f"  [visual-memory] Recuperando mejor hipótesis '{target}' en {best}.")
-    return best
+    return None
 
 
 def _confirm_current_view_after_trigger(
