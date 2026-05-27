@@ -71,6 +71,7 @@ _UI_WINDOW_POSITIONS = {
     "1st person": (20, 40),
     "Semantic Map": (760, 40),
 }
+_STICKY_YOLOE_MARKER_ATTR = "_last_yoloe_marker"
 
 
 def _raw_env_flag(name: str, default: bool = False) -> bool:
@@ -121,6 +122,7 @@ _ROOM_EXPLORE_POINT_MIN_SEP_ENV = "VLMAPS_EXPLORE_POINT_MIN_SEP_M"
 _ROOM_EXPLORE_MIN_CLEARANCE_ENV = "VLMAPS_EXPLORE_MIN_CLEARANCE_CELLS"
 _ROOM_EXPLORE_DEBUG_ENV = "VLMAPS_EXPLORE_DEBUG"
 _ROOM_EXPLORE_FOCUS_RADIUS_ENV = "VLMAPS_EXPLORE_FOCUS_RADIUS_M"
+_ROOM_EXPLORE_FOCUS_EXPAND_ENV = "VLMAPS_ROOM_EXPLORE_FOCUS_EXPAND_M"
 _APPROACH_MIN_CLEARANCE_ENV = "VLMAPS_APPROACH_MIN_CLEARANCE_CELLS"
 _APPROACH_MAX_STEPS_ENV = "VLMAPS_APPROACH_MAX_STEPS"
 _APPROACH_RAW_FALLBACK_ENV = "VLMAPS_APPROACH_RAW_FALLBACK"
@@ -522,19 +524,96 @@ def build_rgb_map_2d(robot) -> np.ndarray:
     return pool_3d_rgb_to_2d(robot.map.grid_rgb, robot.map.grid_pos, robot.map.gs)
 
 
+def _store_yoloe_marker(
+    robot,
+    label: str,
+    session,
+    bbox_center,
+    ann_rgb=None,
+) -> None:
+    """Persist the last positive YOLOE annotated frame for short flicker gaps."""
+    if robot is None or bbox_center is None:
+        return
+    try:
+        cx, cy = float(bbox_center[0]), float(bbox_center[1])
+    except Exception:
+        return
+    marker = {
+        "label": str(label or "object"),
+        "cx": cx,
+        "cy": cy,
+        "conf": float(getattr(session, "last_conf", 0.0) or 0.0),
+        "row": int(getattr(robot, "curr_pos_on_map", [0, 0])[0]),
+        "col": int(getattr(robot, "curr_pos_on_map", [0, 0])[1]),
+        "angle": float(getattr(robot, "curr_ang_deg_on_map", 0.0)),
+        "ts": time.monotonic(),
+    }
+    setattr(robot, _STICKY_YOLOE_MARKER_ATTR, marker)
+    setattr(robot, "_last_yoloe_bbox_center", (cx, cy))
+    setattr(robot, "_last_yoloe_seen_angle_deg", float(getattr(robot, "curr_ang_deg_on_map", 0.0)))
+    if ann_rgb is not None:
+        try:
+            ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+            # Keep YOLOE's own annotation exactly as returned by the model.
+            setattr(robot, "_last_yoloe_positive_bgr", ann_bgr.copy())
+        except Exception:
+            pass
+
+
+def _sticky_yoloe_marker_is_current(robot) -> bool:
+    marker = getattr(robot, _STICKY_YOLOE_MARKER_ATTR, None)
+    if marker is None:
+        return False
+    try:
+        age_s = time.monotonic() - float(marker.get("ts", 0.0))
+        marker_angle = float(marker.get("angle", getattr(robot, "curr_ang_deg_on_map", 0.0)))
+        current_angle = float(getattr(robot, "curr_ang_deg_on_map", marker_angle))
+        angle_delta = abs(_normalize_turn_error(current_angle - marker_angle))
+        current_pos = getattr(robot, "curr_pos_on_map", None)
+        if current_pos is not None:
+            drow = float(current_pos[0]) - float(marker.get("row", current_pos[0]))
+            dcol = float(current_pos[1]) - float(marker.get("col", current_pos[1]))
+            dist_cells = float(np.hypot(drow, dcol))
+        else:
+            dist_cells = 0.0
+        # Persistent means detector-flicker persistent, not "draw a stale box
+        # after the robot has moved/rotated to a different view".
+        if age_s > 30.0 or angle_delta > 35.0 or dist_cells > 14.0:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def show_obs(robot, label: str = "", yoloe_frame_bgr: np.ndarray = None):
     """Display the first-person camera view (with optional YOLOE overlay)."""
     global _frozen_detection_bgr
     if is_eval_headless():
         return
-    if yoloe_frame_bgr is not None:
-        frame = yoloe_frame_bgr.copy()
-    elif _frozen_detection_bgr is not None:
-        frame = _frozen_detection_bgr.copy()
+
+    sticky_current = _sticky_yoloe_marker_is_current(robot)
+    last_yoloe_positive = getattr(robot, "_last_yoloe_positive_bgr", None)
+
+    # During short detector flicker, keep showing YOLOE's own annotated frame.
+    # If the robot has moved/rotated away, fall back to the live camera rather
+    # than drawing stale evidence ourselves.
+    if sticky_current and last_yoloe_positive is not None:
+        frame = last_yoloe_positive.copy()
+    elif yoloe_frame_bgr is not None:
+        if getattr(robot, _STICKY_YOLOE_MARKER_ATTR, None) is not None and not sticky_current:
+            obs = robot.sim.get_sensor_observations(0)
+            if "color_sensor" in obs:
+                frame = cv2.cvtColor(obs["color_sensor"][:, :, :3], cv2.COLOR_RGB2BGR)
+            else:
+                frame = yoloe_frame_bgr.copy()
+        else:
+            frame = yoloe_frame_bgr.copy()
     else:
         obs = robot.sim.get_sensor_observations(0)
         if "color_sensor" in obs:
             frame = cv2.cvtColor(obs["color_sensor"][:, :, :3], cv2.COLOR_RGB2BGR)
+        elif _frozen_detection_bgr is not None:
+            frame = _frozen_detection_bgr.copy()
         else:
             ui_wait(1)
             return
@@ -874,7 +953,20 @@ def _room_support_heatmap_for_plan(
 
     # Defensive support set for small open-vocabulary objects. These heatmaps
     # are only used if they have evidence inside the selected LabelMe room.
-    for label in ["counter", "table", "desk", "shelf", "cabinet", "refrigerator", "oven"]:
+    # Beds/sofas/chairs matter for teddy bears, balls, bottles on side tables,
+    # and other portable objects that are often not on kitchen furniture.
+    for label in [
+        "counter",
+        "table",
+        "desk",
+        "shelf",
+        "cabinet",
+        "bed",
+        "sofa",
+        "chair",
+        "refrigerator",
+        "oven",
+    ]:
         if label not in labels:
             labels.append(label)
 
@@ -1621,6 +1713,7 @@ def scan_360_and_verify(
                     last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
                 if det_found:
                     found = True
+                    _store_yoloe_marker(robot, cat, session, _bbox, ann_rgb)
 
                 # Show frame: annotated if YOLOE has replied, raw otherwise
                 if last_ann_bgr is not None:
@@ -1647,6 +1740,7 @@ def scan_360_and_verify(
             det_found, ann_rgb, _bbox = session.poll_result()
             if det_found:
                 found = True
+                _store_yoloe_marker(robot, cat, session, _bbox, ann_rgb)
                 if ann_rgb is not None:
                     last_ann_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
                     _frozen_detection_bgr = last_ann_bgr.copy()
@@ -4158,6 +4252,49 @@ def _path_stays_inside_mask(path_cells: list, room_mask: Optional[np.ndarray]) -
     return True
 
 
+def _cell_inside_mask(cell, room_mask: Optional[np.ndarray]) -> bool:
+    if room_mask is None or cell is None:
+        return True
+    h, w = room_mask.shape[:2]
+    try:
+        r = int(round(cell[0]))
+        c = int(round(cell[1]))
+    except Exception:
+        return False
+    return 0 <= r < h and 0 <= c < w and bool(room_mask[r, c])
+
+
+def _path_reenters_room_mask(
+    path_cells: list,
+    room_mask: Optional[np.ndarray],
+    *,
+    max_outside_gap: int = 6,
+) -> bool:
+    """Allow a path that starts outside the room to re-enter and stay there."""
+    if room_mask is None or not path_cells:
+        return True
+    if not _cell_inside_mask(path_cells[-1], room_mask):
+        return False
+
+    first_inside = None
+    for idx, cell in enumerate(path_cells):
+        if _cell_inside_mask(cell, room_mask):
+            first_inside = idx
+            break
+    if first_inside is None:
+        return False
+
+    outside_gap = 0
+    for cell in path_cells[first_inside:]:
+        if _cell_inside_mask(cell, room_mask):
+            outside_gap = 0
+        else:
+            outside_gap += 1
+            if outside_gap > int(max_outside_gap):
+                return False
+    return True
+
+
 def _record_unique_scan_zone(search_state: Optional[SearchState], robot, cell=None) -> bool:
     """Record current physical scan zone and return False when it is redundant."""
     if search_state is None:
@@ -4550,11 +4687,135 @@ def _focused_navigable_from_heatmap(
     focus_nav = navigable & focus
     if int(focus_nav.sum()) < 30:
         return None, ""
+
+    # If the focused domain is a thin strip or a tiny fraction of the room, it
+    # tends to generate repeated viewpoints on one side of the furniture. In
+    # that case expand once more so we still explore around the support object.
+    nav_area = max(1, int(navigable.sum()))
+    focus_area = int(focus_nav.sum())
+    rows, cols = np.where(focus_nav)
+    span_r = int(rows.max() - rows.min() + 1) if len(rows) else 0
+    span_c = int(cols.max() - cols.min() + 1) if len(cols) else 0
+    min_span_m = min(span_r, span_c) * cell_size
+    focus_ratio = float(focus_area) / float(nav_area)
+    if focus_ratio < 0.18 or min_span_m < 0.75:
+        expand_m = _env_float(_ROOM_EXPLORE_FOCUS_EXPAND_ENV, 0.65, 0.1)
+        expand_cells = max(1, int(round(expand_m / max(cell_size, 1e-6))))
+        expand_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (expand_cells * 2 + 1, expand_cells * 2 + 1),
+        )
+        expanded = cv2.dilate(focus_nav.astype(np.uint8), expand_kernel, iterations=1).astype(bool)
+        focus_nav = navigable & expanded
+
     desc = (
         f"foco semántico: hot={int(hot.sum())} nav={int(focus_nav.sum())} "
         f"radio={radius_m:.2f}m umbral={threshold:.3f}"
     )
     return focus_nav, desc
+
+
+def _planned_exploration_path_is_usable(
+    robot,
+    point: Tuple[int, int],
+    obs_map: np.ndarray,
+    room_mask: Optional[np.ndarray],
+    room_name: str,
+    *,
+    min_endpoint_clearance: float,
+    min_path_clearance: float = 1.0,
+    preplanned_dense: Optional[list] = None,
+) -> Tuple[bool, str]:
+    """Validate that an exploration point is actually reachable on the grid."""
+    if obs_map is None:
+        return False, "sin mapa"
+    free_map = obs_map > 0
+    dist_obs = distance_transform_edt(free_map)
+    h, w = free_map.shape[:2]
+    pr, pc = int(round(point[0])), int(round(point[1]))
+    if not (0 <= pr < h and 0 <= pc < w):
+        return False, "fuera de mapa"
+    if not bool(free_map[pr, pc]):
+        return False, "objetivo ocupado"
+    if float(dist_obs[pr, pc]) < float(min_endpoint_clearance):
+        return False, f"clearance objetivo {float(dist_obs[pr, pc]):.1f}"
+
+    dense = preplanned_dense
+    if dense is None:
+        try:
+            _, planned_actions = robot.plan_path_only([pr, pc])
+        except Exception as exc:
+            return False, f"plan error: {exc}"
+        polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
+        dense = densify_path_cells(polyline)
+        robot._set_nav_curr_pose()
+        current = getattr(robot, "curr_pos_on_map", None)
+        if (
+            not planned_actions
+            and current is not None
+            and float(np.hypot(float(current[0]) - pr, float(current[1]) - pc)) > 1.5
+        ):
+            return False, "sin acciones"
+
+    if not dense:
+        return False, "ruta vacia"
+    end_r, end_c = int(round(dense[-1][0])), int(round(dense[-1][1]))
+    if float(np.hypot(end_r - pr, end_c - pc)) > 2.0:
+        return False, "ruta no llega"
+
+    min_seen_clearance = float("inf")
+    for row, col in dense:
+        r, c = int(round(row)), int(round(col))
+        if not (0 <= r < h and 0 <= c < w):
+            return False, "ruta fuera de mapa"
+        if not bool(free_map[r, c]):
+            return False, "ruta cruza obstaculo"
+        min_seen_clearance = min(min_seen_clearance, float(dist_obs[r, c]))
+    if min_seen_clearance < float(min_path_clearance):
+        return False, f"clearance ruta {min_seen_clearance:.1f}"
+
+    if room_mask is not None and not _path_stays_inside_mask(dense, room_mask):
+        starts_inside = _cell_inside_mask(dense[0], room_mask)
+        if starts_inside or not _path_reenters_room_mask(dense, room_mask):
+            return False, f"sale de {room_name}"
+    return True, "ok"
+
+
+def _filter_reachable_exploration_points(
+    robot,
+    points: List[Tuple[int, int]],
+    obs_map: np.ndarray,
+    room_mask: Optional[np.ndarray],
+    room_name: str,
+    *,
+    min_endpoint_clearance: float,
+    target_points: int,
+) -> List[Tuple[int, int]]:
+    reachable: List[Tuple[int, int]] = []
+    rejected: Dict[str, int] = {}
+    seen = set()
+    for point in points:
+        point = (int(point[0]), int(point[1]))
+        if point in seen:
+            continue
+        seen.add(point)
+        ok, reason = _planned_exploration_path_is_usable(
+            robot,
+            point,
+            obs_map,
+            room_mask,
+            room_name,
+            min_endpoint_clearance=min_endpoint_clearance,
+        )
+        if ok:
+            reachable.append(point)
+            if len(reachable) >= int(target_points):
+                break
+        else:
+            rejected[reason] = rejected.get(reason, 0) + 1
+    if rejected:
+        print(f"  [zone-explore] Puntos descartados por no alcanzables: {rejected}")
+    return reachable
 
 
 def _generate_room_exploration_points(
@@ -4654,13 +4915,28 @@ def _generate_room_exploration_points(
     for level_idx, (level_name, _clearance, level_mask) in enumerate(levels):
         if not level_mask.any():
             continue
+        sample_points = min(
+            int(level_mask.sum()),
+            max(int(target_points) * 3, int(target_points) + 6),
+        )
         points = _cluster_room_candidates(
             level_mask,
             selection_domain,
             dist_obs,
-            target_points,
+            sample_points,
             requested_sep_cells,
             current,
+        )
+        if not points:
+            continue
+        points = _filter_reachable_exploration_points(
+            robot,
+            points,
+            obs_map,
+            room_mask,
+            room_name,
+            min_endpoint_clearance=float(max(2.0, min_clearance_cells)),
+            target_points=target_points,
         )
         if not points:
             continue
@@ -4807,7 +5083,19 @@ def _forward_target_cell_from_view(
 
 def _reset_visual_hypotheses(robot, target: str) -> None:
     # Kept as a compatibility hook; the simplified controller no longer uses
-    # projected visual memory to choose new navigation goals.
+    # projected visual memory to choose new navigation goals. We do clear the
+    # sticky UI marker so a new query never inherits the previous object's box.
+    for attr in (
+        _STICKY_YOLOE_MARKER_ATTR,
+        "_last_yoloe_positive_bgr",
+        "_last_yoloe_bbox_center",
+        "_last_yoloe_seen_angle_deg",
+    ):
+        try:
+            if hasattr(robot, attr):
+                delattr(robot, attr)
+        except Exception:
+            pass
     return None
 
 
@@ -4820,12 +5108,8 @@ def _record_visual_hypothesis(
     room_mask: Optional[np.ndarray] = None,
     source: str = "visual",
 ) -> Optional[dict]:
-    """Compatibility no-op for the earlier visual-memory experiment."""
-    if ann_rgb is not None:
-        try:
-            setattr(robot, "_last_yoloe_positive_bgr", cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR))
-        except Exception:
-            pass
+    """Compatibility hook: store only the visual marker, not navigation memory."""
+    _store_yoloe_marker(robot, target, session, bbox_center, ann_rgb)
     return None
 
 
@@ -5122,9 +5406,14 @@ def explore_room_zone_with_yoloe(
         if time.monotonic() - started > timeout_s:
             print(f"  [zone-explore] Tiempo máximo agotado ({timeout_s:.0f}s).")
             break
-        if search_state is not None and search_state.n_approach_attempts >= max_attempts:
-            print(f"  [zone-explore] Tope de acercamientos alcanzado ({max_attempts}).")
-            break
+        approach_budget_exhausted = (
+            search_state is not None and search_state.n_approach_attempts >= max_attempts
+        )
+        if approach_budget_exhausted:
+            print(
+                f"  [zone-explore] Tope de acercamientos alcanzado ({max_attempts}); "
+                "se continúa cubriendo puntos sin interrumpir por baja probabilidad."
+            )
 
         print(f"  [zone-explore] Punto {idx}/{len(points)}: {list(point)}")
         show_map(
@@ -5145,12 +5434,35 @@ def explore_room_zone_with_yoloe(
 
         polyline = normalize_path_cells(getattr(robot, "last_planned_path", None) or [])
         dense = densify_path_cells(polyline)
-        if room_mask is not None and dense and not _path_stays_inside_mask(dense, room_mask):
+        usable, unusable_reason = _planned_exploration_path_is_usable(
+            robot,
+            point,
+            robot.map.obstacles_map,
+            room_mask,
+            resolved_room,
+            min_endpoint_clearance=min_clearance_cells,
+            preplanned_dense=dense,
+        )
+        if not usable:
             print(
-                f"  [zone-explore] Ruta descartada: saldría de '{resolved_room}' "
-                f"para llegar a {list(point)}."
+                f"  [zone-explore] Punto descartado antes de navegar: "
+                f"{list(point)} ({unusable_reason})."
             )
             continue
+        if room_mask is not None and dense and not _path_stays_inside_mask(dense, room_mask):
+            starts_inside = _cell_inside_mask(dense[0], room_mask)
+            can_reenter = (not starts_inside) and _path_reenters_room_mask(dense, room_mask)
+            if can_reenter:
+                print(
+                    f"  [zone-explore] Ruta empieza fuera y reentra en '{resolved_room}' "
+                    f"para llegar a {list(point)}; se permite continuar."
+                )
+            else:
+                print(
+                    f"  [zone-explore] Ruta descartada: saldría de '{resolved_room}' "
+                    f"para llegar a {list(point)}."
+                )
+                continue
         trigger = {"hit": False, "cell": None, "during_route": False}
 
         def _monitor(_step_idx: int, _action: str) -> bool:
@@ -5178,6 +5490,8 @@ def explore_room_zone_with_yoloe(
                     yoloe_frame_bgr=ann_bgr,
                 )
             if detected:
+                if approach_budget_exhausted:
+                    return False
                 robot._set_nav_curr_pose()
                 trigger["hit"] = True
                 trigger["during_route"] = True
@@ -5227,7 +5541,7 @@ def explore_room_zone_with_yoloe(
 
         trigger_hit = bool(trigger["hit"])
         trigger_cell = trigger["cell"]
-        if not trigger_hit and _scan_room_exploration_yaws(
+        if not approach_budget_exhausted and not trigger_hit and _scan_room_exploration_yaws(
                 robot,
                 session_ref["low"],
                 target,
@@ -5273,9 +5587,9 @@ def explore_room_zone_with_yoloe(
             if getattr(robot, "_last_detection_status", None) == "high_probability":
                 print(
                     f"  [zone-explore] Alta probabilidad para '{target}' tras aproximación; "
-                    "se aborta la exploración y se deja el objetivo marcado como probable."
+                    "se sigue con el circuito para intentar confirmarlo desde otro punto."
                 )
-                return False, "high_probability"
+                continue
 
             false_cell = trigger_cell or (
                 int(robot.curr_pos_on_map[0]),

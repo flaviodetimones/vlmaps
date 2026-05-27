@@ -123,6 +123,8 @@ _MANUAL_TABLE: Dict[str, Dict[str, float]] = {
     "shoes":        {"bedroom": 0.8, "hallway": 0.7, "closet": 0.9},
     "basketball":   {"living": 0.8, "bedroom": 0.5, "hallway": 0.3},
     "ball":         {"living": 0.8, "bedroom": 0.5, "hallway": 0.3},
+    "teddy bear":   {"bedroom": 0.9, "living": 0.5},
+    "bear":         {"bedroom": 0.9, "living": 0.5},
     "guitar":       {"living": 0.7, "bedroom": 0.6, "office": 0.3},
     "bicycle":      {"hallway": 0.7, "garage": 0.9, "living": 0.3},
     # waste / utility
