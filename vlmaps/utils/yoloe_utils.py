@@ -24,6 +24,7 @@ _WEIGHTS_CANDIDATES = [
     Path("/workspace/yoloe-11l-seg.pt"),
     Path(__file__).resolve().parents[4] / "yoloe-11l-seg.pt",  # repo root
 ]
+_WEIGHTS_ENV = "VLMAPS_YOLOE_WEIGHTS"
 
 _WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_worker.py"
 _PERSISTENT_WORKER_SCRIPT = Path(__file__).resolve().parent / "_yoloe_persistent_worker.py"
@@ -50,6 +51,12 @@ def runtime_conf_thresh(default: float = 0.65) -> float:
 
 
 def _find_weights() -> str:
+    env_path = os.environ.get(_WEIGHTS_ENV)
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.exists():
+            return str(p)
+        raise FileNotFoundError(f"YOLOE weights from {_WEIGHTS_ENV} do not exist: {p}")
     for p in _WEIGHTS_CANDIDATES:
         if p.exists():
             return str(p)
@@ -320,7 +327,13 @@ def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession
     The first call blocks while the model loads (~10 s); subsequent calls
     return immediately.
     """
-    key = (str(target), float(conf_thresh))
+    try:
+        weights = _find_weights()
+    except FileNotFoundError as e:
+        print(f"  [YOLOE] weights not found: {e}")
+        return None
+
+    key = (str(target), float(conf_thresh), str(weights))
     cached = _sessions.get(key)
     if cached is not None:
         proc = getattr(cached, "_proc", None)
@@ -332,13 +345,7 @@ def get_session(target: str, conf_thresh: float = 0.25) -> Optional[YoloeSession
             pass
         _sessions.pop(key, None)
 
-    try:
-        weights = _find_weights()
-    except FileNotFoundError as e:
-        print(f"  [YOLOE] weights not found: {e}")
-        return None
-
-    print(f"  [YOLOE] Starting persistent session for '{target}' (loading model…)")
+    print(f"  [YOLOE] Starting persistent session for '{target}' (loading model: {Path(weights).name})")
     sess = YoloeSession(weights, target, conf_thresh)
     ok = sess.start()
     if not ok:
